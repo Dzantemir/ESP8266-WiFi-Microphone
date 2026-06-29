@@ -1,0 +1,60 @@
+' ============================================================================
+'  EASSP Server - TYPE Definitions
+'  PowerBASIC 10 for Windows
+' ============================================================================
+
+' ---- Device Info ----
+TYPE DeviceInfo
+    sMac         AS ASCIIZ * 18
+    dwIP         AS DWORD
+    dwPort       AS DWORD
+    dwStatus     AS DWORD
+    dwError      AS DWORD
+    sFirmware    AS ASCIIZ * 9   ' FIX C4: was * 8 — no room for NUL terminator
+    dwFreeHeap   AS DWORD
+    dwRSSI       AS LONG
+    dwPktsSent   AS DWORD
+    dwDiscovered AS DWORD
+    dwLastSeen   AS DWORD
+    dwAudioPort  AS DWORD
+    dwHBActive   AS DWORD
+    dwChannels   AS DWORD     ' 1=mono, 2=stereo (from INFO payload)
+    dwSmpRate    AS DWORD     ' Sample rate in Hz (from INFO payload, e.g. 48000)
+    dwCodec      AS DWORD     ' Codec ID: 5=ADPCM, 6=PCM (from INFO payload)
+    dwBits       AS DWORD     ' Bits per sample: 16 or 24 (from INFO payload)
+    dwPktRecv    AS DWORD
+    dwPktOOO     AS DWORD
+    dwPktLost    AS DWORD
+    wLastSeq     AS WORD
+    dwBytesRecv  AS DWORD
+    dwStreamStart AS DWORD
+    hWaveOut     AS DWORD
+    hAudioThread AS DWORD
+    fAudioFile   AS LONG       ' file number for UDP OPEN audio
+    dwRunning    AS DWORD
+    dwActive     AS DWORD
+END TYPE
+
+' ---- LV Column (custom, avoids pszText type issues) ----
+TYPE LV_COL
+    mask AS DWORD
+    fmt AS LONG
+    cx AS LONG
+    pszText AS DWORD       ' pointer to ASCIIZ text
+    cchTextMax AS LONG
+    iSubItem AS LONG
+END TYPE
+
+' ---- LV Item (custom, avoids pszText type issues) ----
+TYPE LV_ITM
+    mask AS DWORD
+    iItem AS LONG
+    iSubItem AS LONG
+    state AS DWORD
+    stateMask AS DWORD
+    pszText AS DWORD       ' pointer to ASCIIZ text
+    cchTextMax AS LONG
+    iImage AS LONG
+    lParam AS LONG         ' stores device array index
+    iIndent AS LONG
+END TYPE
