@@ -1862,15 +1862,18 @@ END SUB
 
 ' UpdateWavHeader - Update RIFF size and data size in the WAV header.
 ' Called when closing a file (on stop or auto-split).
+' NOTE: PowerBASIC SEEK is 1-based (first byte = position 1), so we add 1
+' to the 0-based WAV offsets.
 SUB UpdateWavHeader()
     IF g_hDumpFile = 0 THEN EXIT SUB
 
-    ' Update data chunk size (offset 40)
-    SEEK #g_hDumpFile, 40
+    ' Update data chunk size (0-based offset 40 -> 1-based position 41)
+    SEEK #g_hDumpFile, 41
     PUT$ #g_hDumpFile, MKL$(g_dumpDataSize)
 
-    ' Update RIFF size (offset 4) = 36 + data size
-    SEEK #g_hDumpFile, 4
+    ' Update RIFF size (0-based offset 4 -> 1-based position 5)
+    ' RIFF size = 36 + data size
+    SEEK #g_hDumpFile, 5
     PUT$ #g_hDumpFile, MKL$(36 + g_dumpDataSize)
 
     ' Seek to end for further writes
