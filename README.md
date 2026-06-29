@@ -35,7 +35,7 @@ esp8266-wifi-microphone/
 ├── firmware/                  # ESP8266 firmware (ESP8266 RTOS SDK)
 │   ├── CMakeLists.txt
 │   ├── sdkconfig
-│   ├── i2s_patched.c          # Patched I2S driver (copy to SDK)
+│   ├── i2s.c                  # Patched I2S driver (REPLACE in SDK)
 │   └── main/
 │       ├── CMakeLists.txt
 │       ├── Kconfig.projbuild
@@ -103,7 +103,7 @@ git clone https://github.com/yourname/esp8266-wifi-microphone.git projects/esp82
 docker-compose run --rm esp8266 bash -c "
   cd /projects/esp8266-wifi-microphone/firmware &&
   export IDF_PATH=/opt/esp8266-rtos-sdk &&
-  cp i2s_patched.c \$IDF_PATH/components/esp8266/driver/i2s.c &&
+  cp i2s.c \$IDF_PATH/components/esp8266/driver/i2s.c &&
   idf.py build
 "
 
@@ -130,7 +130,7 @@ git checkout release/v3.4
 
 3. Copy patched I2S driver:
 ```bash
-cp firmware/i2s_patched.c $IDF_PATH/components/esp8266/driver/i2s.c
+cp firmware/i2s.c $IDF_PATH/components/esp8266/driver/i2s.c  # REPLACE the SDK file
 ```
 
 4. Build:
