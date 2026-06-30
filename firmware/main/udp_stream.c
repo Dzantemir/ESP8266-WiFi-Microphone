@@ -199,7 +199,7 @@ esp_err_t udp_stream_send(const uint8_t *data, size_t len)
 
         memcpy(buf + WIFI_HDR_LEN, data, len);
 
-        esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, buf, total_len, false);
+        esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, buf, total_len, true);
 
         free(buf);
 
