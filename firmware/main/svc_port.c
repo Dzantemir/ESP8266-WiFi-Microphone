@@ -297,7 +297,7 @@ void svc_port_set_error(uint8_t error_code)
     /* Trigger immediate INFO send to server if address known. */
     if (addr.addr != 0 && port != 0)
     {
-        send_info(s_seq_counter++, &addr, port);
+        { uint16_t s; xSemaphoreTake(s_mutex, portMAX_DELAY); s = s_seq_counter++; xSemaphoreGive(s_mutex); send_info(s, &addr, port); }
     }
 }
 
@@ -685,7 +685,7 @@ static void svc_task_fn(void *arg)
             {
                 last_info = now;
                 if (svc_addr.addr)
-                    send_info(s_seq_counter++, &svc_addr, svc_port);
+                    { uint16_t s; xSemaphoreTake(s_mutex, portMAX_DELAY); s = s_seq_counter++; xSemaphoreGive(s_mutex); send_info(s, &svc_addr, svc_port); }
             }
             /* Watchdog. */
             if (elapsed >= SVC_WATCHDOG_TIMEOUT_MS)
@@ -708,7 +708,7 @@ static void svc_task_fn(void *arg)
                 uint32_t range = SVC_ANNOUNCE_MAX_MS - SVC_ANNOUNCE_MIN_MS;
                 announce_ms = SVC_ANNOUNCE_MIN_MS + (esp_random() % (range + 1));
                 if (bcast.addr)
-                    send_info(s_seq_counter++, &bcast, SVC_PORT_DEFAULT);
+                    { uint16_t s; xSemaphoreTake(s_mutex, portMAX_DELAY); s = s_seq_counter++; xSemaphoreGive(s_mutex); send_info(s, &bcast, SVC_PORT_DEFAULT); }
             }
         }
 #endif

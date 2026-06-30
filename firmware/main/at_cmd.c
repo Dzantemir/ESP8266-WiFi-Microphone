@@ -574,7 +574,7 @@ static void cmd_help(void)
     at_send_str("+HELP:--- Audio Parameters ---\r\n");
     at_send_data("+HELP:  Sample rate: %u Hz (use AT+RATE to change)\r\n", (unsigned)cfg.sample_rate);
     at_send_data("+HELP:  Frame duration: %d ms\r\n", streaming_get_frame_ms());
-    at_send_data("+HELP:  Bits: %d-bit (use AT+BITS to change)\r\n", cfg.bits_per_sample);
+    at_send_data("+HELP:  Bits: %u-bit (use AT+BITS to change)\r\n", cfg.bits_per_sample);
     at_send_data("+HELP:  Gain: %u (use AT+GAIN to change, 0=bypass)\r\n", (unsigned)cfg.gain);
     at_send_data("+HELP:  AGC: mode %u (use AT+AGC to change)\r\n", (unsigned)cfg.agc_mode);
     at_send_data("+HELP:  CODEC: %u (use AT+CODEC to change, 0=ADPCM 1=PCM)\r\n", (unsigned)cfg.codec_mode);
@@ -746,7 +746,7 @@ static void cmd_bits_query(void)
 {
     device_config_t cfg;
     config_get_copy(&cfg);
-    at_send_data("+BITS:%d\r\n", cfg.bits_per_sample);
+    at_send_data("+BITS:%u\r\n", cfg.bits_per_sample);
     at_send_ok();
 }
 
@@ -769,7 +769,7 @@ static void cmd_bits_set(const char *args)
         return;
     }
 
-    at_send_data("+BITS:set to %d (saved, saved, use AT+HOTRESTART to apply)\r\n", (int)bits);
+    at_send_data("+BITS:set to %d (saved, use AT+HOTRESTART to apply)\r\n", (int)bits);
     at_send_ok();
 }
 
@@ -801,7 +801,7 @@ static void cmd_fmt_set(const char *args)
         return;
     }
 
-    at_send_data("+FMT:set to %d (%s, saved, saved, use AT+HOTRESTART to apply)\r\n",
+    at_send_data("+FMT:set to %d (%s, saved, use AT+HOTRESTART to apply)\r\n",
                  (int)fmt, fmt == I2S_CFMT_LSB ? "LSB" : "Philips");
     at_send_ok();
 }
@@ -874,7 +874,7 @@ static void cmd_ch_set(const char *args)
     int new_ch = i2s_capture_channel_count(fmt);
     svc_port_set_channels((uint8_t)new_ch);
 
-    at_send_data("+CH:set to %d (saved, saved, use AT+HOTRESTART to apply)\r\n", (int)ch);
+    at_send_data("+CH:set to %d (saved, use AT+HOTRESTART to apply)\r\n", (int)ch);
     at_send_ok();
 }
 
@@ -911,7 +911,7 @@ static void cmd_rate_set(const char *args)
         return;
     }
 
-    at_send_data("+RATE:set to %u (saved, saved, use AT+HOTRESTART to apply)\r\n", (unsigned)rate);
+    at_send_data("+RATE:set to %u (saved, use AT+HOTRESTART to apply)\r\n", (unsigned)rate);
     at_send_ok();
 }
 
@@ -942,7 +942,7 @@ static void cmd_gain_set(const char *args)
         return;
     }
 
-    at_send_data("+GAIN:set to %u (saved, saved, use AT+HOTRESTART to apply)\r\n", (unsigned)gain);
+    at_send_data("+GAIN:set to %u (saved, use AT+HOTRESTART to apply)\r\n", (unsigned)gain);
     at_send_ok();
 }
 
@@ -1017,7 +1017,7 @@ static void cmd_agc_set(const char *args)
         name = "?";
         break;
     }
-    at_send_data("+AGC:set to %ld (%s, saved, saved, use AT+HOTRESTART to apply)\r\n",
+    at_send_data("+AGC:set to %ld (%s, saved, use AT+HOTRESTART to apply)\r\n",
                  val, name);
     if (val != AGC_MODE_OFF)
     {
@@ -1061,7 +1061,7 @@ static void cmd_codec_set(const char *args)
 
     const char *name = (val == CODEC_MODE_PCM) ? "PCM (raw 16/24-bit)"
                                                : "ADPCM (DVI4 IMA)";
-    at_send_data("+CODEC:set to %ld (%s, saved, saved, use AT+HOTRESTART to apply)\r\n",
+    at_send_data("+CODEC:set to %ld (%s, saved, use AT+HOTRESTART to apply)\r\n",
                  val, name);
     at_send_ok();
 }
@@ -1248,8 +1248,8 @@ static void cmd_status(void)
     at_send_data("+STATUS:wifi_tx_power=%u dBm\r\n", cfg.tx_power);
     at_send_data("+STATUS:streaming=%s\r\n", st.streaming ? "YES" : "NO");
     at_send_data("+STATUS:sample_rate=%u\r\n", (unsigned)cfg.sample_rate);
-    at_send_data("+STATUS:frame_ms=%d (fixed)\r\n", streaming_get_frame_ms());
-    at_send_data("+STATUS:bits_per_sample=%d\r\n", cfg.bits_per_sample);
+    at_send_data("+STATUS:frame_ms=%u (fixed)\r\n", streaming_get_frame_ms());
+    at_send_data("+STATUS:bits_per_sample=%u\r\n", cfg.bits_per_sample);
     at_send_data("+STATUS:gain=%u (0=bypass, 32=+30dB)\r\n", (unsigned)cfg.gain);
     at_send_data("+STATUS:agc=%u (0=OFF 1=LOW 2=MEDIUM 3=HIGH)\r\n", (unsigned)cfg.agc_mode);
     at_send_data("+STATUS:codec=%u (%s)\r\n", (unsigned)cfg.codec_mode,

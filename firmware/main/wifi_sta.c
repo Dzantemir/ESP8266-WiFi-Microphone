@@ -17,6 +17,7 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "tcpip_adapter.h"
 
 #include "board_config.h"
@@ -95,8 +96,20 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 
             ESP_LOGW(TAG, "WIFI_EVENT_STA_DISCONNECTED - reason: %d, reconnecting in %u ms...",
                      evt->reason, (unsigned)delay);
-            vTaskDelay(pdMS_TO_TICKS(delay));
-            esp_wifi_connect();
+            /* FIX B3: Use a timer instead of vTaskDelay to avoid blocking the
+             * event loop task. The default event task processes ALL events
+             * (WiFi, IP, etc.) - blocking it for up to 30s starves everything. */
+            static esp_timer_handle_t reconnect_timer = NULL;
+            if (!reconnect_timer)
+            {
+                const esp_timer_create_args_t timer_args = {
+                    .callback = (void *)esp_wifi_connect,
+                    .name = "wifi_reconnect"
+                };
+                esp_timer_create(&timer_args, &reconnect_timer);
+            }
+            esp_timer_stop(reconnect_timer);
+            esp_timer_start_once(reconnect_timer, (uint64_t)delay * 1000);
             break;
         }
         default:

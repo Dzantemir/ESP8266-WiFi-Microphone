@@ -16,7 +16,7 @@
  *     minutes and enters deep sleep if V_batt < BATT_CRITICAL_MV
  *
  * When BATTERY_ENABLED=0 (CONFIG_STREAMER_BATTERY_ENABLED not set), all
- * functions become no-ops / return 0, so callers need no #ifdefs.
+ * functions become no-ops / return 0, so all functions are available (stubs when disabled).
  *
  * THREAD SAFETY:
  *   - battery_get_voltage_mv() is NOT thread-safe with concurrent ADC

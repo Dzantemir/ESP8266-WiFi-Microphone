@@ -1068,6 +1068,25 @@ void app_main(void)
              (unsigned)AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, (unsigned)AUDIO_BITRATE);
     ESP_LOGI(TAG, "AT command interface on UART0 (%d 8N1)", UART_BAUD_RATE);
 
+    /* 0. NVS (must be first - battery and config depend on it). */
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        ESP_LOGW(TAG, "NVS partition needs erase - erasing...");
+        nvs_flash_erase();
+        err = nvs_flash_init();
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "NVS init failed after erase: %s", esp_err_to_name(err));
+            return;
+        }
+    }
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "NVS init failed: %s", esp_err_to_name(err));
+        return;
+    }
+
     /* 1. Battery monitoring (optional, ported from ESP8285-WEBSERVER).
      * Initializes ADC and starts a background task that checks V_batt
      * every BATT_CHECK_MIN minutes. If V_batt < BATT_CRITICAL_MV, device
@@ -1088,26 +1107,7 @@ void app_main(void)
     ESP_LOGI(TAG, "Battery monitoring disabled (menuconfig)");
 #endif
 
-    /* 2. NVS. */
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
-    {
-        ESP_LOGW(TAG, "NVS partition needs erase - erasing...");
-        nvs_flash_erase();
-        err = nvs_flash_init();
-        if (err != ESP_OK)
-        {
-            ESP_LOGE(TAG, "NVS init failed after erase: %s", esp_err_to_name(err));
-            return;
-        }
-    }
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "NVS init failed: %s", esp_err_to_name(err));
-        return;
-    }
-
-    /* 3. Config manager. */
+    /* 2. Config manager (requires NVS). */
     err = config_mgr_init();
     if (err != ESP_OK)
     {
@@ -1115,7 +1115,7 @@ void app_main(void)
         return;
     }
 
-    /* 4. Stream control EventGroup. */
+    /* 3. Stream control EventGroup. */
     s_stream_evt_grp = xEventGroupCreate();
     if (!s_stream_evt_grp)
     {
