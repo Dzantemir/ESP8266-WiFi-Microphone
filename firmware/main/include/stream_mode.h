@@ -48,14 +48,22 @@ typedef struct {
 
     /* Boot-time WiFi initialization.
      * UDP:   esp_wifi_init + connect to AP (non-blocking, events drive it).
-     * RAWTX: esp_wifi_init + start radio + promiscuous + set_channel.
+     * RAWTX: esp_wifi_init + esp_wifi_start + block until the STA_START event
+     *        handler has run set_channel/set_protocol(11B)/set_fixed_rate(11M)
+     *        (per esp_wifi_set_protocol() docs, set_protocol MUST be called
+     *        inside the STA_START event - so ALL radio config happens in the
+     *        handler, and the "radio ready" bit is only signalled afterwards).
+     *        This guarantees the radio is calibrated AND configured when the
+     *        pipeline starts, so the first esp_wifi_80211_tx() succeeds
+     *        instead of being dropped.
      * Called once from app_main(). May be called again from start_streaming()
      * if boot init failed. */
     esp_err_t (*wifi_init)(const device_config_t *cfg);
 
     /* Ensure WiFi is ready for streaming (called in start_streaming).
      * UDP:   blocks until AP association completes (with timeout).
-     * RAWTX: no-op (radio already on from wifi_init).
+     * RAWTX: no-op - radio readiness is already ensured inside wifi_init()
+     *        (it blocks on WIFI_EVENT_STA_START). Returns ESP_OK immediately.
      * Returns ESP_OK when ready, error otherwise. */
     esp_err_t (*wifi_wait_ready)(const device_config_t *cfg);
 

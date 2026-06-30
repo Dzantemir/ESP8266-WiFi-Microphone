@@ -251,6 +251,18 @@ uint32_t i2s_capture_compute_frame_ms(uint32_t sample_rate, int channels,
 #define WIFI_RECONNECT_BACKOFF_MAX_MS  30000
 #endif
 
+/* Raw 802.11 TX mode: how long to wait for WIFI_EVENT_STA_START after
+ * esp_wifi_start() before giving up. esp_wifi_start() is asynchronous - it
+ * returns before the radio is actually up; we block on the STA_START event
+ * (posted by the WiFi driver once the radio is calibrated) so the first
+ * esp_wifi_80211_tx() call succeeds instead of being dropped. Typical
+ * bring-up is ~100-300 ms; 3 s is a safety net for a wedged radio. */
+#ifdef CONFIG_STREAMER_WIFI_RAW_START_TIMEOUT_MS
+#define WIFI_RAW_START_TIMEOUT_MS  CONFIG_STREAMER_WIFI_RAW_START_TIMEOUT_MS
+#else
+#define WIFI_RAW_START_TIMEOUT_MS  3000
+#endif
+
 /* ====================================================================
  *  Service Port (EASSP) - configured via Kconfig
  * ==================================================================== */

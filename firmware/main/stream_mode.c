@@ -120,7 +120,13 @@ static esp_err_t rawtx_wifi_init(const device_config_t *cfg)
 
 static esp_err_t rawtx_wifi_wait_ready(const device_config_t *cfg)
 {
-    /* Radio is already on from wifi_init(). No AP association to wait for. */
+    /* Radio readiness is already ensured inside rawtx_wifi_init() ->
+     * wifi_sta_init_raw(): it blocks until the STA_START event handler has
+     * finished running set_channel/set_protocol(11B)/set_fixed_rate(11M)
+     * (set_protocol MUST be called inside the STA_START event per its API
+     * doc). By the time we get here the radio is calibrated AND configured,
+     * so there is nothing left to wait for. */
+    (void)cfg;
     return ESP_OK;
 }
 

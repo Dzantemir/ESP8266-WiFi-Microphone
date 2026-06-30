@@ -25,8 +25,9 @@
 
 static const char *TAG = "wifi_sta";
 
-#define WIFI_EVT_CONNECTED (1 << 0)
-#define WIFI_EVT_GOT_IP (1 << 1)
+#define WIFI_EVT_CONNECTED   (1 << 0)
+#define WIFI_EVT_GOT_IP      (1 << 1)
+#define WIFI_EVT_STA_STARTED (1 << 2)  /* raw TX: WIFI_EVENT_STA_START fired -> radio up */
 
 static EventGroupHandle_t s_wifi_evt = NULL;
 static SemaphoreHandle_t s_backoff_mtx = NULL;
@@ -68,7 +69,9 @@ extern esp_err_t wifi_set_user_fixed_rate(uint8_t enable_mask, uint8_t rate);
 #define WIFI_RATE_MCS7 0x17       // MCS7 (65 Mbps при 20 МГц)
 
 /* Event handler - only active in UDP mode.
- * In raw TX mode we don't register it (no connect/disconnect events needed). */
+ * In raw TX mode a separate, smaller handler (wifi_raw_event_handler) is
+ * used: it only needs WIFI_EVENT_STA_START as a radio-ready signal and must
+ * NOT call esp_wifi_connect() (raw TX has no AP). */
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data)
 {
@@ -131,6 +134,101 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
             xEventGroupSetBits(s_wifi_evt, WIFI_EVT_CONNECTED | WIFI_EVT_GOT_IP);
         }
     }
+}
+
+/* Raw TX configuration context - shared between wifi_sta_init_raw()
+ * (calling task) and wifi_raw_event_handler() (event-loop task).
+ *
+ * channel:      set by caller BEFORE esp_wifi_start(); read by handler.
+ * configured:   set true by handler AFTER all radio-config calls complete.
+ * config_err:   captures the first fatal error from set_channel / set_protocol
+ *               (set_rate failure is non-fatal and only logged). ESP_OK if
+ *               everything succeeded.
+ *
+ * Synchronization: the writes to `configured` / `config_err` in the handler
+ * happen-before the xEventGroupSetBits() call; the caller's read after
+ * xEventGroupWaitBits() is therefore safe (FreeRTOS event-group ops use
+ * critical sections, providing the necessary memory barrier). `volatile`
+ * is kept for intent documentation. */
+typedef struct {
+    uint8_t            channel;
+    volatile bool      configured;
+    volatile esp_err_t config_err;
+} raw_tx_ctx_t;
+
+static raw_tx_ctx_t s_raw_ctx = {0};
+
+/* Raw 802.11 TX mode event handler.
+ *
+ * Listens ONLY for WIFI_EVENT_STA_START - the signal that esp_wifi_start()
+ * has finished bringing the radio up. We do NOT call esp_wifi_connect()
+ * here (raw TX has no AP).
+ *
+ * IMPORTANT: per the official esp_wifi_set_protocol() API doc:
+ *   "@attention Please call this API in SYSTEM_EVENT_STA_START event"
+ * So set_protocol (and, for symmetry and ordering safety, set_channel and
+ * wifi_set_user_fixed_rate too) are called INSIDE this handler - not from
+ * the calling task after the event. Doing all radio config here:
+ *   1. satisfies the official API contract for set_protocol,
+ *   2. guarantees channel/protocol/rate are applied atomically before the
+ *      WIFI_EVT_STA_STARTED bit is signalled,
+ *   3. eliminates the "initial drop" at stream start - the calling task
+ *      can never reach esp_wifi_80211_tx() before the radio is up AND
+ *      fully configured. */
+static void wifi_raw_event_handler(void *arg, esp_event_base_t base,
+                                   int32_t id, void *data)
+{
+    (void)arg;
+    (void)data;
+    if (base != WIFI_EVENT || id != WIFI_EVENT_STA_START)
+        return;
+
+    ESP_LOGI(TAG, "WIFI_EVENT_STA_START - configuring radio (raw TX mode)");
+
+    /* 1. Set the WiFi channel for raw TX (requires STA started). */
+    esp_err_t err = esp_wifi_set_channel(s_raw_ctx.channel,
+                                         WIFI_SECOND_CHAN_NONE);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_wifi_set_channel(%d) failed: %s",
+                 s_raw_ctx.channel, esp_err_to_name(err));
+        s_raw_ctx.config_err = err;
+    }
+
+    /* 2. Restrict protocol to 802.11b only.
+     *    MUST be called inside the STA_START event per API docs. 11b-only
+     *    gives the best raw-TX air-time vs. drop-rate tradeoff (tested
+     *    ~1-2% drop at 200 pkt/s PCM 48kHz/5ms with 11M fixed rate). */
+    err = esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_wifi_set_protocol failed: %s", esp_err_to_name(err));
+        if (s_raw_ctx.config_err == ESP_OK)
+            s_raw_ctx.config_err = err;
+    }
+
+    /* 3. Pin the TX rate to 11 Mbps. Without this, esp_wifi_80211_tx() uses
+     *    the 1 Mbps base rate -> ~50% packet drop at 200 pkt/s (air time
+     *    exceeds real time). At 11 Mbps the same traffic fits in ~10% air
+     *    time. Non-fatal: if it fails the stream still works but with a
+     *    higher drop rate for high-bitrate codecs. */
+    err = wifi_set_user_fixed_rate(FIXED_RATE_MASK_STA, WIFI_RATE_11M);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "wifi_set_user_fixed_rate failed: %s - "
+                      "continuing with default rate", esp_err_to_name(err));
+    }
+    else
+    {
+        ESP_LOGI(TAG, "Raw TX: protocol=11B, rate=11 Mbps (fixed)");
+    }
+
+    /* 4. Signal completion. The calling task waits on this bit; once set,
+     *    the radio is up AND fully configured, so the first
+     *    esp_wifi_80211_tx() will succeed. */
+    s_raw_ctx.configured = true;
+    if (s_wifi_evt)
+        xEventGroupSetBits(s_wifi_evt, WIFI_EVT_STA_STARTED);
 }
 
 /* ---- Common WiFi hardware init (shared by both modes) ---- */
@@ -214,11 +312,29 @@ esp_err_t wifi_sta_init(const char *ssid, const char *password,
     if (err != ESP_OK)
         return err;
 
-    /* 2. Register event handlers BEFORE esp_wifi_start. */
-    err = esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
+    /* 2. Register event handlers BEFORE esp_wifi_start.
+     *
+     * Register the specific events we actually handle rather than
+     * ESP_EVENT_ANY_ID: the switch in wifi_event_handler only acts on
+     * STA_START / STA_DISCONNECTED, so listening on ANY_ID would needlessly
+     * wake the event-loop task for every WIFI_EVENT (SCAN_DONE, etc.).
+     * Symmetric with the raw TX mode, which also registers STA_START
+     * specifically.
+     *
+     * CAVEAT: esp_event_handler_unregister(base, ESP_EVENT_ANY_ID, h) does
+     * NOT remove handlers registered for specific ids - it only clears the
+     * base's "any-id" list. So the deinit path MUST unregister the exact
+     * same three (base,id) pairs registered here. */
+    err = esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_START,
+                                     wifi_event_handler, NULL);
     if (err != ESP_OK)
         return err;
-    err = esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL);
+    err = esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,
+                                     wifi_event_handler, NULL);
+    if (err != ESP_OK)
+        return err;
+    err = esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                     wifi_event_handler, NULL);
     if (err != ESP_OK)
         return err;
 
@@ -260,56 +376,78 @@ esp_err_t wifi_sta_init_raw(uint8_t channel, uint8_t tx_power)
         return ESP_ERR_NO_MEM;
     }
 
+    /* Set up the context shared with the STA_START handler BEFORE registering
+     * the handler / starting WiFi. The handler reads s_raw_ctx.channel and
+     * writes s_raw_ctx.configured / .config_err. */
+    s_raw_ctx.channel      = channel;
+    s_raw_ctx.configured   = false;
+    s_raw_ctx.config_err   = ESP_OK;
+
     /* 1. Init WiFi hardware (esp_wifi_init, set_mode). */
     esp_err_t err = wifi_hw_init();
     if (err != ESP_OK)
         return err;
 
-    /* 2. Start WiFi hardware first (channel can only be set after start). */
+    /* 2. Register the STA_START handler BEFORE esp_wifi_start().
+     *    esp_wifi_start() is asynchronous: it queues the start request and
+     *    returns immediately - the radio comes up shortly afterwards in the
+     *    WiFi driver task, which then posts WIFI_EVENT_STA_START. Registering
+     *    before start() guarantees we don't race and miss the event.
+     *
+     *    The handler performs ALL radio configuration (set_channel,
+     *    set_protocol, set_rate) - per the esp_wifi_set_protocol() API doc
+     *    ("@attention Please call this API in SYSTEM_EVENT_STA_START event")
+     *    the protocol call MUST happen inside the STA_START event. */
+    err = esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_START,
+                                     wifi_raw_event_handler, NULL);
+    if (err != ESP_OK)
+        return err;
+
+    /* 3. Start WiFi hardware (queues the radio bring-up; STA_START fires soon). */
     err = wifi_hw_start(tx_power);
     if (err != ESP_OK)
         return err;
 
-    /* Disable power saving - required for low-latency TX (both UDP and
-     * Raw TX). PS_MIN/MAX adds 100-300ms beacon-aligned wake delays. */
-    // err = esp_wifi_set_ps(WIFI_PS_NONE);
-    // if (err != ESP_OK)
-    // {
-    //     ESP_LOGE(TAG, "esp_wifi_set_ps failed: %s", esp_err_to_name(err));
-    //     return err;
-    // }
-
-    /* 4. Set the WiFi channel for raw TX (must be after esp_wifi_start). */
-    err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
-    if (err != ESP_OK)
+    /* 4. Wait for the STA_START handler to finish configuring the radio.
+     *    The handler sets WIFI_EVT_STA_STARTED only AFTER set_channel,
+     *    set_protocol and set_rate have all run, so by the time this bit is
+     *    set the radio is up AND fully configured. This is the critical fix
+     *    for the "initial drop" at stream start: esp_wifi_start() returns
+     *    before the radio is actually up, so without this wait the first
+     *    few esp_wifi_80211_tx() calls would hit an uncalibrated radio and
+     *    be dropped.
+     *
+     *    Typical bring-up time on ESP8266 is ~100-300 ms; the timeout is a
+     *    safety net for a wedged radio, not the expected wait. */
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_evt,
+                                           WIFI_EVT_STA_STARTED,
+                                           pdFALSE, pdTRUE,
+                                           pdMS_TO_TICKS(WIFI_RAW_START_TIMEOUT_MS));
+    if (!(bits & WIFI_EVT_STA_STARTED))
     {
-        ESP_LOGE(TAG, "esp_wifi_set_channel(%d) failed: %s", channel, esp_err_to_name(err));
-        return err;
-    }
-    err = esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "esp_wifi_set_protocol failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    err = wifi_set_user_fixed_rate(FIXED_RATE_MASK_STA, WIFI_RATE_11M);
-    if (err != ESP_OK)
-    {
-        ESP_LOGW(TAG, "wifi_set_user_fixed_rate failed: %s", esp_err_to_name(err));
-        /* Non-fatal: continue with default rate. Stream will work but with
-         * high drop rate for high-bitrate codecs (PCM 48kHz). */
-    }
-    else
-    {
-        ESP_LOGI(TAG, "Raw TX rate set to 54 Mbps");
+        ESP_LOGE(TAG, "Timeout (%d ms) waiting for WIFI_EVENT_STA_START "
+                      "(raw TX) - radio did not come up",
+                 WIFI_RAW_START_TIMEOUT_MS);
+        return ESP_ERR_TIMEOUT;
     }
 
-    /* 6. Mark as "connected" so the pipeline tasks don't wait for WiFi. */
+    /* 5. Surface any fatal config error captured by the handler
+     *    (set_channel or set_protocol failure; set_rate is non-fatal and
+     *    only logged inside the handler). */
+    if (s_raw_ctx.config_err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Raw TX radio configuration failed: %s",
+                 esp_err_to_name(s_raw_ctx.config_err));
+        return s_raw_ctx.config_err;
+    }
+
+    /* 6. Radio is up and fully configured. Mark "connected" so the pipeline
+     *    tasks don't wait for WiFi. */
     xEventGroupSetBits(s_wifi_evt, WIFI_EVT_CONNECTED);
 
     s_initialized = true;
-    ESP_LOGI(TAG, "WiFi initialized (Raw 802.11 TX mode, channel %d)", channel);
+    ESP_LOGI(TAG, "WiFi initialized (Raw 802.11 TX mode, channel %d, "
+                  "protocol=11B, rate=11 Mbps)", channel);
     return ESP_OK;
 }
 
@@ -320,9 +458,25 @@ esp_err_t wifi_sta_deinit(void)
     if (!s_initialized)
         return ESP_OK;
 
-    /* Unregister event handlers (safe even if not registered). */
-    esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler);
-    esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler);
+    /* Unregister event handlers. Each registration in wifi_sta_init() /
+     * wifi_sta_init_raw() has a matching unregister here. unregister() is
+     * safe even if the handler was never registered (no-op in that case).
+     *
+     * Note: we unregister by the EXACT (base,id) pair -
+     * esp_event_handler_unregister(base, ESP_EVENT_ANY_ID, h) would NOT
+     * remove handlers registered for specific ids (it only clears the
+     * base's any-id list), so the pairs below must mirror the register()
+     * calls exactly. */
+    /* UDP-mode handlers (registered by wifi_sta_init). */
+    esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_STA_START,
+                                 wifi_event_handler);
+    esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,
+                                 wifi_event_handler);
+    esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                 wifi_event_handler);
+    /* Raw-TX-mode handler (registered by wifi_sta_init_raw). */
+    esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_STA_START,
+                                 wifi_raw_event_handler);
 
     esp_wifi_stop();
     esp_wifi_deinit();
