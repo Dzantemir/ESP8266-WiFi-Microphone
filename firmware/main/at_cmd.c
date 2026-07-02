@@ -21,12 +21,6 @@
  * Audio parameters (AT+RATE, AT+BITS, AT+FMT, AT+CH) apply on next stream start.
  */
 
-#include "at_cmd.h"
-#include "config_mgr.h"
-#include "svc_port.h"
-#include "svc_protocol.h"
-#include "wifi_sta.h"
-#include "i2s_capture.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -37,14 +31,21 @@
 
 /* FreeRTOS MUST come before driver/uart.h and esp_wifi.h! */
 #include "freertos/FreeRTOS.h"
+#include "board_config.h"
 #include "freertos/task.h"
 
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
+#include "at_cmd.h"
+#include "config_mgr.h"
+#include "svc_port.h"
+#include "svc_protocol.h"
+#include "wifi_sta.h"
+#include "i2s_capture.h"
 
-#include "board_config.h"
+
 #include "battery.h"
 #include "stream_control.h"
 #include "udp_stream.h"
@@ -91,10 +92,12 @@ static void cmd_agc_query(void);
 static void cmd_agc_set(const char *args);
 static void cmd_codec_query(void);
 static void cmd_codec_set(const char *args);
-static void cmd_rawtx_query(void);
-static void cmd_rawtx_set(const char *args);
 static void cmd_wch_query(void);
 static void cmd_wch_set(const char *args);
+static void cmd_xport_query(void);
+static void cmd_xport_set(const char *args);
+static void cmd_timing_query(void);
+static void cmd_timing_set(const char *args);
 #if BATTERY_ENABLED
 static void cmd_batt_query(void);
 #endif
@@ -395,21 +398,30 @@ static void at_process_line(const char *line, int len)
         else
             at_send_error();
     }
-    else if (strcasecmp(cmd_name, "RAWTX") == 0)
-    {
-        if (is_query)
-            cmd_rawtx_query();
-        else if (args)
-            cmd_rawtx_set(args);
-        else
-            at_send_error();
-    }
     else if (strcasecmp(cmd_name, "WCH") == 0)
     {
         if (is_query)
             cmd_wch_query();
         else if (args)
             cmd_wch_set(args);
+        else
+            at_send_error();
+    }
+    else if (strcasecmp(cmd_name, "XPORT") == 0)
+    {
+        if (is_query)
+            cmd_xport_query();
+        else if (args)
+            cmd_xport_set(args);
+        else
+            at_send_error();
+    }
+    else if (strcasecmp(cmd_name, "TIMING") == 0)
+    {
+        if (is_query)
+            cmd_timing_query();
+        else if (args)
+            cmd_timing_set(args);
         else
             at_send_error();
     }
@@ -555,10 +567,12 @@ static void cmd_help(void)
     at_send_str("+HELP:AT+AGC=0|1|2|3 - set AGC preset (0=off 1=low hiss 2=balanced 3=fast)\r\n");
     at_send_str("+HELP:AT+CODEC?      - show codec (0=ADPCM, 1=PCM)\r\n");
     at_send_str("+HELP:AT+CODEC=0|1   - set codec (0=adpcm 1=pcm, auto-save, hotrestart)\r\n");
-    at_send_str("+HELP:AT+RAWTX?      - show raw TX mode (0=UDP, 1=raw 802.11)\r\n");
-    at_send_str("+HELP:AT+RAWTX=0|1   - set raw TX (0=udp 1=raw wifi, auto-save, reboot)\r\n");
     at_send_str("+HELP:AT+WCH?        - show wifi channel (1-13)\r\n");
     at_send_str("+HELP:AT+WCH=n       - set wifi channel 1-13 (auto-save, raw TX only)\r\n");
+    at_send_str("+HELP:AT+XPORT?      - show transport (0=UDP 1=TCP 2=RawTX)\r\n");
+    at_send_str("+HELP:AT+XPORT=0|1|2 - set transport (auto-save, hotrestart)\r\n");
+    at_send_str("+HELP:AT+TIMING?     - show I2S RX input delays (sd,ws,bck)\r\n");
+    at_send_str("+HELP:AT+TIMING=s,w,b - set I2S RX delays 0-3 each (auto-save, hotrestart)\r\n");
 #if BATTERY_ENABLED
     at_send_str("+HELP:AT+BATT?       - show battery voltage and charge level\r\n");
 #endif
@@ -578,8 +592,14 @@ static void cmd_help(void)
     at_send_data("+HELP:  Gain: %u (use AT+GAIN to change, 0=bypass)\r\n", (unsigned)cfg.gain);
     at_send_data("+HELP:  AGC: mode %u (use AT+AGC to change)\r\n", (unsigned)cfg.agc_mode);
     at_send_data("+HELP:  CODEC: %u (use AT+CODEC to change, 0=ADPCM 1=PCM)\r\n", (unsigned)cfg.codec_mode);
-    at_send_data("+HELP:  RAWTX: %u (use AT+RAWTX to change, 0=UDP 1=Raw 802.11)\r\n", (unsigned)cfg.rawtx_mode);
-    if (cfg.rawtx_mode)
+    {
+        const char *xname = "UDP";
+        if (cfg.transport_mode == TRANSPORT_MODE_TCP) xname = "TCP";
+        else if (cfg.transport_mode == TRANSPORT_MODE_RAWTX) xname = "Raw 802.11 TX";
+        at_send_data("+HELP:  Transport: %u %s (use AT+XPORT to change, 0=UDP 1=TCP 2=RawTX)\r\n",
+                     (unsigned)cfg.transport_mode, xname);
+    }
+    if (cfg.transport_mode == TRANSPORT_MODE_RAWTX)
     {
         at_send_data("+HELP:  WCH: %u (use AT+WCH to change, 1-13)\r\n", (unsigned)cfg.wifi_channel);
     }
@@ -1066,39 +1086,6 @@ static void cmd_codec_set(const char *args)
     at_send_ok();
 }
 
-static void cmd_rawtx_query(void)
-{
-    device_config_t cfg;
-    config_get_copy(&cfg);
-    const char *name = cfg.rawtx_mode ? "Raw 802.11 TX" : "UDP via WiFi";
-    at_send_data("+RAWTX:%u (%s)\r\n", (unsigned)cfg.rawtx_mode, name);
-    at_send_ok();
-}
-
-static void cmd_rawtx_set(const char *args)
-{
-    char *endptr = NULL;
-    long val = strtol(args, &endptr, 10);
-    if (endptr == args || *endptr != '\0' || val < 0 || val > 1)
-    {
-        at_send_data("+ERR:rawtx must be 0 (UDP) or 1 (Raw 802.11)\r\n");
-        at_send_error();
-        return;
-    }
-
-    esp_err_t err = config_set_rawtx_mode((uint8_t)val);
-    if (err != ESP_OK)
-    {
-        at_send_data("+ERR:config_set_rawtx_mode failed\r\n");
-        at_send_error();
-        return;
-    }
-
-    at_send_data("+RAWTX:set to %ld (%s, saved, REBOOT REQUIRED)\r\n",
-                 val, val ? "Raw 802.11 TX" : "UDP via WiFi");
-    at_send_ok();
-}
-
 static void cmd_wch_query(void)
 {
     device_config_t cfg;
@@ -1128,6 +1115,117 @@ static void cmd_wch_set(const char *args)
     }
 
     at_send_data("+WCH:set to %ld (saved, applies on next boot/raw TX start)\r\n", val);
+    at_send_ok();
+}
+
+/* AT+XPORT? — показать текущий транспорт (0=UDP, 1=TCP, 2=RawTX).
+ * AT+XPORT=n — установить, авто-сохранение в NVS, применить HOTRESTART. */
+static void cmd_xport_query(void)
+{
+    device_config_t cfg;
+    config_get_copy(&cfg);
+    const char *name;
+    switch (cfg.transport_mode)
+    {
+    case TRANSPORT_MODE_TCP:   name = "TCP"; break;
+    case TRANSPORT_MODE_RAWTX: name = "Raw 802.11 TX"; break;
+    case TRANSPORT_MODE_UDP:
+    default:                   name = "UDP"; break;
+    }
+    at_send_data("+XPORT:%u (%s)\r\n", (unsigned)cfg.transport_mode, name);
+    at_send_ok();
+}
+
+static void cmd_xport_set(const char *args)
+{
+    char *endptr = NULL;
+    long val = strtol(args, &endptr, 10);
+    if (endptr == args || *endptr != '\0' ||
+        val < 0 || val > TRANSPORT_MODE_RAWTX)
+    {
+        at_send_data("+ERR:xport must be 0=UDP, 1=TCP, 2=RawTX\r\n");
+        at_send_error();
+        return;
+    }
+
+    esp_err_t err = config_set_transport_mode((uint8_t)val);
+    if (err != ESP_OK)
+    {
+        at_send_data("+ERR:config_set_transport_mode failed\r\n");
+        at_send_error();
+        return;
+    }
+
+    at_send_data("+XPORT:set to %ld (saved, use AT+HOTRESTART to apply)\r\n", val);
+    at_send_ok();
+}
+
+/* AT+TIMING? — вывести текущие задержки I2S RX.
+ * AT+TIMING=sd,ws,bck — установить (0..3 каждый, сохраняется в NVS).
+ * Применяется при следующем AT+HOTRESTART (или старте стрима). */
+static void cmd_timing_query(void)
+{
+    device_config_t cfg;
+    config_get_copy(&cfg);
+    at_send_data("+TIMING:sd=%u,ws=%u,bck=%u\r\n",
+                 (unsigned)cfg.i2s_timing_sd_delay,
+                 (unsigned)cfg.i2s_timing_ws_delay,
+                 (unsigned)cfg.i2s_timing_bck_delay);
+    at_send_ok();
+}
+
+static void cmd_timing_set(const char *args)
+{
+    /* Format: sd,ws,bck — три целых 0..3 через запятую. */
+    char buf[32];
+    strncpy(buf, args, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char *p = buf;
+    char *endptr = NULL;
+    long sd = strtol(p, &endptr, 10);
+    if (endptr == p || *endptr != ',')
+    {
+        at_send_data("+ERR:format is sd,ws,bck (each 0-3)\r\n");
+        at_send_error();
+        return;
+    }
+    p = endptr + 1;
+    long ws = strtol(p, &endptr, 10);
+    if (endptr == p || *endptr != ',')
+    {
+        at_send_data("+ERR:format is sd,ws,bck (each 0-3)\r\n");
+        at_send_error();
+        return;
+    }
+    p = endptr + 1;
+    long bck = strtol(p, &endptr, 10);
+    if (endptr == p || *endptr != '\0')
+    {
+        at_send_data("+ERR:format is sd,ws,bck (each 0-3)\r\n");
+        at_send_error();
+        return;
+    }
+
+    if (sd < 0 || sd > I2S_TIMING_DELAY_MAX ||
+        ws < 0 || ws > I2S_TIMING_DELAY_MAX ||
+        bck < 0 || bck > I2S_TIMING_DELAY_MAX)
+    {
+        at_send_data("+ERR:each value must be 0-%d\r\n", I2S_TIMING_DELAY_MAX);
+        at_send_error();
+        return;
+    }
+
+    esp_err_t err = config_set_i2s_timing((uint8_t)sd, (uint8_t)ws, (uint8_t)bck);
+    if (err != ESP_OK)
+    {
+        at_send_data("+ERR:config_set_i2s_timing failed\r\n");
+        at_send_error();
+        return;
+    }
+
+    at_send_data("+TIMING:set to sd=%ld,ws=%ld,bck=%ld (saved, use AT+HOTRESTART to apply)\r\n",
+                 sd, ws, bck);
     at_send_ok();
 }
 
@@ -1185,7 +1283,7 @@ static void cmd_hotrestart(void)
      * stream start. This prevents HOTRESTART from overriding an
      * intentional stop.
      *
-     * Does NOT reload NVS-only boot params like WiFi SSID, rawtx_mode,
+     * Does NOT reload NVS-only boot params like WiFi SSID, transport_mode,
      * or svc_port - for those, use AT+RST (full reboot). */
     if (!streaming_is_active())
     {
@@ -1254,12 +1352,21 @@ static void cmd_status(void)
     at_send_data("+STATUS:agc=%u (0=OFF 1=LOW 2=MEDIUM 3=HIGH)\r\n", (unsigned)cfg.agc_mode);
     at_send_data("+STATUS:codec=%u (%s)\r\n", (unsigned)cfg.codec_mode,
                  cfg.codec_mode == CODEC_MODE_PCM ? "PCM" : "ADPCM");
-    at_send_data("+STATUS:rawtx=%u (%s)\r\n", (unsigned)cfg.rawtx_mode,
-                 cfg.rawtx_mode ? "Raw 802.11 TX" : "UDP");
-    if (cfg.rawtx_mode)
+    {
+        const char *xname = "UDP";
+        if (cfg.transport_mode == TRANSPORT_MODE_TCP) xname = "TCP";
+        else if (cfg.transport_mode == TRANSPORT_MODE_RAWTX) xname = "Raw 802.11 TX";
+        at_send_data("+STATUS:transport=%u (%s)\r\n",
+                     (unsigned)cfg.transport_mode, xname);
+    }
+    if (cfg.transport_mode == TRANSPORT_MODE_RAWTX)
     {
         at_send_data("+STATUS:wifi_channel=%u\r\n", (unsigned)cfg.wifi_channel);
     }
+    at_send_data("+STATUS:i2s_timing=sd=%u,ws=%u,bck=%u\r\n",
+                 (unsigned)cfg.i2s_timing_sd_delay,
+                 (unsigned)cfg.i2s_timing_ws_delay,
+                 (unsigned)cfg.i2s_timing_bck_delay);
 #if BATTERY_ENABLED
     {
         uint32_t batt_mv = battery_get_last_mv();
@@ -1300,8 +1407,15 @@ static void cmd_status(void)
                      cfg.channel_format, ch_desc,
                      (unsigned)channel_format_to_count(cfg.channel_format));
     }
-    at_send_data("+STATUS:bitrate=%u\r\n",
-                 (unsigned)(cfg.sample_rate * 4 * channel_format_to_count(cfg.channel_format)));
+    {
+        /* Bitrate depends on codec: ADPCM = 4 bits/sample, PCM = bits_per_sample
+         * bits/sample. Previously always used 4, showing wrong bitrate for PCM. */
+        unsigned bits_per_codec = (cfg.codec_mode == CODEC_MODE_PCM)
+                                      ? cfg.bits_per_sample : 4;
+        at_send_data("+STATUS:bitrate=%u\r\n",
+                     (unsigned)(cfg.sample_rate * bits_per_codec *
+                                channel_format_to_count(cfg.channel_format)));
+    }
     at_send_data("+STATUS:error=%s (%d)\r\n",
                  st.error_code == 0 ? "NONE" : st.error_code == 1 ? "MEMORY"
                                            : st.error_code == 2   ? "I2S"

@@ -7,10 +7,10 @@
  *    sets a fixed channel, and marks WiFi as "ready" for esp_wifi_80211_tx.
  */
 
-#include "wifi_sta.h"
 
 #include <string.h>
 #include "freertos/FreeRTOS.h"
+#include "board_config.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 
@@ -19,20 +19,27 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "tcpip_adapter.h"
+#include "wifi_sta.h"
 
-#include "board_config.h"
+
 #include "svc_port.h"
 
 static const char *TAG = "wifi_sta";
 
-#define WIFI_EVT_CONNECTED   (1 << 0)
-#define WIFI_EVT_GOT_IP      (1 << 1)
-#define WIFI_EVT_STA_STARTED (1 << 2)  /* raw TX: WIFI_EVENT_STA_START fired -> radio up */
+#define WIFI_EVT_CONNECTED (1 << 0)
+#define WIFI_EVT_GOT_IP (1 << 1)
+#define WIFI_EVT_STA_STARTED (1 << 2) /* raw TX: WIFI_EVENT_STA_START fired -> radio up */
 
 static EventGroupHandle_t s_wifi_evt = NULL;
 static SemaphoreHandle_t s_backoff_mtx = NULL;
 static uint32_t s_backoff_ms = WIFI_RECONNECT_BACKOFF_MIN_MS;
 static bool s_initialized = false;
+
+/* Reconnect timer — scheduled by wifi_event_handler on STA_DISCONNECTED to
+ * call esp_wifi_connect() after a backoff delay. File-scope (not
+ * function-static) so wifi_sta_deinit() can stop it before esp_wifi_stop(),
+ * preventing the callback from firing on a shut-down radio. */
+static esp_timer_handle_t s_reconnect_timer = NULL;
 
 /* Increase raw TX data rate from default 1 Mbps to 54 Mbps.
  * Without this, esp_wifi_80211_tx() uses 1 Mbps base rate -> at 200 pkt/s
@@ -102,17 +109,15 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
             /* FIX B3: Use a timer instead of vTaskDelay to avoid blocking the
              * event loop task. The default event task processes ALL events
              * (WiFi, IP, etc.) - blocking it for up to 30s starves everything. */
-            static esp_timer_handle_t reconnect_timer = NULL;
-            if (!reconnect_timer)
+            if (!s_reconnect_timer)
             {
                 const esp_timer_create_args_t timer_args = {
                     .callback = (void *)esp_wifi_connect,
-                    .name = "wifi_reconnect"
-                };
-                esp_timer_create(&timer_args, &reconnect_timer);
+                    .name = "wifi_reconnect"};
+                esp_timer_create(&timer_args, &s_reconnect_timer);
             }
-            esp_timer_stop(reconnect_timer);
-            esp_timer_start_once(reconnect_timer, (uint64_t)delay * 1000);
+            esp_timer_stop(s_reconnect_timer);
+            esp_timer_start_once(s_reconnect_timer, (uint64_t)delay * 1000);
             break;
         }
         default:
@@ -150,9 +155,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
  * xEventGroupWaitBits() is therefore safe (FreeRTOS event-group ops use
  * critical sections, providing the necessary memory barrier). `volatile`
  * is kept for intent documentation. */
-typedef struct {
-    uint8_t            channel;
-    volatile bool      configured;
+typedef struct
+{
+    uint8_t channel;
+    volatile bool configured;
     volatile esp_err_t config_err;
 } raw_tx_ctx_t;
 
@@ -216,7 +222,8 @@ static void wifi_raw_event_handler(void *arg, esp_event_base_t base,
     if (err != ESP_OK)
     {
         ESP_LOGW(TAG, "wifi_set_user_fixed_rate failed: %s - "
-                      "continuing with default rate", esp_err_to_name(err));
+                      "continuing with default rate",
+                 esp_err_to_name(err));
     }
     else
     {
@@ -379,9 +386,9 @@ esp_err_t wifi_sta_init_raw(uint8_t channel, uint8_t tx_power)
     /* Set up the context shared with the STA_START handler BEFORE registering
      * the handler / starting WiFi. The handler reads s_raw_ctx.channel and
      * writes s_raw_ctx.configured / .config_err. */
-    s_raw_ctx.channel      = channel;
-    s_raw_ctx.configured   = false;
-    s_raw_ctx.config_err   = ESP_OK;
+    s_raw_ctx.channel = channel;
+    s_raw_ctx.configured = false;
+    s_raw_ctx.config_err = ESP_OK;
 
     /* 1. Init WiFi hardware (esp_wifi_init, set_mode). */
     esp_err_t err = wifi_hw_init();
@@ -447,7 +454,8 @@ esp_err_t wifi_sta_init_raw(uint8_t channel, uint8_t tx_power)
 
     s_initialized = true;
     ESP_LOGI(TAG, "WiFi initialized (Raw 802.11 TX mode, channel %d, "
-                  "protocol=11B, rate=11 Mbps)", channel);
+                  "protocol=11B, rate=11 Mbps)",
+             channel);
     return ESP_OK;
 }
 
@@ -477,6 +485,16 @@ esp_err_t wifi_sta_deinit(void)
     /* Raw-TX-mode handler (registered by wifi_sta_init_raw). */
     esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_STA_START,
                                  wifi_raw_event_handler);
+
+    /* Stop any pending reconnect timer before shutting down the radio.
+     * Without this, a STA_DISCONNECTED that arrived just before deinit
+     * would schedule esp_wifi_connect() after esp_wifi_stop()/deinit(),
+     * calling into a shut-down driver (esp_wifi_connect on a stopped
+     * radio returns an error or crashes depending on SDK state). */
+    if (s_reconnect_timer)
+    {
+        esp_timer_stop(s_reconnect_timer);
+    }
 
     esp_wifi_stop();
     esp_wifi_deinit();

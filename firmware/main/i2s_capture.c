@@ -20,13 +20,16 @@
  *   (low 8 bits are always 0x00 = padding).
  */
 
-#include "i2s_capture.h"
 
 #include "freertos/FreeRTOS.h"
+#include "board_config.h"
 #include "driver/i2s.h"
 #include "esp_log.h"
+#include "esp8266/i2s_struct.h"
+#include "esp8266/eagle_soc.h"
+#include "i2s_capture.h"
 
-#include "board_config.h"
+
 
 static const char *TAG = "i2s_cap";
 #define I2S_PORT I2S_NUM_0
@@ -41,6 +44,9 @@ static uint8_t s_gain = 32;        /* 0=bypass, 1..64 = multiplier */
 static uint8_t s_agc_mode = 0;     /* 0=OFF, 1=LOW, 2=MEDIUM, 3=HIGH */
 static uint8_t s_agc_attack = 75;  /* derived from s_agc_mode at init */
 static uint8_t s_agc_release = 20; /* derived from s_agc_mode at init */
+static uint8_t s_timing_sd_delay = 0;   /* I2S.timing.rx_sd_in_delay (0..3) */
+static uint8_t s_timing_ws_delay = 0;   /* I2S.timing.rx_ws_in_delay (0..3) */
+static uint8_t s_timing_bck_delay = 0;  /* I2S.timing.rx_bck_in_delay (0..3) */
 
 /* AGC state - persists across frames within a stream, reset on init.
  *
@@ -156,8 +162,15 @@ uint32_t i2s_capture_compute_frame_ms(uint32_t sample_rate, int channels,
             continue; /* DMA minimum */
         if (samples > max_samples)
             continue; /* MTU limit */
+        /* Even-sample constraint:
+         *   - ADPCM (codec_mode != 1): packs 2 samples per byte, samples MUST
+         *     be even. Skip odd.
+         *   - PCM: не скипаем нечётные здесь. main.c округляет samples_per_frame
+         *     вниз до кратного 8 (16-bit) / 4 (24-bit), что решает и чётность,
+         *     и SLC word-alignment, и rw_pos drift. Скипать здесь = выбрать
+         *     слишком маленький frame_ms (5ms вместо 15ms для 44100 PCM). */
         if (codec_mode != 1 && (samples & 1))
-            continue; /* ADPCM even */
+            continue;
         return ms;
     }
 
@@ -175,6 +188,7 @@ uint32_t i2s_capture_compute_frame_ms(uint32_t sample_rate, int channels,
             continue;
         if (samples > max_samples)
             continue;
+        /* Same even-sample constraint as the preferred loop (ADPCM only). */
         if (codec_mode != 1 && (samples & 1))
             continue;
         return (uint32_t)ms;
@@ -184,7 +198,9 @@ uint32_t i2s_capture_compute_frame_ms(uint32_t sample_rate, int channels,
 
 esp_err_t i2s_capture_init(uint32_t sample_rate, int bits, int comm_format,
                            int channel_format, int samples_per_frame,
-                           uint32_t frame_ms, uint8_t gain, uint8_t agc_mode)
+                           uint32_t frame_ms, uint8_t gain, uint8_t agc_mode,
+                           uint8_t timing_sd_delay, uint8_t timing_ws_delay,
+                           uint8_t timing_bck_delay)
 {
     if (s_initialized)
         return ESP_ERR_INVALID_STATE;
@@ -198,6 +214,12 @@ esp_err_t i2s_capture_init(uint32_t sample_rate, int bits, int comm_format,
         gain = 32;
     if (agc_mode > AGC_MODE_HIGH)
         agc_mode = AGC_MODE_MEDIUM;
+    if (timing_sd_delay > I2S_TIMING_DELAY_MAX)
+        timing_sd_delay = 0;
+    if (timing_ws_delay > I2S_TIMING_DELAY_MAX)
+        timing_ws_delay = 0;
+    if (timing_bck_delay > I2S_TIMING_DELAY_MAX)
+        timing_bck_delay = 0;
 
     s_bits = bits;
     s_channels = i2s_capture_channel_count(channel_format);
@@ -205,6 +227,9 @@ esp_err_t i2s_capture_init(uint32_t sample_rate, int bits, int comm_format,
     s_frame_ms = frame_ms;
     s_gain = gain;
     s_agc_mode = agc_mode;
+    s_timing_sd_delay  = timing_sd_delay;
+    s_timing_ws_delay  = timing_ws_delay;
+    s_timing_bck_delay = timing_bck_delay;
 
     /* Resolve AGC preset to attack/release speeds. */
     switch (agc_mode)
@@ -230,7 +255,13 @@ esp_err_t i2s_capture_init(uint32_t sample_rate, int bits, int comm_format,
 
     /* DMA-буфер = 1/4 PCM-кадра -> 4 события RX_DONE на кадр.
      * Это улучшает stop-респонсивность (проверка streaming_is_active() в 4 раза чаще).
-     * Драйвер может срезать dma_buf_len если буфер > 4092 байт. */
+     * Драйвер может срезать dma_buf_len если буфер > 4092 байт.
+     *
+     * samples_per_frame уже выровнено в main.c:
+     *   16-bit: кратно 8 → dma_buf_len = samples/4 = чётный → blocksize ≡ 0 (mod 4)
+     *   24-bit: кратно 4 → blocksize = dma_buf_len × 4 ≡ 0 (mod 4)
+     * Это гарантирует: SLC word-alignment (нет нулевых сэмплов) И
+     * want кратен buf_size (нет rw_pos дрейфа, нет потери сэмплов). */
     int dma_buf_len = samples_per_frame / 4;
     if (dma_buf_len < 8)
         dma_buf_len = 8;
@@ -312,8 +343,29 @@ esp_err_t i2s_capture_init(uint32_t sample_rate, int bits, int comm_format,
         return err;
     }
 
+    /* Apply RX input timing delays (TRM §10.2.1.6, I2S.timing register).
+     * Драйвер установлен → регистры I2S доступны. Делаем до старта захвата. */
+    i2s_capture_apply_timing(s_timing_sd_delay, s_timing_ws_delay,
+                             s_timing_bck_delay);
+    if (s_timing_sd_delay || s_timing_ws_delay || s_timing_bck_delay)
+    {
+        ESP_LOGI(TAG, "I2S RX timing: sd=%u ws=%u bck=%u",
+                 (unsigned)s_timing_sd_delay, (unsigned)s_timing_ws_delay,
+                 (unsigned)s_timing_bck_delay);
+    }
+
     s_initialized = true;
     return ESP_OK;
+}
+
+void i2s_capture_apply_timing(int sd_delay, int ws_delay, int bck_delay)
+{
+    /* TRM §10.2.1.6: каждый поле 2 бита (0..3). Маскируем на всякий случай. */
+    I2S0.timing.rx_sd_in_delay  = sd_delay  & 0x3;
+    I2S0.timing.rx_ws_in_delay  = ws_delay  & 0x3;
+    I2S0.timing.rx_bck_in_delay = bck_delay & 0x3;
+    /* Memory barrier — гарантируем, что запись завершится до возврата. */
+    asm volatile("" ::: "memory");
 }
 
 esp_err_t i2s_capture_deinit(void)
@@ -464,6 +516,8 @@ esp_err_t i2s_capture_read(int32_t *buf, int buf_len, int *samples_read)
     if (s_bits == 16)
     {
         /* 16-bit mode: 32-bit DMA word = [S_N hi16 | S_N+1 lo16].
+         * Both halves carry real samples (in ONLY_LEFT mode both slots
+         * capture the left channel; in RIGHT_LEFT stereo they carry L/R).
          * Mono: swap pairs (little-endian). Stereo: already interleaved.
          * Then sign-extend int16 -> int32. */
         int16_t *s = (int16_t *)buf;

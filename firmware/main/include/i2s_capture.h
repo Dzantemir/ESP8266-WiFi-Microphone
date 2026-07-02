@@ -17,9 +17,10 @@
  *
  * 16-bit mode (rx_fifo_mod=1, ONLY_LEFT/RIGHT):
  *   Each 32-bit DMA word contains TWO 16-bit samples packed as
- *   [Sample_N (hi16) | Sample_N+1 (lo16)]. On little-endian Xtensa,
- *   reading as int16_t* gives pairs in swapped order; we swap them
- *   back before sign-extending into int32_t.
+ *   [Sample_N (hi16) | Sample_N+1 (lo16)]. Both halves carry real audio
+ *   (in ONLY_LEFT mode both I2S slots capture the left channel). On
+ *   little-endian Xtensa, reading as int16_t* gives pairs in swapped
+ *   order; we swap them back before sign-extending into int32_t.
  *
  * 24-bit mode (rx_fifo_mod=3, ONLY_LEFT/RIGHT):
  *   Each 32-bit DMA word contains ONE 24-bit sample LEFT-justified in
@@ -43,10 +44,10 @@
  *   - samples_per_frame = rate x frame_ms / 1000 is even (ADPCM requirement)
  *   - samples_per_frame / 4 >= 32 (SDK DMA buffer minimum)
  *   - UDP packet = 16 + channels x (4 + samples/2) <= 1400 bytes (MTU safe)
- *   - If rawtx_mode: air_time/sec <= 0.95 (Raw TX throughput limit)
+ *   - If transport_mode == RawTX: air_time/sec <= 0.95 (Raw TX throughput limit)
  * Prefers 20ms, then tries 10/30/40/60ms in order.
  *
- * rawtx_mode: when true, enforces an additional constraint for Raw 802.11 TX.
+ * RawTX transport: enforces an additional constraint for Raw 802.11 TX.
  *   esp_wifi_80211_tx is limited to ~1 Mbps effective throughput (ppTxPkt
  *   driver overhead + CSMA/CA). PCM at high bitrates exceeds this, causing
  *   50%+ packet drops. The constraint is:
@@ -69,7 +70,12 @@ uint32_t i2s_capture_compute_frame_ms(uint32_t sample_rate, int channels,
  *       Used only when agc_mode=0 (OFF).
  * agc_mode: 0=OFF (use fixed gain), 1=LOW, 2=MEDIUM, 3=HIGH.
  *           Each preset has tuned attack/release speeds. See board_config.h
- *           AGC_LOW/MED/HIGH_ATTACK/RELEASE constants. */
+ *           AGC_LOW/MED/HIGH_ATTACK/RELEASE constants.
+ * timing_sd_delay / timing_ws_delay / timing_bck_delay:
+ *           RX input sample delays (0..3) — ESP8266 TRM §10.2.1.6,
+ *           I2S.timing register. Задержка в тактах APB (12.5 нс @ 80 МГц).
+ *           Применяются после i2s_driver_install вызовом
+ *           i2s_capture_apply_timing(). 0 = без задержки. */
 esp_err_t i2s_capture_init(uint32_t sample_rate,
                             int bits_per_sample,
                             int comm_format,
@@ -77,10 +83,23 @@ esp_err_t i2s_capture_init(uint32_t sample_rate,
                             int samples_per_frame,
                             uint32_t frame_ms,
                             uint8_t gain,
-                            uint8_t agc_mode);
+                            uint8_t agc_mode,
+                            uint8_t timing_sd_delay,
+                            uint8_t timing_ws_delay,
+                            uint8_t timing_bck_delay);
 
 /* Deinitialize I2S capture and free resources. */
 esp_err_t i2s_capture_deinit(void);
+
+/* Применяет RX input timing delays к I2S-периферии (регистр I2S.timing).
+ * Каждый аргумент маскируется до 2 бит (0..3) и пишется в
+ *   I2S0.timing.rx_sd_in_delay  (задержка DATA)
+ *   I2S0.timing.rx_ws_in_delay  (задержка WS)
+ *   I2S0.timing.rx_bck_in_delay (задержка BCK)
+ * Используется внутри i2s_capture_init; также может вызываться отдельно
+ * для смены тайминга в рантайме (после i2s_capture_init, но во время
+ * стрима — на свой риск, I2S должен быть остановлен). */
+void i2s_capture_apply_timing(int sd_delay, int ws_delay, int bck_delay);
 
 /*
  * Read samples from I2S DMA into buf.

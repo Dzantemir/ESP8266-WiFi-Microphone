@@ -16,10 +16,11 @@
 #include "esp_sleep.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
+#include "board_config.h"
+
 #include "freertos/task.h"
 
 #include "battery.h"
-#include "board_config.h"
 
 #include "driver/adc.h"
 

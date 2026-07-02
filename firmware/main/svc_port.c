@@ -8,14 +8,12 @@
  * Uses POSIX sockets (lwip/sockets.h) on ESP8266 RTOS SDK v3.4.
  */
 
-#include "svc_port.h"
-#include "svc_protocol.h"
-#include "config_mgr.h"
 
 #include <string.h>
 #include <errno.h>
 
 #include "freertos/FreeRTOS.h"
+#include "board_config.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "freertos/event_groups.h"
@@ -23,13 +21,16 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
+#include "svc_port.h"
+#include "svc_protocol.h"
+#include "config_mgr.h"
 
 #include "tcpip_adapter.h"
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
 #include "lwip/def.h" /* ntohs() */
 
-#include "board_config.h"
+
 extern uint32_t streaming_get_frame_ms(void);
 
 static const char *TAG = "svc_port";
@@ -409,6 +410,7 @@ static void build_info_payload(svc_info_payload_t *info)
     info->sample_rate = cfg.sample_rate;
     info->frame_ms = streaming_get_frame_ms();
     info->bits_per_sample = cfg.bits_per_sample;
+    info->transport_mode = cfg.transport_mode;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     info->status = (s_state == SVC_STREAMING) ? SVC_STATUS_STREAMING : SVC_STATUS_IDLE;
@@ -443,13 +445,19 @@ static void send_info(uint16_t req_seq, const ip_addr_t *dest, uint16_t port)
 
     uint8_t buf[SVC_HEADER_SIZE + sizeof(svc_info_payload_t)];
 
-    uint16_t seq;
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    seq = s_seq_counter++;
-    xSemaphoreGive(s_mutex);
-
+    /* Use req_seq directly for the header sequence number.
+     *
+     * Callers are responsible for sourcing the seq:
+     *   - DISCOVER/CONFIGURE/STOP replies: pass the request's seq (echo)
+     *   - Periodic / error-triggered INFO: caller increments s_seq_counter
+     *     under s_mutex and passes the result.
+     *
+     * Previously send_info ALSO incremented s_seq_counter itself, causing a
+     * double increment — seq numbers jumped by 2, and reply headers never
+     * echoed the request's seq (the req_seq parameter was silently
+     * discarded). */
     svc_header_t hdr;
-    svc_header_init(&hdr, SVC_CMD_INFO, seq, sizeof(svc_info_payload_t));
+    svc_header_init(&hdr, SVC_CMD_INFO, req_seq, sizeof(svc_info_payload_t));
     memcpy(buf, &hdr, SVC_HEADER_SIZE);
     memcpy(buf + SVC_HEADER_SIZE, &info, sizeof(svc_info_payload_t));
 

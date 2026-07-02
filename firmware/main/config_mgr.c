@@ -6,15 +6,16 @@
  * immediately so settings survive reset.
  */
 
-#include "config_mgr.h"
 
 #include <string.h>
 #include "freertos/FreeRTOS.h"
+#include "board_config.h"
+
 #include "freertos/semphr.h"
 #include "nvs.h"
 #include "esp_log.h"
+#include "config_mgr.h"
 
-#include "board_config.h"
 
 static const char *TAG = "config_mgr";
 static const char *NVS_NAMESPACE = "streamer";
@@ -40,8 +41,11 @@ static void set_defaults(device_config_t *cfg)
     cfg->gain = AUDIO_GAIN_DEFAULT;
     cfg->agc_mode = AUDIO_AGC_DEFAULT;
     cfg->codec_mode = AUDIO_CODEC_DEFAULT;
-    cfg->rawtx_mode = RAWTX_MODE_DEFAULT;
     cfg->wifi_channel = RAWTX_CHANNEL_DEFAULT;
+    cfg->transport_mode = TRANSPORT_MODE_DEFAULT;
+    cfg->i2s_timing_sd_delay  = I2S_TIMING_SD_DELAY_DEFAULT;
+    cfg->i2s_timing_ws_delay  = I2S_TIMING_WS_DELAY_DEFAULT;
+    cfg->i2s_timing_bck_delay = I2S_TIMING_BCK_DELAY_DEFAULT;
 }
 
 /* ---- NVS load/save ---- */
@@ -77,8 +81,11 @@ static esp_err_t load_from_nvs(device_config_t *cfg)
     nvs_get_u8(h, "gain", &cfg->gain);
     nvs_get_u8(h, "agc", &cfg->agc_mode);
     nvs_get_u8(h, "codec", &cfg->codec_mode);
-    nvs_get_u8(h, "rawtx", &cfg->rawtx_mode);
     nvs_get_u8(h, "wch", &cfg->wifi_channel);
+    nvs_get_u8(h, "xport", &cfg->transport_mode);
+    nvs_get_u8(h, "tmsd", &cfg->i2s_timing_sd_delay);
+    nvs_get_u8(h, "tmws", &cfg->i2s_timing_ws_delay);
+    nvs_get_u8(h, "tmbck", &cfg->i2s_timing_bck_delay);
 
     nvs_close(h);
     return ESP_OK;
@@ -105,8 +112,11 @@ static esp_err_t save_to_nvs(const device_config_t *cfg)
     nvs_set_u8(h, "gain", cfg->gain);
     nvs_set_u8(h, "agc", cfg->agc_mode);
     nvs_set_u8(h, "codec", cfg->codec_mode);
-    nvs_set_u8(h, "rawtx", cfg->rawtx_mode);
     nvs_set_u8(h, "wch", cfg->wifi_channel);
+    nvs_set_u8(h, "xport", cfg->transport_mode);
+    nvs_set_u8(h, "tmsd", cfg->i2s_timing_sd_delay);
+    nvs_set_u8(h, "tmws", cfg->i2s_timing_ws_delay);
+    nvs_set_u8(h, "tmbck", cfg->i2s_timing_bck_delay);
 
     err = nvs_commit(h);
     nvs_close(h);
@@ -179,13 +189,25 @@ esp_err_t config_mgr_init(void)
     {
         s_config.codec_mode = AUDIO_CODEC_DEFAULT;
     }
-    if (s_config.rawtx_mode > 1)
-    {
-        s_config.rawtx_mode = 0;
-    }
     if (s_config.wifi_channel < 1 || s_config.wifi_channel > 13)
     {
         s_config.wifi_channel = 1;
+    }
+    if (s_config.transport_mode > TRANSPORT_MODE_RAWTX)
+    {
+        s_config.transport_mode = TRANSPORT_MODE_DEFAULT;
+    }
+    if (s_config.i2s_timing_sd_delay > I2S_TIMING_DELAY_MAX)
+    {
+        s_config.i2s_timing_sd_delay = I2S_TIMING_SD_DELAY_DEFAULT;
+    }
+    if (s_config.i2s_timing_ws_delay > I2S_TIMING_DELAY_MAX)
+    {
+        s_config.i2s_timing_ws_delay = I2S_TIMING_WS_DELAY_DEFAULT;
+    }
+    if (s_config.i2s_timing_bck_delay > I2S_TIMING_DELAY_MAX)
+    {
+        s_config.i2s_timing_bck_delay = I2S_TIMING_BCK_DELAY_DEFAULT;
     }
     ESP_LOGI(TAG, "Runtime audio: %u Hz, %d ms, %d-bit, fmt=%d, ch=%d, gain=%u, agc=%u, codec=%u",
              (unsigned)s_config.sample_rate, 20,
@@ -405,21 +427,6 @@ esp_err_t config_set_codec_mode(uint8_t mode)
     return err;
 }
 
-esp_err_t config_set_rawtx_mode(uint8_t mode)
-{
-    if (mode > 1)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    s_config.rawtx_mode = mode;
-    esp_err_t err = save_locked();
-    xSemaphoreGive(s_mutex);
-    if (err == ESP_OK)
-        ESP_LOGI(TAG, "Config saved to NVS (rawtx_mode=%u)", (unsigned)mode);
-    return err;
-}
-
 esp_err_t config_set_wifi_channel(uint8_t ch)
 {
     if (ch < 1 || ch > 13)
@@ -432,6 +439,41 @@ esp_err_t config_set_wifi_channel(uint8_t ch)
     xSemaphoreGive(s_mutex);
     if (err == ESP_OK)
         ESP_LOGI(TAG, "Config saved to NVS (wifi_channel=%u)", (unsigned)ch);
+    return err;
+}
+
+esp_err_t config_set_transport_mode(uint8_t mode)
+{
+    if (mode > TRANSPORT_MODE_RAWTX)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_config.transport_mode = mode;
+    esp_err_t err = save_locked();
+    xSemaphoreGive(s_mutex);
+    if (err == ESP_OK)
+        ESP_LOGI(TAG, "Config saved to NVS (transport_mode=%u)", (unsigned)mode);
+    return err;
+}
+
+esp_err_t config_set_i2s_timing(uint8_t sd_delay, uint8_t ws_delay, uint8_t bck_delay)
+{
+    if (sd_delay > I2S_TIMING_DELAY_MAX ||
+        ws_delay > I2S_TIMING_DELAY_MAX ||
+        bck_delay > I2S_TIMING_DELAY_MAX)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_config.i2s_timing_sd_delay  = sd_delay;
+    s_config.i2s_timing_ws_delay  = ws_delay;
+    s_config.i2s_timing_bck_delay = bck_delay;
+    esp_err_t err = save_locked();
+    xSemaphoreGive(s_mutex);
+    if (err == ESP_OK)
+        ESP_LOGI(TAG, "Config saved to NVS (i2s_timing: sd=%u ws=%u bck=%u)",
+                 (unsigned)sd_delay, (unsigned)ws_delay, (unsigned)bck_delay);
     return err;
 }
 

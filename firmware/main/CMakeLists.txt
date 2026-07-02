@@ -10,6 +10,8 @@ set(COMPONENT_SRCS
     "adpcm_encoder.c"
     "tpdf_dither.c"
     "udp_stream.c"
+    "tcp_stream.c"
+    "rawtx_stream.c"
     "wifi_sta.c"
     "svc_port.c"
     "at_cmd.c"

@@ -118,6 +118,79 @@ static inline bool sample_rate_is_valid(uint32_t rate)
 #define AGC_HIGH_ATTACK   90
 #define AGC_HIGH_RELEASE  50
 
+/* I2S RX input timing delays (ESP8266 TRM §10.2.1.6, I2S.timing register).
+ * Each delay is 0..3 (2 бита): задержка входного сэмпла в тактах APB
+ * (12.5 нс при 80 МГц). Полезно для компенсации skew'а между INMP441
+ * и BCK/WS на длинных проводах или при странном PCB-дизайне.
+ *
+ *   rx_sd_in_delay  — задержка сигнала DATA (SD) относительно BCK
+ *   rx_ws_in_delay  — задержка сигнала WS  относительно BCK
+ *   rx_bck_in_delay — задержка сигнала BCK
+ *
+ * Значение по умолчанию 0 (без задержки) подходит для INMP441
+ * на коротких проводах. Настраивается через menuconfig или AT+TIMING.
+ * Применяется при i2s_capture_init (после i2s_driver_install). */
+#define I2S_TIMING_DELAY_MAX 3
+
+#ifdef CONFIG_STREAMER_I2S_TIMING_SD_DELAY
+#define I2S_TIMING_SD_DELAY_DEFAULT CONFIG_STREAMER_I2S_TIMING_SD_DELAY
+#else
+#define I2S_TIMING_SD_DELAY_DEFAULT 0
+#endif
+
+#ifdef CONFIG_STREAMER_I2S_TIMING_WS_DELAY
+#define I2S_TIMING_WS_DELAY_DEFAULT CONFIG_STREAMER_I2S_TIMING_WS_DELAY
+#else
+#define I2S_TIMING_WS_DELAY_DEFAULT 0
+#endif
+
+#ifdef CONFIG_STREAMER_I2S_TIMING_BCK_DELAY
+#define I2S_TIMING_BCK_DELAY_DEFAULT CONFIG_STREAMER_I2S_TIMING_BCK_DELAY
+#else
+#define I2S_TIMING_BCK_DELAY_DEFAULT 0
+#endif
+
+/* Transport mode — какой транспорт использовать для аудио-потока.
+ *   0 = UDP: классический, datagram, без гарантий доставки/порядка.
+ *   1 = TCP: ESP = listener (открывает listening socket), сервер подключается.
+ *            Framing: [u16 length][pkt_header 16B][payload].
+ *            TCP_NODELAY + неблокирующий send (drop при переполнении, как UDP).
+ *   2 = Raw 802.11 TX: broadcast raw WiFi frames (monitor mode на приёмнике).
+ * Применяется при AT+HOTRESTART. Диктуется ESP (как и каналы) — сервер
+ * узнаёт тип из INFO payload. */
+#define TRANSPORT_MODE_UDP    0
+#define TRANSPORT_MODE_TCP    1
+#define TRANSPORT_MODE_RAWTX  2
+
+#ifdef CONFIG_STREAMER_TRANSPORT_MODE
+#define TRANSPORT_MODE_DEFAULT CONFIG_STREAMER_TRANSPORT_MODE
+#else
+#define TRANSPORT_MODE_DEFAULT TRANSPORT_MODE_UDP
+#endif
+
+/* TCP transport tuning (only used when transport_mode == TRANSPORT_MODE_TCP).
+ *   SEND_TIMEOUT_MS — таймаут блокирующего send(). При истечении соединение
+ *     закрывается, accept task принимает новый connect.
+ *     LAN: 1000-2000, плохой WiFi: 3000-5000.
+ *   ACCEPT_TASK_STACK — стек фоновой задачи accept(). 1024 = минимум. */
+#ifdef CONFIG_STREAMER_TCP_SEND_TIMEOUT_MS
+#define TCP_SEND_TIMEOUT_MS CONFIG_STREAMER_TCP_SEND_TIMEOUT_MS
+#else
+#define TCP_SEND_TIMEOUT_MS 2000
+#endif
+
+#ifdef CONFIG_STREAMER_TCP_ACCEPT_TASK_STACK
+#define TCP_ACCEPT_TASK_STACK CONFIG_STREAMER_TCP_ACCEPT_TASK_STACK
+#else
+#define TCP_ACCEPT_TASK_STACK 1024
+#endif
+
+#ifdef CONFIG_STREAMER_TASK_PRIO_TCP_ACCEPT
+#define TCP_ACCEPT_TASK_PRIO CONFIG_STREAMER_TASK_PRIO_TCP_ACCEPT
+#else
+#define TCP_ACCEPT_TASK_PRIO 4
+#endif
+
 /* I2S communication format
  *   0 = Philips I2S (msb_shift=1) - standard, INMP441
  *   1 = LSB / Left-justified (msb_shift=0) */
@@ -132,7 +205,7 @@ static inline bool sample_rate_is_valid(uint32_t rate)
  *   - samples_per_frame is even (ADPCM packs 2 samples/byte)
  *   - samples_per_frame/4 >= 32 (SDK DMA minimum)
  *   - UDP packet <= 1400 bytes (MTU safe, codec & bits aware)
- *   - If rawtx_mode: air_time/sec <= 0.95 (Raw TX throughput limit) */
+ *   - If transport_mode == RawTX: air_time/sec <= 0.95 (throughput limit) */
 uint32_t i2s_capture_compute_frame_ms(uint32_t sample_rate, int channels,
                                        int codec_mode, int bits_per_sample);
 
@@ -178,18 +251,8 @@ uint32_t i2s_capture_compute_frame_ms(uint32_t sample_rate, int channels,
 #define AUDIO_CODEC_DEFAULT CODEC_MODE_ADPCM
 #endif
 
-/* WiFi transmission mode (0=UDP via router, 1=Raw 802.11 TX broadcast).
- * Raw TX mode bypasses the TCP/IP stack and sends raw 802.11 data frames
- * directly into the air on a fixed channel. No router needed.
- * Receiver must be in Monitor Mode. */
-#define RAWTX_MODE_UDP     0   /* used by RAWTX_MODE_DEFAULT */
-
-#ifdef CONFIG_STREAMER_RAWSWITCH
-#define RAWTX_MODE_DEFAULT CONFIG_STREAMER_RAWSWITCH
-#else
-#define RAWTX_MODE_DEFAULT RAWTX_MODE_UDP
-#endif
-
+/* WiFi channel for Raw 802.11 TX mode (used when transport_mode == TRANSPORT_MODE_RAWTX).
+ * Configurable via menuconfig (STREAMER_RAWTX_CHANNEL) or AT+WCH=1..13. */
 #ifdef CONFIG_STREAMER_RAWTX_CHANNEL
 #define RAWTX_CHANNEL_DEFAULT CONFIG_STREAMER_RAWTX_CHANNEL
 #else

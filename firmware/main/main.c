@@ -24,6 +24,7 @@
 #include <inttypes.h>
 
 #include "freertos/FreeRTOS.h"
+#include "board_config.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -33,7 +34,7 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 
-#include "board_config.h"
+
 #include "config_mgr.h"
 #include "wifi_sta.h"
 #include "svc_port.h"
@@ -41,7 +42,6 @@
 #include "i2s_capture.h"
 #include "adpcm_encoder.h"
 #include "tpdf_dither.h"
-#include "udp_stream.h"
 #include "packet_format.h"
 #include "at_cmd.h"
 #include "battery.h"
@@ -494,7 +494,7 @@ static void stream_task_fn(void *arg)
     int wait_count = 0;
     while (streaming_is_active())
     {
-        bool transport_ready = udp_stream_is_ready();
+        bool transport_ready = transport_is_ready();
         bool wifi_ready = ops->needs_wifi_association
                               ? wifi_sta_is_connected()
                               : true;
@@ -534,7 +534,7 @@ static void stream_task_fn(void *arg)
         if (xQueueReceive(adpcm_filled_queue, &adpcm, pdMS_TO_TICKS(100)) != pdTRUE)
             continue;
 
-        if (!udp_stream_is_ready() || !adpcm->data_len)
+        if (!transport_is_ready() || !adpcm->data_len)
         {
             dropped++;
             xQueueSend(adpcm_free_queue, &adpcm, 0);
@@ -555,7 +555,7 @@ static void stream_task_fn(void *arg)
         memcpy(pkt, &hdr, PKT_HDR_SIZE);
         memcpy(pkt + PKT_HDR_SIZE, adpcm->data, adpcm->data_len);
 
-        if (udp_stream_send(pkt, PKT_HDR_SIZE + adpcm->data_len) == ESP_OK)
+        if (transport_send(pkt, PKT_HDR_SIZE + adpcm->data_len) == ESP_OK)
         {
             sent++;
             /* Clear stale NETWORK error after successful send - the initial
@@ -636,7 +636,22 @@ static esp_err_t start_streaming(void)
     device_config_t cfg;
     config_get_copy(&cfg);
 
+    /* Re-select transport mode from config. This is CRITICAL for AT+HOTRESTART:
+     * AT+XPORT changes cfg.transport_mode in NVS, but s_active_ops was set
+     * once at boot. Without this call, switching UDP<->TCP<->RAWTX via
+     * AT+XPORT + HOTRESTART has no effect — the old transport stays active.
+     *
+     * If the transport changed, deinit the old one first (e.g. close TCP
+     * listening socket before switching to UDP). */
+    const stream_mode_ops_t *old_ops = stream_mode_ops();
+    stream_mode_init(&cfg);
     const stream_mode_ops_t *ops = stream_mode_ops();
+    if (ops != old_ops)
+    {
+        ESP_LOGI(TAG, "Transport changed — deinitializing old transport (%s)",
+                 old_ops->name);
+        old_ops->deinit();
+    }
 
     /* Resolve stream destination (UDP: from server CONFIGURE; RAWTX: none). */
     uint32_t stream_host = 0;
@@ -663,12 +678,44 @@ static esp_err_t start_streaming(void)
                                               cfg.codec_mode, cfg.bits_per_sample);
     s_samples_per_frame = (int)(s_sample_rate * s_frame_ms / 1000);
 
+    /* Align samples_per_frame to solve TWO problems at once:
+     *
+     * 1. SLC word-alignment (ESP8266 SLC передаёт 32-битными словами):
+     *    blocksize = dma_buf_len × sample_size должен быть ≡ 0 (mod 4).
+     *    Для 16-bit (sample_size=2): dma_buf_len чётный → blocksize ≡ 0 (mod 4).
+     *
+     * 2. rw_pos drift (want не кратен buf_size → i2s_read читает "хвост"
+     *    из следующего буфера, rw_pos растёт, swap-pairs ломается на
+     *    нечётном хвосте → теряется 1 сэмпл/кадр → пощипывание):
+     *    want = samples × bytes_per_sample, buf_size = dma_buf_len × sample_size.
+     *    want кратен buf_size ⇔ samples кратен dma_buf_len ⇔ samples кратен 4
+     *    (т.к. dma_buf_len = samples/4).
+     *
+     * Оба условия: samples кратно 4 И dma_buf_len чётный ⇔ samples кратно 8
+     * (для 16-bit). Для 24-bit (sample_size=4) — samples кратно 4.
+     *
+     * Пример (44100 Гц, 15ms → 661 samples):
+     *   БЕЗ выравнивания: samples=661, dl=165→164(фикс), want=1322, buf=328,
+     *     rw_pos дрейф 10 байт = 5 сэмплов (НЕЧЁТ!) → потеря 1 сэмпл/кадр
+     *   С выравниванием: samples=656, dl=164, want=1312, buf=328,
+     *     1312/328=4.0 → rw_pos=0, swap-pairs OK, дрейфа НЕТ */
+    if (cfg.bits_per_sample == 16)
+        s_samples_per_frame &= ~7;   /* кратно 8: 661→656, 882→880, 220→216 */
+    else
+        s_samples_per_frame &= ~3;   /* кратно 4 (24-bit) */
+
     ESP_LOGI(TAG, "Computed frame_ms=%u -> samples_per_frame=%d (rate=%u, ch=%u)",
              (unsigned)s_frame_ms, s_samples_per_frame,
              (unsigned)s_sample_rate, s_channels);
 
     s_adpcm_frame_bytes = s_samples_per_frame / 2;
-    s_audio_bitrate = s_sample_rate * 4 * s_channels;
+    /* Bitrate depends on codec: ADPCM = 4 bits/sample, PCM = bits_per_sample
+     * bits/sample. Previously always used 4, showing wrong bitrate for PCM. */
+    {
+        int bits_per_codec = (s_codec_mode == CODEC_MODE_PCM)
+                                 ? s_bits_per_sample : 4;
+        s_audio_bitrate = s_sample_rate * (uint32_t)bits_per_codec * s_channels;
+    }
     s_sample_rate_enum = sample_rate_to_enum(s_sample_rate);
     s_codec_mode = cfg.codec_mode;
     s_bits_per_sample = cfg.bits_per_sample;
@@ -745,7 +792,10 @@ static esp_err_t start_streaming(void)
     err = i2s_capture_init(s_sample_rate, cfg.bits_per_sample,
                            cfg.comm_format, cfg.channel_format,
                            s_samples_per_frame, s_frame_ms,
-                           cfg.gain, cfg.agc_mode);
+                           cfg.gain, cfg.agc_mode,
+                           cfg.i2s_timing_sd_delay,
+                           cfg.i2s_timing_ws_delay,
+                           cfg.i2s_timing_bck_delay);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "I2S init failed: %s", esp_err_to_name(err));
@@ -925,7 +975,7 @@ cleanup_on_fail:
 
     /* CRITICAL FIX (C1): Close transport FIRST so any task blocked in
      * sendto() returns immediately (EBADF) and can exit cleanly. */
-    udp_stream_deinit();
+    transport_deinit();
 
     /* FIX (C3): Wait for any already-created pipeline tasks to exit before
      * deleting semaphores/queues. Without this, a task created at step 9
@@ -1000,7 +1050,10 @@ static void stop_streaming(void)
      * This was the root cause of the HOTRESTART crash: force-deleted task
      * orphaned svc_port::s_mutex -> next start_streaming() deadlocked in
      * svc_port_clear_error() -> watchdog reboot after ~8s. */
-    udp_stream_deinit();
+    /* Close transport (TCP: only client conn, keep listener alive for restart;
+     * UDP/RawTX: full deinit). This unblocks any task stuck in send()/sendto()
+     * so it exits cleanly — see the EBADF comment above. */
+    transport_close_client();
 
     /* Wait for each task to exit cleanly. */
     int clean_exits = 0;
@@ -1049,8 +1102,8 @@ static void stop_streaming(void)
      * i2s_driver_uninstall() before its internal state is safe to re-init. */
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    /* udp_stream_deinit() was already called above (before wait_for_task_exit)
-     * - see C1 fix comment. */
+    /* Transport was already closed above (transport_close_client, before
+     * wait_for_task_exit) - see C1 fix comment. */
 
     stream_mode_ops()->on_stream_stopped();
 
@@ -1144,13 +1197,13 @@ void app_main(void)
         ESP_LOGW(TAG, "WiFi init failed, will retry at stream start");
     }
 
-    /* 6. Service port (UDP: starts EASSP listener; RAWTX: no-op). */
+    /* 6. Service port (UDP/TCP: starts EASSP listener; RAWTX: no-op). */
     err = stream_mode_ops()->svc_port_init(s_stream_evt_grp, cfg.svc_port);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "Service port init failed: %s", esp_err_to_name(err));
     }
-    else if (!stream_mode_is_rawtx())
+    else if (stream_mode_ops()->uses_svc_port)
     {
         ESP_LOGI(TAG, "Service port started on UDP:%u - waiting for server...",
                  (unsigned)cfg.svc_port);
@@ -1207,3 +1260,4 @@ void app_main(void)
         }
     }
 }
+ 
