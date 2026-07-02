@@ -96,11 +96,24 @@ SUB AddLog(BYVAL sText AS STRING)
     ' SendMessage from worker threads deadlocks when GUI is in WaitForSingleObject
     ' during shutdown → 3s timeout → orphan thread → DeleteCriticalSection
     ' use-after-free → crash. PostMessage never blocks.
-    ' We pass STRPTR(sLine) - safe because the string handle stays alive until
-    ' the GUI thread processes WM_APP_LOG and reads it. PowerBASIC strings use
-    ' reference counting, so the handle remains valid as long as the PostMessage
-    ' payload references it.
-    PostMessage g_hDlg, %WM_APP_LOG, 0, STRPTR(sLine)
+    '
+    ' FIX (use-after-free): The local sLine is destroyed when AddLog returns.
+    ' PostMessage only stores a raw DWORD (the pointer value) — PowerBASIC does
+    ' NOT know the pointer is referenced by the message and does NOT increment
+    ' the string's reference count. By the time WM_APP_LOG is processed, the
+    ' string data has been freed → dangling pointer → garbage or crash.
+    ' Solution: allocate a heap copy (NUL-terminated), pass its pointer in
+    ' lParam and the byte length in wParam. The GUI thread reads exactly that
+    ' many bytes, then frees the heap block.
+    LOCAL nLen  AS LONG
+    LOCAL pBuf  AS BYTE PTR
+    nLen = LEN(sLine)
+    pBuf = HeapAlloc(g_hHeap, 0, nLen + 1)
+    IF pBuf THEN
+        POKE$ pBuf, sLine
+        @pBuf[nLen] = 0          ' NUL terminator
+        PostMessage g_hDlg, %WM_APP_LOG, nLen, pBuf
+    END IF
 END SUB
 
 ' AddLogSync - synchronous AddLog for use from GUI thread only (avoids
@@ -376,7 +389,7 @@ SUB ResizeControls()
         hDWP = DeferWindowPos(hDWP, hBtn1, %NULL, 2, y, 90, btnH, dwFlags)
         hDWP = DeferWindowPos(hDWP, hBtn2, %NULL, 96, y, 90, btnH, dwFlags)
         hDWP = DeferWindowPos(hDWP, hBtn3, %NULL, cx - 92, y, 90, btnH, dwFlags)
-        hDWP = DeferWindowPos(hDWP, hBtn4, %NULL, cx - 160, y, 60, btnH, dwFlags)
+        hDWP = DeferWindowPos(hDWP, hBtn4, %NULL, cx - 200, y, 90, btnH, dwFlags)
 
         ' StatusBar: position it at the bottom, full width, fixed height.
         ' Included in DeferWindowPos batch with SWP_NOCOPYBITS to prevent
@@ -507,6 +520,14 @@ SUB UpdateDevice(BYVAL sMac AS STRING, BYVAL dwIP AS DWORD, BYVAL dwPort AS DWOR
     ' Only present in INFO v2 (33-byte payload). Guard against old 32-byte INFO.
     IF bufLen >= %EASSP_HDR_SZ + 33 THEN
         g_Devs(idx).dwBits = PEEK(BYTE, pBuf + 40)   ' bits_per_sample
+    END IF
+    ' transport_mode at payload offset 33 = pBuf+41 (INFO v2.1, 34-byte payload).
+    ' 0=UDP, 1=TCP (ESP=listener, server connects), 2=Raw 802.11 TX.
+    ' Guard against older 33-byte INFO (defaults to UDP=0).
+    IF bufLen >= %EASSP_HDR_SZ + 34 THEN
+        g_Devs(idx).dwTransport = PEEK(BYTE, pBuf + 41)   ' transport_mode
+    ELSE
+        g_Devs(idx).dwTransport = 0   ' assume UDP for old firmware
     END IF
     g_Devs(idx).dwPktsSent   = PEEK(DWORD, pBuf + 23)   ' offset 15 in payload
     g_Devs(idx).dwFreeHeap   = PEEK(DWORD, pBuf + 27)   ' offset 19 in payload
@@ -815,6 +836,57 @@ FUNCTION RateEnumToHz(BYVAL e AS LONG) AS DWORD
     END SELECT
 END FUNCTION
 
+' EspActualRate - Вычисляет ФАКТИЧЕСКУЮ частоту I2S ESP8266 для данного
+' номинала и бит.глубины I2S. Зеркалит i2s_set_rate() из firmware/i2s.c:
+'   160 МГц / (bits×2ch) / (bck_div × mclk_div), оба делителя целые 1..63.
+'
+' ЗАЧЕМ: ESP не может выдать ровно 44100 Гц — реально 43860 Гц (-0.545%).
+' Если открыть WaveOut на номинале 44100, буфер опустошается быстрее, чем
+' ESP наполняет → underrun → пощипывание/щелчки в LIVE режиме (дамп при
+' этом чистый, т.к. пишет все пакеты синхронно).
+'
+' Открываем WaveOut на фактической частоте ESP → дрейф = 0 → финальный
+' ресамплинг до частоты карты делает Windows-аудиодвижок (качественно).
+'
+' Параметры:
+'   nominalHz - номинал из INFO-пакета (8000/11025/.../48000)
+'   i2sBits   - РЕАЛЬНАЯ бит.глубина I2S (devBits из INFO, 16 или 24).
+'               НЕ outBits! Для ADPCM outBits=16, но I2S может быть 24.
+FUNCTION EspActualRate(BYVAL nominalHz AS DWORD, BYVAL i2sBits AS LONG) AS DWORD
+    LOCAL scaled AS DOUBLE
+    LOCAL i AS LONG, j AS LONG
+    LOCAL bestI AS LONG, bestJ AS LONG
+    LOCAL bestDelta AS DOUBLE, d AS DOUBLE, actual AS DOUBLE
+
+    ' 160 МГц / (bits × 2ch)
+    IF i2sBits = 24 THEN
+        scaled = 160000000.0# / 48.0#     ' 3 333 333.33
+    ELSE
+        scaled = 160000000.0# / 32.0#     ' 5 000 000
+    END IF
+
+    ' Перебор всех пар делителей 1..63 (как в прошивке)
+    bestI = 1
+    bestJ = 1
+    bestDelta = scaled                  ' больше любого возможного delta
+    FOR i = 1 TO 63
+        FOR j = i TO 63                 ' j >= i: симметрично, отсекаем дубли
+            actual = scaled / (CSNG(i) * CSNG(j))
+            d = ABS(actual - nominalHz)
+            IF d < bestDelta THEN
+                bestDelta = d
+                bestI = i
+                bestJ = j
+                IF d = 0! THEN EXIT FOR ' точное попадание
+            END IF
+        NEXT j
+        IF bestDelta = 0! THEN EXIT FOR
+    NEXT i
+
+    actual = scaled / (CSNG(bestI) * CSNG(bestJ))
+    FUNCTION = CLNG(actual)
+END FUNCTION
+
 ' CodecName - Return human-readable codec name from codec ID.
 FUNCTION CodecName(BYVAL codecId AS LONG) AS STRING
     SELECT CASE codecId
@@ -867,6 +939,10 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
     devBits = g_Devs(idx).dwBits
     LOCAL devCodec AS LONG
     devCodec = g_Devs(idx).dwCodec
+    LOCAL devTransport AS LONG
+    devTransport = g_Devs(idx).dwTransport
+    LOCAL devIP AS DWORD
+    devIP = g_Devs(idx).dwIP
     ' curRateEnum tracks the sample-rate enum (0..6) currently open in WaveOut.
     ' Initialized from devSmpRate via Hz-to-enum conversion; updated on format change.
     LOCAL curRateEnum AS LONG
@@ -878,24 +954,64 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
     IF devSmpRate < 8000 OR devSmpRate > 48000 THEN devSmpRate = 48000
     IF devBits <> 16 AND devBits <> 24 THEN devBits = 16
 
-    ' Open UDP socket on the pre-assigned audio port
+    ' Open transport: TCP connect to ESP (if transport=1) or UDP listen (default).
     fNum = FREEFILE
     ERRCLEAR
-    UDP OPEN PORT bindPort AS #fNum TIMEOUT 60000
-    IF ERR THEN
+    IF devTransport = 1 THEN
+        ' TCP mode: ESP = listener, we connect to ESP_IP:bindPort.
+        ' Retry connect every 1s until success or stream stops. ESP may
+        ' not have opened its listening socket yet (CONFIGURE → stream
+        ' start → tcp_stream_init_listen is async on ESP side).
+        LOCAL tcpHost AS STRING
+        tcpHost = FormatIP(devIP)
+        LOCAL connectAttempts AS LONG
+        connectAttempts = 0
         AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
-               ": UDP OPEN PORT " & TRIM$(STR$(bindPort)) & " FAILED err=" & TRIM$(STR$(ERR))
-        EnterCriticalSection g_csDev
-        ' NOTE: Do NOT clear hAudioThread here - main thread owns handle cleanup.
-        ' Only clear fAudioFile and dwRunning so stop logic works correctly.
-        g_Devs(idx).fAudioFile = 0
-        g_Devs(idx).dwRunning  = 0
-        LeaveCriticalSection g_csDev
-        FUNCTION = 0
-        EXIT FUNCTION
+               ": TCP connecting to " & tcpHost & ":" & TRIM$(STR$(bindPort))
+        DO WHILE g_Devs(idx).dwRunning = 0 OR g_Devs(idx).dwActive = 0
+            ' Wait until parent marks us active (set below). Actually dwRunning
+            ' is set later in this function; use a different gate. We just
+            ' attempt connect with timeout and retry.
+            EXIT DO
+        LOOP
+        DO
+            ERRCLEAR
+            TCP OPEN PORT bindPort AT tcpHost AS #fNum TIMEOUT 5000
+            IF ERR = 0 THEN EXIT DO
+            INCR connectAttempts
+            IF connectAttempts = 1 OR (connectAttempts MOD 10) = 0 THEN
+                AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+                       ": TCP connect attempt " & TRIM$(STR$(connectAttempts)) & _
+                       " failed err=" & TRIM$(STR$(ERR)) & ", retrying..."
+            END IF
+            ' Check if we should stop (parent cleared dwRunning externally)
+            IF g_Devs(idx).dwRunning = 0 AND connectAttempts > 1 THEN
+                ' Stream was stopped while we were trying to connect
+                AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & ": stream stopped during TCP connect"
+                FUNCTION = 0
+                EXIT FUNCTION
+            END IF
+            SLEEP 1000
+        LOOP
+        AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+               ": TCP connected to " & tcpHost & ":" & TRIM$(STR$(bindPort)) & _
+               " (file #" & TRIM$(STR$(fNum)) & ")"
+    ELSE
+        ' UDP mode (default): open listening UDP socket on bindPort.
+        UDP OPEN PORT bindPort AS #fNum TIMEOUT 60000
+        IF ERR THEN
+            AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+                   ": UDP OPEN PORT " & TRIM$(STR$(bindPort)) & " FAILED err=" & TRIM$(STR$(ERR))
+            EnterCriticalSection g_csDev
+            g_Devs(idx).fAudioFile = 0
+            g_Devs(idx).dwRunning  = 0
+            LeaveCriticalSection g_csDev
+            FUNCTION = 0
+            EXIT FUNCTION
+        END IF
+        AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+               ": UDP OPEN PORT " & TRIM$(STR$(bindPort)) & " OK (file #" & TRIM$(STR$(fNum)) & ")"
     END IF
-    AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
-           ": UDP OPEN PORT " & TRIM$(STR$(bindPort)) & " OK (file #" & TRIM$(STR$(fNum)) & ")"
 
     EnterCriticalSection g_csDev
     g_Devs(idx).fAudioFile = fNum
@@ -961,9 +1077,22 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
     ELSE
         outBits = 16               ' ADPCM: always 16-bit (dithered on ESP)
     END IF
+
+    ' <<<DRIFT FIX>>> открываем WaveOut на ФАКТИЧЕСКОЙ частоте I2S ESP,
+    ' иначе при 44100 Гц (реально 43860) буфер опустошается быстрее →
+    ' underrun → пощипывание в LIVE (дамп чистый, т.к. пишет синхронно).
+    ' Передаём devBits (реальная бит.глубина I2S), НЕ outBits.
+    LOCAL actualSmpRate AS DWORD
+    actualSmpRate = EspActualRate(devSmpRate, devBits)
+    IF actualSmpRate <> devSmpRate THEN
+        AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+               ": rate trim " & TRIM$(STR$(devSmpRate)) & "Hz -> " & _
+               TRIM$(STR$(actualSmpRate)) & "Hz (ESP I2S clock, drift fix)"
+    END IF
+
     wfFmt.wFormatTag      = %WAVE_FORMAT_PCM
     wfFmt.nChannels       = nCh
-    wfFmt.nSamplesPerSec  = devSmpRate
+    wfFmt.nSamplesPerSec  = actualSmpRate
     wfFmt.wBitsPerSample  = outBits
     wfFmt.nBlockAlign     = nCh * (outBits \ 8)
     wfFmt.nAvgBytesPerSec = wfFmt.nSamplesPerSec * wfFmt.nBlockAlign
@@ -1046,24 +1175,127 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
     wIdx = 0
 
     ' ---- Main audio loop ----
+    ' TCP framing: [u16 length BE][16-byte pkt_header][payload].
+    ' UDP: each datagram = [16-byte pkt_header][payload] (boundaries preserved).
+    ' After the receive block, recvBuf = [header][payload] in BOTH cases,
+    ' so the parsing code below is transport-agnostic.
     LOCAL audRecvCount AS LONG    ' DIAG: count of successful RECV
     LOCAL audErrCount  AS LONG    ' DIAG: count of ERR on RECV
     audRecvCount = 0
     audErrCount  = 0
+
+    ' TCP framing state
+    LOCAL tcpLenBuf AS STRING        ' 2-byte length prefix buffer
+    LOCAL tcpPktLen AS LONG          ' decoded packet length (16..1416)
+    LOCAL tcpGot AS LONG             ' bytes received so far in current frame
+    LOCAL tcpNeed AS LONG            ' bytes still needed
+    LOCAL tcpTmp AS STRING           ' temp buffer for partial reads
+    LOCAL tcpReconnectCount AS LONG
+    tcpReconnectCount = 0
+
     DO WHILE g_Devs(idx).dwRunning
         ERRCLEAR
-        UDP RECV #fNum, FROM fromIP, fromPort, recvBuf
 
-        IF ERR THEN
-            INCR audErrCount
-            ' DIAG: log first ERR and every 5000th (≈10s of idle loops)
-            IF audErrCount = 1 OR (audErrCount MOD 5000) = 0 THEN
+        IF devTransport = 1 THEN
+            ' ---- TCP framing read ----
+            ' 1) Read 2-byte length prefix (big-endian).
+            ' PowerBASIC TCP RECV may return fewer bytes than requested,
+            ' so loop until we have exactly 2 bytes (or error/timeout).
+            tcpLenBuf = ""
+            DO WHILE LEN(tcpLenBuf) < 2
+                ERRCLEAR
+                LOCAL tmpLen AS STRING
+                TCP RECV #fNum, 2 - LEN(tcpLenBuf), tmpLen
+                IF ERR OR LEN(tmpLen) = 0 THEN EXIT DO
+                tcpLenBuf = tcpLenBuf & tmpLen
+            LOOP
+            IF ERR OR LEN(tcpLenBuf) < 2 THEN
+                ' Connection broken / closed by ESP. Reconnect.
+                INCR audErrCount
+                IF audErrCount = 1 OR (audErrCount MOD 30) = 0 THEN
+                    AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+                           ": TCP RECV len-prefix err=" & TRIM$(STR$(ERR)) & _
+                           " got=" & TRIM$(STR$(LEN(tcpLenBuf))) & _
+                           " (count=" & TRIM$(STR$(audErrCount)) & ")"
+                END IF
+                ' Close + retry connect (ESP may have restarted stream).
+                TCP CLOSE #fNum
+                ERRCLEAR
+                INCR tcpReconnectCount
+                LOCAL reconOk AS LONG
+                reconOk = 0
+                DO WHILE g_Devs(idx).dwRunning
+                    ERRCLEAR
+                    TCP OPEN PORT bindPort AT tcpHost AS #fNum TIMEOUT 5000
+                    IF ERR = 0 THEN reconOk = 1 : EXIT DO
+                    SLEEP 1000
+                LOOP
+                IF reconOk = 0 THEN EXIT DO   ' stream stopped
                 AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
-                       ": UDP RECV err=" & TRIM$(STR$(ERR)) & _
-                       " (count=" & TRIM$(STR$(audErrCount)) & ") - no data?"
+                       ": TCP reconnected (attempt " & TRIM$(STR$(tcpReconnectCount)) & ")"
+                ITERATE DO
             END IF
-            SLEEP 2
-            ITERATE DO
+            ' Decode big-endian u16 length.
+            tcpPktLen = (ASC(tcpLenBuf, 1) * 256&) + ASC(tcpLenBuf, 2)
+            IF tcpPktLen < %PKT_HDR_SZ OR tcpPktLen > 1416 THEN
+                ' Invalid frame — resync by closing+reconnecting (rare).
+                AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+                       ": TCP invalid frame len=" & TRIM$(STR$(tcpPktLen)) & ", resyncing"
+                TCP CLOSE #fNum
+                ERRCLEAR
+                SLEEP 500
+                DO WHILE g_Devs(idx).dwRunning
+                    ERRCLEAR
+                    TCP OPEN PORT bindPort AT tcpHost AS #fNum TIMEOUT 5000
+                    IF ERR = 0 THEN EXIT DO
+                    SLEEP 1000
+                LOOP
+                ITERATE DO
+            END IF
+            ' 2) Read tcpPktLen bytes (payload = pkt_header + data).
+            recvBuf = ""
+            tcpGot = 0
+            tcpNeed = tcpPktLen
+            DO WHILE tcpGot < tcpNeed
+                ERRCLEAR
+                TCP RECV #fNum, (tcpNeed - tcpGot), tcpTmp
+                IF ERR OR LEN(tcpTmp) = 0 THEN
+                    ' Partial frame — connection broke mid-read. Reconnect.
+                    EXIT DO
+                END IF
+                recvBuf = recvBuf & tcpTmp
+                tcpGot = tcpGot + LEN(tcpTmp)
+            LOOP
+            IF tcpGot < tcpNeed THEN
+                ' Reconnect on partial read.
+                INCR audErrCount
+                TCP CLOSE #fNum
+                ERRCLEAR
+                DO WHILE g_Devs(idx).dwRunning
+                    ERRCLEAR
+                    TCP OPEN PORT bindPort AT tcpHost AS #fNum TIMEOUT 5000
+                    IF ERR = 0 THEN EXIT DO
+                    SLEEP 1000
+                LOOP
+                ITERATE DO
+            END IF
+            ' recvBuf now = [16-byte header][payload], same as UDP path.
+            ' fromIP/fromPort unused for TCP (single connection), set for safety.
+            fromIP = devIP
+            fromPort = bindPort
+        ELSE
+            ' ---- UDP datagram receive (original path) ----
+            UDP RECV #fNum, FROM fromIP, fromPort, recvBuf
+            IF ERR THEN
+                INCR audErrCount
+                IF audErrCount = 1 OR (audErrCount MOD 5000) = 0 THEN
+                    AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+                           ": UDP RECV err=" & TRIM$(STR$(ERR)) & _
+                           " (count=" & TRIM$(STR$(audErrCount)) & ") - no data?"
+                END IF
+                SLEEP 2
+                ITERATE DO
+            END IF
         END IF
 
         IF LEN(recvBuf) < %PKT_HDR_SZ THEN ITERATE DO
@@ -1213,6 +1445,28 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
             ' Jump to WaveOut reopen (resets decoder, sets up WAVEFORMATEX,
             ' opens WaveOut, prepares headers)
             GOTO reopen_waveout
+        END IF
+
+        ' ---- Buffer availability check (CRITICAL FIX) ----
+        ' Check if the target playback buffer is still being played by WaveOut
+        ' BEFORE decoding into it. Previously the decode wrote to pcmPtrs(wIdx)
+        ' unconditionally, and the INQUEUE check only guarded waveOutWrite.
+        ' When the buffer was still in queue, the decode CORRUPTED the audio
+        ' that WaveOut was reading concurrently → race condition → crackling.
+        '
+        ' The WAV dump was clean because it reads decoded data AFTER the write
+        ' completes (consistent snapshot). But WaveOut reads the buffer DURING
+        ' the decode write, getting a mix of old and new samples → pops/clicks.
+        '
+        ' Fix: if the buffer is still in queue, skip the decode entirely.
+        ' Set pcmLen = 0 so dump and waveOutWrite are also skipped. Do NOT
+        ' advance wIdx (see comment at waveOutWrite below) — we retry the
+        ' same buffer on the next packet, by which time WaveOut may have
+        ' finished playing it. This drops at most 1-2 packets instead of
+        ' cycling through all 16 buffers and dropping 320ms of audio.
+        IF waveOut <> 0 AND (whdrs(wIdx).dwFlags AND %WHDR_INQUEUE) <> 0 THEN
+            pcmLen = 0
+            GOTO pcm_ready
         END IF
 
         ' ---- Raw PCM passthrough (codec == 6) ----
@@ -1429,15 +1683,23 @@ pcm_ready:
             LeaveCriticalSection g_csDump
         END IF
 
-        ' FIX M1+M2: Guard against waveOut=NULL (failed reopen) - skip
-        ' waveOutWrite if no valid WaveOut handle.
-        IF waveOut <> 0 AND (whdrs(wIdx).dwFlags AND %WHDR_INQUEUE) = 0 THEN
+        ' ---- Submit to WaveOut ----
+        ' FIX M1+M2: Guard against waveOut=NULL (failed reopen).
+        ' FIX (race condition): Guard with pcmLen > 0 — when the pre-decode
+        ' INQUEUE check skipped the decode, pcmLen is 0 and we must NOT
+        ' submit (would replay stale data from a previous frame).
+        ' Only advance wIdx when we actually submitted a buffer. If we
+        ' skipped (pcmLen = 0 or buffer still in queue), we retry the SAME
+        ' buffer on the next packet — this naturally throttles the decode
+        ' loop to match WaveOut's playback rate, dropping the minimum
+        ' number of packets (1-2) instead of cycling through all 16.
+        IF waveOut <> 0 AND pcmLen > 0 AND (whdrs(wIdx).dwFlags AND %WHDR_INQUEUE) = 0 THEN
             whdrs(wIdx).dwBufferLength = pcmLen
             whdrs(wIdx).dwBytesRecorded = pcmLen
             waveOutWrite waveOut, whdrs(wIdx), SIZEOF(WAVEHDR)
+            wIdx = (wIdx + 1) MOD %NUM_WAVE_BUFS
         END IF
 
-        wIdx = (wIdx + 1) MOD %NUM_WAVE_BUFS
         ITERATE DO
 
 reopen_waveout:
@@ -1466,9 +1728,17 @@ reopen_waveout:
         ELSE
             outBits = 16
         END IF
+
+        ' <<<DRIFT FIX>>> та же коррекция частоты при reopen
+        actualSmpRate = EspActualRate(devSmpRate, devBits)
+        IF actualSmpRate <> devSmpRate THEN
+            AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+                   ": rate trim " & TRIM$(STR$(devSmpRate)) & "Hz -> " & _
+                   TRIM$(STR$(actualSmpRate)) & "Hz (reopen, drift fix)"
+        END IF
         wfFmt.wFormatTag      = %WAVE_FORMAT_PCM
         wfFmt.nChannels       = nCh
-        wfFmt.nSamplesPerSec  = devSmpRate
+        wfFmt.nSamplesPerSec  = actualSmpRate
         wfFmt.wBitsPerSample  = outBits
         wfFmt.nBlockAlign     = nCh * (outBits \ 8)
         wfFmt.nAvgBytesPerSec = wfFmt.nSamplesPerSec * wfFmt.nBlockAlign
@@ -1534,10 +1804,15 @@ reopen_waveout:
     END IF
     LeaveCriticalSection g_csDump
 
-    ' UDP may have been closed from outside (StopAllStreams) on shutdown,
-    ' so use ERRCLEAR to handle already-closed file gracefully
+    ' Transport may have been closed from outside (StopAllStreams) on shutdown,
+    ' so use ERRCLEAR to handle already-closed file gracefully.
+    ' TCP and UDP use different CLOSE statements.
     ERRCLEAR
-    UDP CLOSE #fNum
+    IF devTransport = 1 THEN
+        TCP CLOSE #fNum
+    ELSE
+        UDP CLOSE #fNum
+    END IF
     ERRCLEAR
 
     FOR wIdx2 = 0 TO %NUM_WAVE_BUFS - 1
@@ -2087,11 +2362,15 @@ SUB RefreshUI()
         lvi.pszText  = VARPTR(szText)
         SendMessage hLV, %LVM_SETITEMTEXT, lvIdx, VARPTR(lvi)
 
-        ' Col 6 - Codec
+        ' Col 6 - Codec (with transport suffix: ADPCM/UDP, PCM/TCP, etc.)
         SELECT CASE g_Devs(i).dwCodec
             CASE %CODEC_ID:     szText = "ADPCM"
-            CASE %CODEC_ID_PCM: szText = "PCM 16"
+            CASE %CODEC_ID_PCM: szText = "PCM"
             CASE ELSE:          szText = TRIM$(STR$(g_Devs(i).dwCodec))
+        END SELECT
+        SELECT CASE g_Devs(i).dwTransport
+            CASE 1: szText = szText & "/TCP"
+            CASE 2: szText = szText & "/Raw"
         END SELECT
         lvi.iSubItem = %LV_COL_CODEC
         lvi.pszText  = VARPTR(szText)
@@ -2311,22 +2590,28 @@ CALLBACK FUNCTION MainDlgProc()
 
         CASE %WM_APP_LOG
             ' FIX C5: Async log message from worker threads.
-            ' CB.LPARAM = STRPTR(sLine) - a PowerBASIC string handle.
-            ' PEEK$ reads the string data, then we append to the log textbox.
+            ' wParam = byte length of the string, lParam = pointer to a
+            ' NUL-terminated heap buffer allocated by AddLog.
+            ' Read exactly wParam bytes (previously PEEK$ read a fixed 4096
+            ' bytes, reading past the allocation), then free the heap block.
             IF CB.LPARAM THEN
+                LOCAL pLogBuf AS BYTE PTR
+                LOCAL nLogLen AS LONG
                 LOCAL sLogLine AS STRING
-                sLogLine = PEEK$(CB.LPARAM, 4096)   ' read up to 4KB
-                ' Find the actual end (PB strings are not NUL-terminated
-                ' in memory, but PEEK$ with a max length is safe here
-                ' because sLine was built with known content)
-                LOCAL nLen AS LONG
-                CONTROL SEND g_hDlg, %IDC_LOG, %WM_GETTEXTLENGTH, 0, 0 TO nLen
-                IF nLen > 32768 THEN
-                    CONTROL SET TEXT g_hDlg, %IDC_LOG, ""
-                    nLen = 0
+                LOCAL nCurLen AS LONG
+                pLogBuf = CB.LPARAM
+                nLogLen = CB.WPARAM
+                IF nLogLen > 0 THEN
+                    sLogLine = PEEK$(pLogBuf, nLogLen)
+                    CONTROL SEND g_hDlg, %IDC_LOG, %WM_GETTEXTLENGTH, 0, 0 TO nCurLen
+                    IF nCurLen > 32768 THEN
+                        CONTROL SET TEXT g_hDlg, %IDC_LOG, ""
+                        nCurLen = 0
+                    END IF
+                    CONTROL SEND g_hDlg, %IDC_LOG, %EM_SETSEL, nCurLen, nCurLen
+                    CONTROL SEND g_hDlg, %IDC_LOG, %EM_REPLACESEL, 0, STRPTR(sLogLine)
                 END IF
-                CONTROL SEND g_hDlg, %IDC_LOG, %EM_SETSEL, nLen, nLen
-                CONTROL SEND g_hDlg, %IDC_LOG, %EM_REPLACESEL, 0, STRPTR(sLogLine)
+                HeapFree g_hHeap, 0, pLogBuf
             END IF
             FUNCTION = 1
             EXIT FUNCTION
@@ -2512,7 +2797,7 @@ FUNCTION PBMAIN() AS LONG
     CONTROL ADD BUTTON, g_hDlg, %IDC_BTN_START,   "Start Stream", 2, 290, 90, 26
     CONTROL ADD BUTTON, g_hDlg, %IDC_BTN_STOP,    "Stop Stream",  96, 290, 90, 26
     CONTROL ADD BUTTON, g_hDlg, %IDC_BTN_STOPALL, "Stop All",    190, 290, 90, 26
-    CONTROL ADD BUTTON, g_hDlg, %IDC_BTN_DUMP,    "DUMP",        284, 290, 60, 26
+    CONTROL ADD BUTTON, g_hDlg, %IDC_BTN_DUMP,    "DUMP",        284, 290, 90, 26
     CONTROL DISABLE g_hDlg, %IDC_BTN_START
     CONTROL DISABLE g_hDlg, %IDC_BTN_STOP
     CONTROL DISABLE g_hDlg, %IDC_BTN_STOPALL

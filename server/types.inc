@@ -21,7 +21,7 @@ TYPE DeviceInfo
     dwChannels   AS DWORD     ' 1=mono, 2=stereo (from INFO payload)
     dwSmpRate    AS DWORD     ' Sample rate in Hz (from INFO payload, e.g. 48000)
     dwCodec      AS DWORD     ' Codec ID: 5=ADPCM, 6=PCM (from INFO payload)
-    dwBits       AS DWORD     ' Bits per sample: 16 or 24 (from INFO payload)
+    dwBits       AS DWORD     ' Bits per sample: 16 or 24 (from INFO payload)    dwTransport  AS DWORD     ' Transport: 0=UDP, 1=TCP, 2=Raw 802.11 TX (INFO v2.1)
     dwPktRecv    AS DWORD
     dwPktOOO     AS DWORD
     dwPktLost    AS DWORD
