@@ -174,9 +174,9 @@ Switchable at runtime via `AT+XPORT=0|1|2` + `AT+HOTRESTART`
 
 | Component | Purpose | Price |
 |-----------|---------|-------|
-| ESP8266 (ESP-12F / NodeMCU / Wemos D1) | Microcontroller + WiFi | ~$3 |
-| INMP441 I2S MEMS microphone | Audio capture (24-bit) | ~$2 |
-| USB-to-UART adapter | Flashing + AT commands | ~$2 |
+| ESP8266 (ESP-12F / NodeMCU / Wemos D1) | Microcontroller + WiFi | ~$1 |
+| INMP441 I2S MEMS microphone | Audio capture (24-bit) | ~$1 |
+| USB-to-UART adapter | Flashing + AT commands | ~$1 |
 
 ### Wiring Diagram
 
