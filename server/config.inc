@@ -40,11 +40,20 @@
 %IDC_BTN_STOPALL  = 105
 %IDC_BTN_DUMP     = 109
 %IDC_STATUSBAR    = 108
+%IDC_COMBO_DEVICE = 110   ' WaveOut device selection (VB-Cable, etc.)
+%IDC_LBL_OUTPUT   = 111   ' "Output:" label for device combo
 
 ' ---- Timer / Menu ----
 %IDT_REFRESH      = 1
 %IDM_ABOUT        = &H1000   ' Must be multiple of 16 (WM_SYSCOMMAND uses low 4 bits)
 %IDM_ADD_DEVICE   = &H1010
+
+' ---- ListView context menu (right-click) ----
+%IDM_CTX_START     = &H2001
+%IDM_CTX_STOP      = &H2002
+%IDM_CTX_SELECTALL = &H2003
+%IDM_CTX_CLEARALL  = &H2004
+%IDM_CTX_STOPALL   = &H2005
 
 ' ---- Add Device Dialog ----
 %IDD_ADD_DEVICE   = 2000

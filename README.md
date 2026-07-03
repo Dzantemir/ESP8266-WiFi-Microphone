@@ -90,6 +90,13 @@ Switchable at runtime via `AT+XPORT=0|1|2` + `AT+HOTRESTART`
 - **Multi-device**: Stream from up to 16 ESP8266s simultaneously
 - **Auto-discovery**: UDP broadcast on port 3950
 - **Device names**: Shows `hostname (MAC)` in ListView — identify devices at a glance
+- **Per-device output**: Right-click any device → "Output Device" submenu →
+  route each microphone to a different WaveOut device (speakers, VB-Cable, etc.)
+  for independent use in Discord, Zoom, OBS simultaneously
+- **Virtual microphone support**: Select VB-Cable as output → audio appears as
+  a virtual microphone in any application (Discord, Zoom, OBS, Teams, browsers)
+- **Context menu**: Right-click ListView for Start/Stop, Select All / Clear All,
+  per-device output selection, and Stop All Streams
 - **Transport auto-detect**: Reads `transport_mode` from INFO payload,
   opens UDP socket or TCP connection automatically
 - **Clock drift fix**: WaveOut opens at ESP's actual I2S rate (e.g. 43860 Hz
@@ -97,6 +104,7 @@ Switchable at runtime via `AT+XPORT=0|1|2` + `AT+HOTRESTART`
 - **WAV recording**: 1 GB auto-split, correct headers for all formats
 - **24-bit playback**: Native WaveOut, auto-fallback to 16-bit
 - **Real-time stats**: RSSI, heap, packet loss, duration
+- **Multi-part status bar**: Devices count, streaming count, UDP port, output device
 
 </td>
 </tr>
@@ -252,7 +260,7 @@ Connect to ESP8266 UART (115200 baud) and send:
 AT+WIFI=YourWiFiSSID,YourWiFiPassword
 AT+RATE=48000
 AT+BITS=24
-AT+AGC=2
+AT+AGC=3              # 0=OFF 1=Studio 2=Podcast 3=Balanced 4=Fast 5=Noisy 6=Music 7=Limiter 8=Surveillance
 AT+XPORT=0          # 0=UDP (default), 1=TCP, 2=Raw 802.11 TX
 AT+HOTRESTART       # Apply changes without reboot
 ```
@@ -268,7 +276,26 @@ Run `eassp_server.exe` on your Windows PC. The ESP8266 appears automatically:
 The receiver auto-detects the transport mode from the device's INFO packet and
 opens a UDP socket or TCP connection accordingly.
 
-### 4. Record (Optional)
+**Right-click** the ListView for a context menu:
+- **Start Stream / Stop Stream** — for checked devices
+- **Output Device ▶** — route this microphone to a specific WaveOut device
+- **Select All / Clear All** — batch checkbox operations
+- **Stop All Streams** — stop everything
+
+### 4. Virtual Microphone (Optional — use in Discord/Zoom/OBS)
+
+To route the ESP8266 audio into any application as a virtual microphone:
+
+1. Download and install **VB-Cable** from [vb-audio.com/Cable](https://vb-audio.com/Cable/) (free)
+2. In EASSP Server: right-click the device → **Output Device** → **CABLE Input**
+   (or select it from the "Output:" dropdown at the top)
+3. In Discord/Zoom/OBS: select **CABLE Output** as your microphone
+4. Audio from ESP8266 now appears as a microphone input!
+
+For multiple microphones: install multiple VB-Cable instances (A, B, C...) and
+route each ESP8266 to a different cable. Each appears as a separate microphone.
+
+### 5. Record (Optional)
 
 Click **DUMP** to record to WAV. Files auto-split at 1 GB:
 - `dump_153000_1.wav` — first gigabyte
@@ -292,7 +319,7 @@ Click **DUMP** to record to WAV. Files auto-split at 1 GB:
 | `AT+BITS=n` | Bit depth (16 or 24) | `AT+BITS=24` |
 | `AT+CH=n` | Channel: 0=L, 1=R, 2=stereo | `AT+CH=0` |
 | `AT+CODEC=n` | 0=ADPCM, 1=PCM | `AT+CODEC=0` |
-| `AT+AGC=n` | 0=OFF, 1=LOW, 2=MED, 3=HIGH | `AT+AGC=2` |
+| `AT+AGC=n` | AGC preset 0-8 (see below) | `AT+AGC=3` |
 | `AT+GAIN=n` | Fixed gain 0-64 (0=bypass) | `AT+GAIN=32` |
 | `AT+FMT=n` | 0=Philips I2S, 1=LSB | `AT+FMT=0` |
 | `AT+XPORT=n` | Transport: 0=UDP, 1=TCP, 2=RawTX | `AT+XPORT=1` |
@@ -301,6 +328,27 @@ Click **DUMP** to record to WAV. Files auto-split at 1 GB:
 | `AT+HOTRESTART` | Restart stream (apply changes) | `AT+HOTRESTART` |
 | `AT+FACTORY` | Factory reset | `AT+FACTORY` |
 | `AT+HELP` | Show all commands | `AT+HELP` |
+
+---
+
+## 🎛️ AGC Presets
+
+9 presets selectable via `AT+AGC=0..8` or menuconfig:
+
+| # | Name | Attack | Release | Target | Character |
+|---|------|:------:|:-------:|:------:|-----------|
+| 0 | OFF | — | — | — | Bypass (use fixed gain via AT+GAIN) |
+| 1 | Studio Soft | 30 | 5 | -18 dBFS | Very smooth, minimal pumping |
+| 2 | Podcast | 50 | 15 | -18 dBFS | Smooth voice control |
+| 3 | Voice Balanced | 75 | 20 | -18 dBFS | Default, good for speech |
+| 4 | Voice Fast | 90 | 40 | -18 dBFS | Fast reaction for dynamic speech |
+| 5 | Noisy Room | 60 | 25 | -15 dBFS | High noise gate, cuts background |
+| 6 | Music | 15 | 60 | -12 dBFS | Slow attack (no transient squash), fast release |
+| 7 | Limiter | 100 | 5 | -6 dBFS | Peak limiting only, no quiet boost |
+| 8 | Surveillance | 95 | 80 | -12 dBFS | Aggressive, constant level for monitoring |
+
+**Attack** = speed of gain drop when signal is loud (% per frame)
+**Release** = speed of gain rise when signal is quiet (% per frame)
 
 ---
 
@@ -515,9 +563,9 @@ esp8266-wifi-microphone/
 │           └── ...                # Other headers
 │
 ├── server/                        # Windows receiver (PowerBASIC 10)
-│   ├── eassp_server.bas           # Main app (UDP + TCP, drift fix, reconnect)
-│   ├── config.inc                 # Constants
-│   └── types.inc                  # Type definitions (DeviceInfo + dwTransport)
+│   ├── eassp_server.bas           # Main app (UDP+TCP, drift fix, per-device output, context menu)
+│   ├── config.inc                 # Constants + control IDs + menu IDs
+│   └── types.inc                  # DeviceInfo (dwTransport, sHostname, dwWaveDevice)
 │
 ├── patches/                       # Documentation of applied fixes
 │   ├── README.md                  # Patch guide
@@ -544,7 +592,7 @@ Key configuration options (via `idf.py menuconfig` → ADPCM Streamer Configurat
 | | `STREAMER_I2S_BITS_PER_SAMPLE` | 24 | 16 or 24 |
 | | `STREAMER_AUDIO_CODEC` | ADPCM | ADPCM or PCM |
 | | `STREAMER_AUDIO_GAIN` | 32 | 0–64 (0=bypass) |
-| | `STREAMER_AGC_MODE` | MEDIUM | OFF/LOW/MEDIUM/HIGH |
+| | `STREAMER_AGC_MODE` | Voice Balanced | 9 presets (OFF→Surveillance) |
 | **I2S Timing** | `STREAMER_I2S_TIMING_SD_DELAY` | 0 | RX SD delay (0–3) |
 | | `STREAMER_I2S_TIMING_WS_DELAY` | 0 | RX WS delay (0–3) |
 | | `STREAMER_I2S_TIMING_BCK_DELAY` | 0 | RX BCK delay (0–3) |

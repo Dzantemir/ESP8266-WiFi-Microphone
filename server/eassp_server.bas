@@ -40,6 +40,10 @@ GLOBAL g_hHbTh      AS DWORD    ' heartbeat thread handle
 GLOBAL g_bRunning   AS LONG
 GLOBAL g_seqCnt     AS LONG     ' was WORD, changed to LONG for InterlockedIncrement
 
+' ---- WaveOut device selection (for VB-Cable virtual microphone) ----
+' g_WaveDeviceId: -1 = WAVE_MAPPER (default), 0..N = specific device
+GLOBAL g_WaveDeviceId AS LONG
+
 GLOBAL g_csDev      AS CRITICAL_SECTION
 
 GLOBAL g_Devs()     AS DeviceInfo
@@ -162,6 +166,37 @@ END SUB
 '  LISTVIEW HELPERS
 ' ============================================================================
 
+' PopulateDeviceCombo - Enumerate WaveOut devices and fill the ComboBox.
+' Adds "Default (WAVE_MAPPER)" as first entry, then all physical/virtual
+' devices (speakers, VB-Cable, etc.). User selects which device receives
+' the audio — select "CABLE Input" to route to a virtual microphone.
+SUB PopulateDeviceCombo()
+    LOCAL numDevs AS LONG
+    LOCAL i AS LONG
+    LOCAL caps AS WAVEOUTCAPS
+    LOCAL sName AS STRING
+    LOCAL mmRes AS LONG
+
+    ' Start with "Default" (WAVE_MAPPER = -1)
+    COMBOBOX ADD g_hDlg, %IDC_COMBO_DEVICE, "Default (WAVE_MAPPER)"
+
+    ' Enumerate all WaveOut devices
+    numDevs = waveOutGetNumDevs()
+    FOR i = 0 TO numDevs - 1
+        mmRes = waveOutGetDevCaps(i, caps, SIZEOF(caps))
+        IF mmRes = 0 THEN
+            sName = EXTRACT$(caps.szPname, CHR$(0))
+            IF LEN(sName) = 0 THEN sName = "Device " & TRIM$(STR$(i))
+            COMBOBOX ADD g_hDlg, %IDC_COMBO_DEVICE, _
+                TRIM$(STR$(i)) & ": " & sName
+        END IF
+    NEXT i
+
+    ' Select "Default" (index 0 in the combo = WAVE_MAPPER)
+    COMBOBOX SELECT g_hDlg, %IDC_COMBO_DEVICE, 1
+    g_WaveDeviceId = -1  ' WAVE_MAPPER
+END SUB
+
 ' InitListView - Create columns in the ListView
 SUB InitListView()
     LOCAL lvc AS LV_COL
@@ -259,6 +294,44 @@ FUNCTION IsItemChecked(BYVAL hLV AS DWORD, BYVAL iItem AS LONG) AS LONG
     FUNCTION = (dwState AND &H2000) = &H2000
 END FUNCTION
 
+' SetItemChecked - Set ListView item checkbox state
+' bCheck: 1 = checked (state image 2), 0 = unchecked (state image 1)
+SUB SetItemChecked(BYVAL hLV AS DWORD, BYVAL iItem AS LONG, BYVAL bCheck AS LONG)
+    LOCAL lvi AS LV_ITM
+    lvi.mask      = %LVIF_STATE
+    lvi.stateMask = %LVIS_STATEIMAGEMASK
+    IF bCheck THEN
+        lvi.state = &H2000   ' state image index 2 = checked
+    ELSE
+        lvi.state = &H1000   ' state image index 1 = unchecked
+    END IF
+    SendMessage hLV, %LVM_SETITEMSTATE, iItem, VARPTR(lvi)
+END SUB
+
+' GetSelectedDeviceIdx - Returns device array index of the SELECTED (focused) ListView item.
+' Returns -1 if no item is selected.
+FUNCTION GetSelectedDeviceIdx() AS LONG
+    LOCAL hLV AS DWORD
+    LOCAL selItem AS LONG
+    LOCAL lvi AS LV_ITM
+
+    CONTROL HANDLE g_hDlg, %IDC_LISTVIEW TO hLV
+    IF hLV = 0 THEN FUNCTION = -1 : EXIT FUNCTION
+
+    selItem = SendMessage(hLV, %LVM_GETSELECTIONMARK, 0, 0)
+    IF selItem < 0 THEN FUNCTION = -1 : EXIT FUNCTION
+
+    lvi.mask  = %LVIF_PARAM
+    lvi.iItem = selItem
+    lvi.iSubItem = 0
+    SendMessage hLV, %LVM_GETITEM, 0, VARPTR(lvi)
+    IF lvi.lParam >= 0 AND lvi.lParam < %MAX_DEVICES THEN
+        FUNCTION = lvi.lParam
+    ELSE
+        FUNCTION = -1
+    END IF
+END FUNCTION
+
 ' UpdateButtonStates - Enable/disable buttons based on checkbox & stream state
 SUB UpdateButtonStates()
     LOCAL hLV AS DWORD
@@ -323,6 +396,8 @@ SUB ResizeControls()
     LOCAL hBtn2 AS DWORD
     LOCAL hBtn3 AS DWORD
     LOCAL hBtn4 AS DWORD
+    LOCAL hCombo AS DWORD
+    LOCAL hLabel AS DWORD
     LOCAL dwFlags AS DWORD
 
     GetClientRect g_hDlg, rc
@@ -361,6 +436,8 @@ SUB ResizeControls()
     CONTROL HANDLE g_hDlg, %IDC_BTN_STOP    TO hBtn2
     CONTROL HANDLE g_hDlg, %IDC_BTN_STOPALL TO hBtn3
     CONTROL HANDLE g_hDlg, %IDC_BTN_DUMP    TO hBtn4
+    CONTROL HANDLE g_hDlg, %IDC_COMBO_DEVICE TO hCombo
+    CONTROL HANDLE g_hDlg, %IDC_LBL_OUTPUT   TO hLabel
 
     ' SWP_NOCOPYBITS: do NOT copy old pixels to new position.
     '   Without this flag, Windows BitBlts the old control content to
@@ -373,7 +450,7 @@ SUB ResizeControls()
     ' StatusBar is included in the batch so it moves atomically with
     ' all other controls, preventing its internal BitBlt from smearing
     ' old pixels over the button area.
-    hDWP = BeginDeferWindowPos(7)
+    hDWP = BeginDeferWindowPos(9)
     IF hDWP THEN
         ' ListView: x=2, y=2
         hDWP = DeferWindowPos(hDWP, hLV, %NULL, 2, 2, cx - 4, lvH, dwFlags)
@@ -382,14 +459,16 @@ SUB ResizeControls()
         y = lvH + 4
         hDWP = DeferWindowPos(hDWP, hLog, %NULL, 2, y, cx - 4, logH, dwFlags)
 
-        ' Buttons: y=lvH+logH+8
-        '   Start and Stop anchored to left edge,
-        '   DUMP and Stop All anchored to right edge
+        ' Button row: y=lvH+logH+8
+        '   Start(2,90) Stop(96,90) DUMP(190,90) "Output:"(286) ComboBox(328) StopAll(cx-92,90)
         y = lvH + logH + 8
         hDWP = DeferWindowPos(hDWP, hBtn1, %NULL, 2, y, 90, btnH, dwFlags)
         hDWP = DeferWindowPos(hDWP, hBtn2, %NULL, 96, y, 90, btnH, dwFlags)
+        hDWP = DeferWindowPos(hDWP, hBtn4, %NULL, 190, y, 90, btnH, dwFlags)
+        hDWP = DeferWindowPos(hDWP, hLabel, %NULL, 286, y + 6, 40, 20, dwFlags)
+        ' ComboBox: x=328, width = cx-328-92-10 = cx-430 (stretch to Stop All)
+        hDWP = DeferWindowPos(hDWP, hCombo, %NULL, 328, y + 3, cx - 430, 200, dwFlags)
         hDWP = DeferWindowPos(hDWP, hBtn3, %NULL, cx - 92, y, 90, btnH, dwFlags)
-        hDWP = DeferWindowPos(hDWP, hBtn4, %NULL, cx - 200, y, 90, btnH, dwFlags)
 
         ' StatusBar: position it at the bottom, full width, fixed height.
         ' Included in DeferWindowPos batch with SWP_NOCOPYBITS to prevent
@@ -399,6 +478,16 @@ SUB ResizeControls()
 
         EndDeferWindowPos hDWP
     END IF
+
+    ' Recalculate StatusBar part widths for new window width.
+    ' 5 parts: [0] EASSP Server  [1] Devices  [2] Streaming  [3] UDP  [4] Output (stretch)
+    DIM sbP(0 TO 4) AS LONG
+    sbP(0) = 100
+    sbP(1) = 180
+    sbP(2) = 270
+    sbP(3) = 350
+    sbP(4) = -1   ' remaining width
+    CONTROL SEND g_hDlg, %IDC_STATUSBAR, %SB_SETPARTS, 5, VARPTR(sbP(0))
 END SUB
 
 ' ============================================================================
@@ -510,6 +599,7 @@ SUB UpdateDevice(BYVAL sMac AS STRING, BYVAL dwIP AS DWORD, BYVAL dwPort AS DWOR
         g_Devs(idx).dwActive = 1
         g_Devs(idx).sMac = sMac
         g_Devs(idx).dwDiscovered = tick
+        g_Devs(idx).dwWaveDevice = -1   ' Default: WAVE_MAPPER
     END IF
 
     g_Devs(idx).dwIP         = dwIP
@@ -852,7 +942,22 @@ FUNCTION RateEnumToHz(BYVAL e AS LONG) AS DWORD
     END SELECT
 END FUNCTION
 
-
+' EspActualRate - Вычисляет ФАКТИЧЕСКУЮ частоту I2S ESP8266 для данного
+' номинала и бит.глубины I2S. Зеркалит i2s_set_rate() из firmware/i2s.c:
+'   160 МГц / (bits×2ch) / (bck_div × mclk_div), оба делителя целые 1..63.
+'
+' ЗАЧЕМ: ESP не может выдать ровно 44100 Гц — реально 43860 Гц (-0.545%).
+' Если открыть WaveOut на номинале 44100, буфер опустошается быстрее, чем
+' ESP наполняет → underrun → пощипывание/щелчки в LIVE режиме (дамп при
+' этом чистый, т.к. пишет все пакеты синхронно).
+'
+' Открываем WaveOut на фактической частоте ESP → дрейф = 0 → финальный
+' ресамплинг до частоты карты делает Windows-аудиодвижок (качественно).
+'
+' Параметры:
+'   nominalHz - номинал из INFO-пакета (8000/11025/.../48000)
+'   i2sBits   - РЕАЛЬНАЯ бит.глубина I2S (devBits из INFO, 16 или 24).
+'               НЕ outBits! Для ADPCM outBits=16, но I2S может быть 24.
 FUNCTION EspActualRate(BYVAL nominalHz AS DWORD, BYVAL i2sBits AS LONG) AS DWORD
     LOCAL scaled AS DOUBLE
     LOCAL i AS LONG, j AS LONG
@@ -1079,6 +1184,10 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
         outBits = 16               ' ADPCM: always 16-bit (dithered on ESP)
     END IF
 
+    ' <<<DRIFT FIX>>> открываем WaveOut на ФАКТИЧЕСКОЙ частоте I2S ESP,
+    ' иначе при 44100 Гц (реально 43860) буфер опустошается быстрее →
+    ' underrun → пощипывание в LIVE (дамп чистый, т.к. пишет синхронно).
+    ' Передаём devBits (реальная бит.глубина I2S), НЕ outBits.
     LOCAL actualSmpRate AS DWORD
     actualSmpRate = EspActualRate(devSmpRate, devBits)
     IF actualSmpRate <> devSmpRate THEN
@@ -1099,7 +1208,7 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
     ' it (WAVERR_BADFORMAT or MMSYSERR), retry with 16-bit and mark for
     ' on-the-fly 24→16 conversion.
     LOCAL waveResult AS LONG
-    waveResult = waveOutOpen(waveOut, %WAVE_MAPPER, wfFmt, 0, 0, %CALLBACK_NULL)
+    waveResult = waveOutOpen(waveOut, g_Devs(idx).dwWaveDevice, wfFmt, 0, 0, %CALLBACK_NULL)
     IF waveResult <> 0 AND outBits = 24 THEN
         AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
                ": 24-bit WaveOut failed (err=" & TRIM$(STR$(waveResult)) & _
@@ -1108,7 +1217,7 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
         wfFmt.wBitsPerSample  = 16
         wfFmt.nBlockAlign     = nCh * 2
         wfFmt.nAvgBytesPerSec = wfFmt.nSamplesPerSec * wfFmt.nBlockAlign
-        waveResult = waveOutOpen(waveOut, %WAVE_MAPPER, wfFmt, 0, 0, %CALLBACK_NULL)
+        waveResult = waveOutOpen(waveOut, g_Devs(idx).dwWaveDevice, wfFmt, 0, 0, %CALLBACK_NULL)
     END IF
     IF waveResult = 0 THEN
         LOCAL sCodecName AS STRING
@@ -1743,7 +1852,7 @@ reopen_waveout:
 
         ' Open WaveOut. Try 24-bit first if PCM 24-bit; if the card rejects
         ' it, retry with 16-bit and mark for on-the-fly 24->16 conversion.
-        waveResult = waveOutOpen(waveOut, %WAVE_MAPPER, wfFmt, 0, 0, %CALLBACK_NULL)
+        waveResult = waveOutOpen(waveOut, g_Devs(idx).dwWaveDevice, wfFmt, 0, 0, %CALLBACK_NULL)
         IF waveResult <> 0 AND outBits = 24 THEN
             AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
                    ": 24-bit WaveOut failed on reopen (err=" & TRIM$(STR$(waveResult)) & _
@@ -1752,7 +1861,7 @@ reopen_waveout:
             wfFmt.wBitsPerSample  = 16
             wfFmt.nBlockAlign     = nCh * 2
             wfFmt.nAvgBytesPerSec = wfFmt.nSamplesPerSec * wfFmt.nBlockAlign
-            waveResult = waveOutOpen(waveOut, %WAVE_MAPPER, wfFmt, 0, 0, %CALLBACK_NULL)
+            waveResult = waveOutOpen(waveOut, g_Devs(idx).dwWaveDevice, wfFmt, 0, 0, %CALLBACK_NULL)
         END IF
 
         IF waveResult = 0 THEN
@@ -2379,12 +2488,12 @@ SUB RefreshUI()
         ' Col 6 - Codec (with transport suffix: ADPCM/UDP, PCM/TCP, etc.)
         SELECT CASE g_Devs(i).dwCodec
             CASE %CODEC_ID:     szText = "ADPCM"
-            CASE %CODEC_ID_PCM: szText = "PCM"
+            CASE %CODEC_ID_PCM: szText = "PCM 16"
             CASE ELSE:          szText = TRIM$(STR$(g_Devs(i).dwCodec))
         END SELECT
         SELECT CASE g_Devs(i).dwTransport
-            CASE 0: szText = szText & "/UDP"
             CASE 1: szText = szText & "/TCP"
+            CASE 2: szText = szText & "/Raw"
         END SELECT
         lvi.iSubItem = %LV_COL_CODEC
         lvi.pszText  = VARPTR(szText)
@@ -2471,9 +2580,26 @@ SUB RefreshUI()
     IF hLV THEN SendMessage hLV, %WM_SETREDRAW, 1, 0
     IF hLV THEN InvalidateRect hLV, BYVAL %NULL, %TRUE
 
-    ' Update StatusBar
-    sLine = "  EASSP Server  |  Devices:" & STR$(cnt) & "  |  Streaming:" & STR$(strmCnt) & "  |  UDP:3950"
+    ' Update StatusBar (5 parts)
+    sLine = " EASSP Server"
     CONTROL SEND g_hDlg, %IDC_STATUSBAR, %SB_SETTEXT, 0, STRPTR(sLine)
+    sLine = " Devices:" & STR$(cnt)
+    CONTROL SEND g_hDlg, %IDC_STATUSBAR, %SB_SETTEXT, 1, STRPTR(sLine)
+    sLine = " Streaming:" & STR$(strmCnt)
+    CONTROL SEND g_hDlg, %IDC_STATUSBAR, %SB_SETTEXT, 2, STRPTR(sLine)
+    sLine = " UDP:3950"
+    CONTROL SEND g_hDlg, %IDC_STATUSBAR, %SB_SETTEXT, 3, STRPTR(sLine)
+    ' Part 4: selected output device name
+    LOCAL sbDevIdx AS LONG
+    COMBOBOX GET SELECT g_hDlg, %IDC_COMBO_DEVICE TO sbDevIdx
+    IF sbDevIdx <= 1 THEN
+        sLine = " Output: Default"
+    ELSE
+        LOCAL devText AS STRING
+        COMBOBOX GET TEXT g_hDlg, %IDC_COMBO_DEVICE, sbDevIdx TO devText
+        sLine = " Output: " & devText
+    END IF
+    CONTROL SEND g_hDlg, %IDC_STATUSBAR, %SB_SETTEXT, 4, STRPTR(sLine)
 
     ' Update button enable/disable state
     UpdateButtonStates
@@ -2562,6 +2688,34 @@ CALLBACK FUNCTION MainDlgProc()
                         ToggleDump
                         FUNCTION = 1
                     END IF
+
+                CASE %IDC_COMBO_DEVICE
+                    IF CB.CTLMSG = %CBN_SELCHANGE THEN
+                        ' Change output device for the SELECTED device in ListView.
+                        ' If no device selected, change for all (global default).
+                        LOCAL selIdx AS LONG
+                        LOCAL selDevIdx AS LONG
+                        selDevIdx = GetSelectedDeviceIdx()
+                        COMBOBOX GET SELECT g_hDlg, %IDC_COMBO_DEVICE TO selIdx
+                        IF selIdx <= 1 THEN
+                            IF selDevIdx >= 0 THEN
+                                g_Devs(selDevIdx).dwWaveDevice = -1
+                                AddLog "Output device for " & TRIM$(g_Devs(selDevIdx).sHostname) & _
+                                       ": Default (WAVE_MAPPER)"
+                            ELSE
+                                AddLog "Select a device in ListView first, then choose output"
+                            END IF
+                        ELSE
+                            IF selDevIdx >= 0 THEN
+                                g_Devs(selDevIdx).dwWaveDevice = selIdx - 2
+                                AddLog "Output device for " & TRIM$(g_Devs(selDevIdx).sHostname) & _
+                                       ": " & TRIM$(STR$(selIdx - 2)) & " (will apply on next stream start)"
+                            ELSE
+                                AddLog "Select a device in ListView first, then choose output"
+                            END IF
+                        END IF
+                        FUNCTION = 1
+                    END IF
             END SELECT
 
         CASE %WM_NOTIFY
@@ -2583,6 +2737,143 @@ CALLBACK FUNCTION MainDlgProc()
                         IF (uNewState AND &HF000) <> (uOldState AND &HF000) THEN
                             UpdateButtonStates
                         END IF
+                    END IF
+                END IF
+                ' Right-click on ListView → show context menu
+                IF @pnmh.hwndFrom = hLV AND @pnmh.code = %NM_RCLICK THEN
+                    LOCAL hPopup AS DWORD
+                    LOCAL pt AS POINTAPI
+                    LOCAL i AS LONG
+                    LOCAL nCount AS LONG
+                    LOCAL nChecked AS LONG
+                    LOCAL nStreaming AS LONG
+
+                    hPopup = CreatePopupMenu()
+                    IF hPopup THEN
+                        ' Count checked + streaming for menu state
+                        nCount = SendMessage(hLV, %LVM_GETITEMCOUNT, 0, 0)
+                        FOR i = 0 TO nCount - 1
+                            IF IsItemChecked(hLV, i) THEN INCR nChecked
+                            LOCAL lviTmp AS LV_ITM
+                            lviTmp.mask = %LVIF_PARAM
+                            lviTmp.iItem = i
+                            lviTmp.iSubItem = 0
+                            SendMessage hLV, %LVM_GETITEM, 0, VARPTR(lviTmp)
+                            IF lviTmp.lParam >= 0 AND lviTmp.lParam < %MAX_DEVICES THEN
+                                IF g_Devs(lviTmp.lParam).dwHBActive THEN INCR nStreaming
+                            END IF
+                        NEXT i
+
+                        ' Build menu
+                        AppendMenu hPopup, %MF_STRING, %IDM_CTX_START, "Start Stream"
+                        AppendMenu hPopup, %MF_STRING, %IDM_CTX_STOP,  "Stop Stream"
+
+                        ' Output Device submenu (for the selected device)
+                        LOCAL hSubOutput AS DWORD
+                        LOCAL selDev AS LONG
+                        LOCAL numDevs AS LONG
+                        LOCAL di AS LONG
+                        LOCAL capsOut AS WAVEOUTCAPS
+                        LOCAL sDevName AS STRING
+
+                        hSubOutput = CreatePopupMenu()
+                        selDev = GetSelectedDeviceIdx()
+
+                        ' "Default (WAVE_MAPPER)" — ID = &H2100
+                        AppendMenu hSubOutput, %MF_STRING, &H2100, "Default (WAVE_MAPPER)"
+                        IF selDev >= 0 AND g_Devs(selDev).dwWaveDevice = -1 THEN
+                            CheckMenuItem hSubOutput, &H2100, %MF_CHECKED
+                        END IF
+
+                        ' Enumerate WaveOut devices
+                        numDevs = waveOutGetNumDevs()
+                        FOR di = 0 TO numDevs - 1
+                            IF waveOutGetDevCaps(di, capsOut, SIZEOF(capsOut)) = 0 THEN
+                                sDevName = EXTRACT$(capsOut.szPname, CHR$(0))
+                                IF LEN(sDevName) = 0 THEN sDevName = "Device " & TRIM$(STR$(di))
+                                ' ID = &H2101 + di (device 0 = &H2101, 1 = &H2102, ...)
+                                AppendMenu hSubOutput, %MF_STRING, &H2101 + di, _
+                                    TRIM$(STR$(di)) & ": " & sDevName
+                                IF selDev >= 0 AND g_Devs(selDev).dwWaveDevice = di THEN
+                                    CheckMenuItem hSubOutput, &H2101 + di, %MF_CHECKED
+                                END IF
+                            END IF
+                        NEXT di
+
+                        AppendMenu hPopup, %MF_SEPARATOR, 0, BYVAL %NULL
+                        AppendMenu hPopup, %MF_POPUP OR %MF_STRING, hSubOutput, "Output Device"
+                        AppendMenu hPopup, %MF_SEPARATOR, 0, BYVAL %NULL
+                        AppendMenu hPopup, %MF_STRING, %IDM_CTX_SELECTALL, "Select All"
+                        AppendMenu hPopup, %MF_STRING, %IDM_CTX_CLEARALL,  "Clear All"
+                        AppendMenu hPopup, %MF_SEPARATOR, 0, BYVAL %NULL
+                        AppendMenu hPopup, %MF_STRING, %IDM_CTX_STOPALL,  "Stop All Streams"
+
+                        ' Enable/disable based on state
+                        IF nChecked = 0 THEN
+                            EnableMenuItem hPopup, %IDM_CTX_START, %MF_GRAYED
+                            EnableMenuItem hPopup, %IDM_CTX_STOP,  %MF_GRAYED
+                        END IF
+                        IF nStreaming = 0 THEN
+                            EnableMenuItem hPopup, %IDM_CTX_STOPALL, %MF_GRAYED
+                        END IF
+                        IF nCount = 0 THEN
+                            EnableMenuItem hPopup, %IDM_CTX_SELECTALL, %MF_GRAYED
+                            EnableMenuItem hPopup, %IDM_CTX_CLEARALL,  %MF_GRAYED
+                        END IF
+                        IF selDev < 0 THEN
+                            EnableMenuItem hPopup, hSubOutput, %MF_GRAYED
+                        END IF
+
+                        ' Show menu at cursor position
+                        GetCursorPos pt
+                        LOCAL ctxCmd AS LONG
+                        ctxCmd = TrackPopupMenu(hPopup, %TPM_LEFTALIGN OR _
+                                       %TPM_TOPALIGN OR %TPM_RETURNCMD OR _
+                                       %TPM_RIGHTBUTTON, _
+                                       pt.x, pt.y, 0, CB.HNDL, BYVAL %NULL)
+                        DestroyMenu hPopup
+                        IF hSubOutput THEN DestroyMenu hSubOutput
+
+                        ' Handle selected menu item
+                        SELECT CASE ctxCmd
+                            CASE %IDM_CTX_START
+                                StartCheckedStreams
+                                UpdateButtonStates
+                            CASE %IDM_CTX_STOP
+                                StopCheckedStreams
+                                UpdateButtonStates
+                            CASE %IDM_CTX_STOPALL
+                                StopAllStreams
+                                UpdateButtonStates
+                            CASE %IDM_CTX_SELECTALL
+                                ' Check all items in ListView
+                                FOR i = 0 TO nCount - 1
+                                    SetItemChecked hLV, i, 1
+                                NEXT i
+                                UpdateButtonStates
+                            CASE %IDM_CTX_CLEARALL
+                                ' Uncheck all items in ListView
+                                FOR i = 0 TO nCount - 1
+                                    SetItemChecked hLV, i, 0
+                                NEXT i
+                                UpdateButtonStates
+                            CASE &H2100
+                                ' "Default (WAVE_MAPPER)" selected for the focused device
+                                IF selDev >= 0 THEN
+                                    g_Devs(selDev).dwWaveDevice = -1
+                                    AddLog "Output device for " & TRIM$(g_Devs(selDev).sHostname) & _
+                                           ": Default (WAVE_MAPPER)"
+                                END IF
+                            CASE &H2101 TO &H21FF
+                                ' Specific device ID = ctxCmd - &H2101
+                                IF selDev >= 0 THEN
+                                    g_Devs(selDev).dwWaveDevice = ctxCmd - &H2101
+                                    AddLog "Output device for " & TRIM$(g_Devs(selDev).sHostname) & _
+                                           ": " & TRIM$(STR$(ctxCmd - &H2101)) & _
+                                           " (will apply on next stream start)"
+                                END IF
+                        END SELECT
+                        FUNCTION = 1
                     END IF
                 END IF
             END IF
@@ -2810,12 +3101,20 @@ FUNCTION PBMAIN() AS LONG
     ' ---- Buttons (initially disabled until checkboxes are used) ----
     CONTROL ADD BUTTON, g_hDlg, %IDC_BTN_START,   "Start Stream", 2, 290, 90, 26
     CONTROL ADD BUTTON, g_hDlg, %IDC_BTN_STOP,    "Stop Stream",  96, 290, 90, 26
-    CONTROL ADD BUTTON, g_hDlg, %IDC_BTN_STOPALL, "Stop All",    190, 290, 90, 26
-    CONTROL ADD BUTTON, g_hDlg, %IDC_BTN_DUMP,    "DUMP",        284, 290, 90, 26
+    CONTROL ADD BUTTON, g_hDlg, %IDC_BTN_DUMP,    "DUMP",        190, 290, 90, 26
     CONTROL DISABLE g_hDlg, %IDC_BTN_START
     CONTROL DISABLE g_hDlg, %IDC_BTN_STOP
-    CONTROL DISABLE g_hDlg, %IDC_BTN_STOPALL
     CONTROL ENABLE  g_hDlg, %IDC_BTN_DUMP
+
+    ' ---- WaveOut device selection ComboBox ----
+    CONTROL ADD LABEL, g_hDlg, %IDC_LBL_OUTPUT, "Output:", 286, 293, 40, 12
+    CONTROL ADD COMBOBOX, g_hDlg, %IDC_COMBO_DEVICE, , 328, 290, 320, 200, _
+        %WS_CHILD OR %WS_VISIBLE OR %WS_TABSTOP OR _
+        %CBS_DROPDOWNLIST OR %WS_VSCROLL, %WS_EX_CLIENTEDGE
+
+    ' ---- Stop All button (right-anchored) ----
+    CONTROL ADD BUTTON, g_hDlg, %IDC_BTN_STOPALL, "Stop All",    658, 290, 90, 26
+    CONTROL DISABLE g_hDlg, %IDC_BTN_STOPALL
 
     ' ---- Log textbox ----
     CONTROL ADD TEXTBOX, g_hDlg, %IDC_LOG, "", _
@@ -2829,13 +3128,24 @@ FUNCTION PBMAIN() AS LONG
     FONT NEW "Courier New", 9 TO hMono
     CONTROL SET FONT g_hDlg, %IDC_LOG, hMono
 
-    ' ---- StatusBar ----
+    ' ---- StatusBar (multi-part) ----
     CONTROL ADD STATUSBAR , g_hDlg, %IDC_STATUSBAR, "", _
         0, 0, 0, 0, _
         %WS_CHILD OR %WS_VISIBLE OR %SBARS_SIZEGRIP
 
+    ' Define StatusBar parts (5 columns):
+    '   [0] EASSP Server   [1] Devices: N   [2] Streaming: N   [3] Heap: N   [4] Output: device
+    ' Parts are set up in ResizeControls (widths depend on window width).
+    ' Initial dummy parts:
+    DIM sbParts(0 TO 4) AS LONG
+    sbParts(0) = 100 : sbParts(1) = 180 : sbParts(2) = 270 : sbParts(3) = 350 : sbParts(4) = -1
+    CONTROL SEND g_hDlg, %IDC_STATUSBAR, %SB_SETPARTS, 5, VARPTR(sbParts(0))
+
     ' ---- Init ListView columns ----
     InitListView
+
+    ' ---- Populate WaveOut device ComboBox ----
+    PopulateDeviceCombo
 
     ' System menu: About + Add Device
     LOCAL hSysMenu AS DWORD

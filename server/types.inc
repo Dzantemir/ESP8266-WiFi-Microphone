@@ -24,6 +24,7 @@ TYPE DeviceInfo
     dwBits       AS DWORD     ' Bits per sample: 16 or 24 (from INFO payload)
     dwTransport  AS DWORD     ' Transport: 0=UDP, 1=TCP, 2=Raw 802.11 TX (INFO v2.1)
     sHostname    AS ASCIIZ * 25  ' v2.2: hostname from INFO payload (24 bytes + NUL)
+    dwWaveDevice AS LONG       ' Per-device WaveOut ID (-1=WAVE_MAPPER, 0..N=specific)
     dwPktRecv    AS DWORD
     dwPktOOO     AS DWORD
     dwPktLost    AS DWORD
