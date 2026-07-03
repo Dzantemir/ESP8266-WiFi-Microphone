@@ -15,7 +15,7 @@
 %STS_IDLE         = 0
 %STS_STREAM       = 1
 %STS_ERROR        = 2
-%INFO_PAYLOAD_SZ  = 33
+%INFO_PAYLOAD_SZ  = 58   ' v2.2: +24 bytes hostname (was 33, then 34 in v2.1)
 %CFG_PAYLOAD_SZ   = 2
 %PKT_HDR_SZ       = 16
 %DVI4_HDR_SZ      = 4

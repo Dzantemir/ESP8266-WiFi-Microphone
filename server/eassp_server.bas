@@ -170,8 +170,8 @@ SUB InitListView()
     lvc.mask = %LVCF_FMT OR %LVCF_WIDTH OR %LVCF_TEXT
     lvc.fmt  = %LVCFMT_LEFT
 
-    ' Col 0 - MAC
-    szText = "MAC"        : lvc.pszText = VARPTR(szText) : lvc.cx = 130
+    ' Col 0 - Hostname (MAC)
+    szText = "Name (MAC)"  : lvc.pszText = VARPTR(szText) : lvc.cx = 200
     CONTROL SEND g_hDlg, %IDC_LISTVIEW, %LVM_INSERTCOLUMN, %LV_COL_MAC, VARPTR(lvc)
 
     ' Col 1 - IP:Port
@@ -389,7 +389,7 @@ SUB ResizeControls()
         hDWP = DeferWindowPos(hDWP, hBtn1, %NULL, 2, y, 90, btnH, dwFlags)
         hDWP = DeferWindowPos(hDWP, hBtn2, %NULL, 96, y, 90, btnH, dwFlags)
         hDWP = DeferWindowPos(hDWP, hBtn3, %NULL, cx - 92, y, 90, btnH, dwFlags)
-        hDWP = DeferWindowPos(hDWP, hBtn4, %NULL, cx - 200, y, 90, btnH, dwFlags)
+        hDWP = DeferWindowPos(hDWP, hBtn4, %NULL, cx - 160, y, 60, btnH, dwFlags)
 
         ' StatusBar: position it at the bottom, full width, fixed height.
         ' Included in DeferWindowPos batch with SWP_NOCOPYBITS to prevent
@@ -442,7 +442,10 @@ SUB DiscoveryProc()
     UDP RECV #g_fDiscFile, FROM fromIP, fromPort, recvBuf
 
     IF ERR THEN EXIT SUB
-    IF LEN(recvBuf) < %EASSP_HDR_SZ + %INFO_PAYLOAD_SZ THEN EXIT SUB
+    ' Accept INFO payloads from v1 (33 bytes) through v2.2 (50 bytes).
+    ' Each field is read with its own bufLen guard, so shorter payloads
+    ' from older firmware are handled gracefully (missing fields default).
+    IF LEN(recvBuf) < %EASSP_HDR_SZ + 33 THEN EXIT SUB
 
     ' Check magic bytes
     IF PEEK(BYTE, STRPTR(recvBuf)) <> %EASSP_MAGIC0 THEN EXIT SUB
@@ -529,6 +532,13 @@ SUB UpdateDevice(BYVAL sMac AS STRING, BYVAL dwIP AS DWORD, BYVAL dwPort AS DWOR
     ELSE
         g_Devs(idx).dwTransport = 0   ' assume UDP for old firmware
     END IF
+    ' v2.2: hostname at payload offset 34 = pBuf+42 (INFO v2.2, 58-byte payload).
+    ' 24 bytes, NUL-terminated. Guard against older payloads (empty string).
+    IF bufLen >= %EASSP_HDR_SZ + 58 THEN
+        g_Devs(idx).sHostname = PEEK$(pBuf + 42, 24)
+    ELSE
+        g_Devs(idx).sHostname = ""
+    END IF
     g_Devs(idx).dwPktsSent   = PEEK(DWORD, pBuf + 23)   ' offset 15 in payload
     g_Devs(idx).dwFreeHeap   = PEEK(DWORD, pBuf + 27)   ' offset 19 in payload
     g_Devs(idx).dwLastSeen = tick
@@ -546,7 +556,13 @@ SUB UpdateDevice(BYVAL sMac AS STRING, BYVAL dwIP AS DWORD, BYVAL dwPort AS DWOR
 
     ' AddLog OUTSIDE CS - never hold CS during UI operations
     IF bNew THEN
-        AddLog "New device: MAC=" & sMac & " IP=" & FormatIP(dwIP) & ":" & TRIM$(STR$(dwPort)) & _
+        LOCAL sDevName AS STRING
+        IF LEN(TRIM$(g_Devs(idx).sHostname)) > 0 THEN
+            sDevName = TRIM$(g_Devs(idx).sHostname)
+        ELSE
+            sDevName = sMac
+        END IF
+        AddLog "New device: " & sDevName & " MAC=" & sMac & " IP=" & FormatIP(dwIP) & ":" & TRIM$(STR$(dwPort)) & _
                " rate=" & TRIM$(STR$(g_Devs(idx).dwSmpRate)) & " Hz"
     END IF
 END SUB
@@ -2308,7 +2324,12 @@ SUB RefreshUI()
             lvIdx = found
         ELSE
             ' ---- New device: insert row ----
-            szText = TRIM$(g_Devs(i).sMac)
+            ' Show "hostname (MAC)" — both visible
+            IF LEN(TRIM$(g_Devs(i).sHostname)) > 0 THEN
+                szText = TRIM$(g_Devs(i).sHostname) & " (" & TRIM$(g_Devs(i).sMac) & ")"
+            ELSE
+                szText = TRIM$(g_Devs(i).sMac)
+            END IF
             lvi.mask     = %LVIF_TEXT OR %LVIF_PARAM
             lvi.iItem    = SendMessage(hLV, %LVM_GETITEMCOUNT, 0, 0)   ' append at end
             lvi.iSubItem = 0
@@ -2316,6 +2337,18 @@ SUB RefreshUI()
             lvi.lParam   = i           ' store device array index
             lvIdx = SendMessage(hLV, %LVM_INSERTITEM, 0, VARPTR(lvi))
         END IF
+
+        ' Update col 0 for existing devices (hostname may have arrived in later INFO)
+        IF LEN(TRIM$(g_Devs(i).sHostname)) > 0 THEN
+            szText = TRIM$(g_Devs(i).sHostname) & " (" & TRIM$(g_Devs(i).sMac) & ")"
+        ELSE
+            szText = TRIM$(g_Devs(i).sMac)
+        END IF
+        lvi.mask     = %LVIF_TEXT
+        lvi.iItem    = lvIdx
+        lvi.iSubItem = %LV_COL_MAC
+        lvi.pszText  = VARPTR(szText)
+        SendMessage hLV, %LVM_SETITEMTEXT, lvIdx, VARPTR(lvi)
 
         ' Col 1 - IP:Port
         szText = FormatIP(g_Devs(i).dwIP) & ":" & TRIM$(STR$(g_Devs(i).dwPort))
@@ -2365,7 +2398,7 @@ SUB RefreshUI()
         ' Col 6 - Codec (with transport suffix: ADPCM/UDP, PCM/TCP, etc.)
         SELECT CASE g_Devs(i).dwCodec
             CASE %CODEC_ID:     szText = "ADPCM"
-            CASE %CODEC_ID_PCM: szText = "PCM"
+            CASE %CODEC_ID_PCM: szText = "PCM 16"
             CASE ELSE:          szText = TRIM$(STR$(g_Devs(i).dwCodec))
         END SELECT
         SELECT CASE g_Devs(i).dwTransport
@@ -2797,7 +2830,7 @@ FUNCTION PBMAIN() AS LONG
     CONTROL ADD BUTTON, g_hDlg, %IDC_BTN_START,   "Start Stream", 2, 290, 90, 26
     CONTROL ADD BUTTON, g_hDlg, %IDC_BTN_STOP,    "Stop Stream",  96, 290, 90, 26
     CONTROL ADD BUTTON, g_hDlg, %IDC_BTN_STOPALL, "Stop All",    190, 290, 90, 26
-    CONTROL ADD BUTTON, g_hDlg, %IDC_BTN_DUMP,    "DUMP",        284, 290, 90, 26
+    CONTROL ADD BUTTON, g_hDlg, %IDC_BTN_DUMP,    "DUMP",        284, 290, 60, 26
     CONTROL DISABLE g_hDlg, %IDC_BTN_START
     CONTROL DISABLE g_hDlg, %IDC_BTN_STOP
     CONTROL DISABLE g_hDlg, %IDC_BTN_STOPALL
