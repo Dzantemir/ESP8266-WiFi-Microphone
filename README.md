@@ -176,9 +176,9 @@ Switchable at runtime via `AT+XPORT=0|1|2` + `AT+HOTRESTART`
 
 | Component | Purpose | Price |
 |-----------|---------|-------|
-| ESP8266 (ESP-12F / NodeMCU / Wemos D1) | Microcontroller + WiFi | ~$3 |
-| INMP441 I2S MEMS microphone | Audio capture (24-bit) | ~$2 |
-| USB-to-UART adapter | Flashing + AT commands | ~$2 |
+| ESP8266 (ESP-12F / NodeMCU / Wemos D1) | Microcontroller + WiFi | ~$1 |
+| INMP441 I2S MEMS microphone | Audio capture (24-bit) | ~$1 |
+| USB-to-UART adapter | Flashing + AT commands | ~$1 |
 
 ### Wiring Diagram
 
@@ -606,7 +606,7 @@ Key configuration options (via `idf.py menuconfig` → ADPCM Streamer Configurat
 | | `STREAMER_TASK_PRIO_I2S` | 5 | I2S capture task priority |
 | | `STREAMER_TASK_PRIO_ADPCM` | 3 | Encoder task priority |
 | | `STREAMER_TASK_PRIO_UDP` | 2 | Sender task priority |
-| **Network / UDP** | `STREAMER_UDP_SEND_TIMEOUT_MS` | 100 | UDP send timeout |
+| **Network / UDP** | `STREAMER_UDP_SEND_TIMEOUT_MS` | 1000 | UDP send timeout |
 | | `STREAMER_TCP_SEND_TIMEOUT_MS` | 2000 | TCP send timeout (ms) |
 
 > **Important**: `CONFIG_LWIP_SO_REUSE=y` must be set in sdkconfig (Component config →
