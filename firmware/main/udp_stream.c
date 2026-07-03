@@ -6,13 +6,15 @@
  * rawtx_stream.c. Raw 802.11 TX is in rawtx_stream.c.
  */
 
+/* ---- System / SDK includes ---- */
 #include <string.h>
 #include <errno.h>
 #include "freertos/FreeRTOS.h"
-
-#include "board_config.h"
 #include "lwip/sockets.h"
 #include "esp_log.h"
+
+/* ---- Project includes ---- */
+#include "board_config.h"
 #include "udp_stream.h"
 
 #ifndef IPTOS_DSCP_EF
@@ -49,8 +51,8 @@ esp_err_t udp_stream_init(uint32_t host_ip, uint16_t host_port)
     // Configure client socket: optional
 
     /* Set TOS (Type of Service) to Expedited Forwarding (Voice). */
-    // int tos = IPTOS_DSCP_EF;
-    // setsockopt(s_sock, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+    //int tos = IPTOS_DSCP_EF;
+    //setsockopt(s_sock, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
 
     memset(&s_dest, 0, sizeof(s_dest));
     s_dest.sin_family = AF_INET;

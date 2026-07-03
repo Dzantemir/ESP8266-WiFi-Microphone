@@ -8,12 +8,11 @@
  * Uses POSIX sockets (lwip/sockets.h) on ESP8266 RTOS SDK v3.4.
  */
 
-
+/* ---- System / SDK includes ---- */
 #include <string.h>
 #include <errno.h>
 
 #include "freertos/FreeRTOS.h"
-#include "board_config.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "freertos/event_groups.h"
@@ -21,15 +20,17 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
-#include "svc_port.h"
-#include "svc_protocol.h"
-#include "config_mgr.h"
 
 #include "tcpip_adapter.h"
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
-#include "lwip/def.h" /* ntohs() */
 
+/* ---- Project includes ---- */
+#include "board_config.h"
+#include "svc_port.h"
+#include "svc_protocol.h"
+#include "config_mgr.h"
+#include "lwip/def.h" /* ntohs() */
 
 extern uint32_t streaming_get_frame_ms(void);
 
@@ -436,6 +437,10 @@ static void build_info_payload(svc_info_payload_t *info)
     info->wifi_rssi = rssi;
 
     strncpy(info->firmware, FIRMWARE_VERSION, sizeof(info->firmware) - 1);
+
+    /* v2.2: hostname for display in receiver UI (NUL-terminated, max 32 chars). */
+    strncpy(info->hostname, cfg.hostname, sizeof(info->hostname) - 1);
+    info->hostname[sizeof(info->hostname) - 1] = '\0';
 }
 
 static void send_info(uint16_t req_seq, const ip_addr_t *dest, uint16_t port)

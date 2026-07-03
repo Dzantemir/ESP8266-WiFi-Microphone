@@ -10,9 +10,13 @@
  * DVI4 convention: first sample in high nibble (MSB), second in low
  * nibble (LSB) - opposite of IMA ADPCM WAV format.
  */
+
+/* ---- System / SDK includes ---- */
 #include <stdlib.h>
 #include "esp_attr.h"
 #include "esp_log.h"
+
+/* ---- Project includes ---- */
 #include "adpcm_encoder.h"
 
 static const char *TAG = "adpcm_enc";

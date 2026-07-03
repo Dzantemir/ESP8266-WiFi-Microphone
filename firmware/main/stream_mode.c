@@ -13,6 +13,11 @@
  *   tcp_stream.c    — TCP listener + blocking send with framing
  *   rawtx_stream.c  — Raw 802.11 TX via esp_wifi_80211_tx()
  */
+
+/* ---- System / SDK includes ---- */
+#include "esp_log.h"
+
+/* ---- Project includes ---- */
 #include "board_config.h"
 #include "stream_mode.h"
 #include "wifi_sta.h"
@@ -20,9 +25,6 @@
 #include "udp_stream.h"
 #include "tcp_stream.h"
 #include "rawtx_stream.h"
-
-
-#include "esp_log.h"
 
 static const char *TAG = "stream_mode";
 

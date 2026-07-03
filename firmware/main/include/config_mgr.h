@@ -30,7 +30,7 @@
 typedef struct {
     char     wifi_ssid[33];
     char     wifi_password[65];
-    char     hostname[33];         /* DHCP hostname (1-32 chars) */
+    char     hostname[24];         /* DHCP hostname (1-23 chars + NUL) */
     uint8_t  tx_power;          /* dBm */
     uint16_t svc_port;          /* EASSP UDP port */
     uint32_t sample_rate;       /* Hz */

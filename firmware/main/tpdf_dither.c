@@ -25,8 +25,11 @@
  * 4. No <stdlib.h> - nothing from it is used.
  */
 
-#include "tpdf_dither.h"
+/* ---- System / SDK includes ---- */
 #include "esp_attr.h" /* IRAM_ATTR, DRAM_ATTR */
+
+/* ---- Project includes ---- */
+#include "tpdf_dither.h"
 
 #ifdef TPDF_DEBUG
 #include <assert.h>

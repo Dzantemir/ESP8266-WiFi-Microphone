@@ -7,10 +7,9 @@
  *    sets a fixed channel, and marks WiFi as "ready" for esp_wifi_80211_tx.
  */
 
-
+/* ---- System / SDK includes ---- */
 #include <string.h>
 #include "freertos/FreeRTOS.h"
-#include "board_config.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 
@@ -19,9 +18,10 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "tcpip_adapter.h"
+
+/* ---- Project includes ---- */
+#include "board_config.h"
 #include "wifi_sta.h"
-
-
 #include "svc_port.h"
 
 static const char *TAG = "wifi_sta";

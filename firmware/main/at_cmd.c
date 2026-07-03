@@ -21,7 +21,7 @@
  * Audio parameters (AT+RATE, AT+BITS, AT+FMT, AT+CH) apply on next stream start.
  */
 
-
+/* ---- System / SDK includes ---- */
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -29,26 +29,25 @@
 #include <strings.h> /* strcasecmp */
 #include <stdarg.h>
 
-/* FreeRTOS MUST come before driver/uart.h and esp_wifi.h! */
 #include "freertos/FreeRTOS.h"
-#include "board_config.h"
 #include "freertos/task.h"
 
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
+
+/* ---- Project includes ---- */
+#include "board_config.h"
 #include "at_cmd.h"
 #include "config_mgr.h"
 #include "svc_port.h"
 #include "svc_protocol.h"
 #include "wifi_sta.h"
 #include "i2s_capture.h"
-
-
 #include "battery.h"
 #include "stream_control.h"
-#include "udp_stream.h"
+#include "stream_mode.h"
 extern uint32_t streaming_get_frame_ms(void);
 
 static const char *TAG = "at_cmd";
@@ -520,7 +519,7 @@ static void cmd_rst(void)
     }
 
     /* Step 2: Safety net - force hardware deinit regardless of step 1. */
-    udp_stream_deinit();  /* close UDP socket / raw TX transport */
+    transport_deinit();  /* close active transport (UDP/TCP/RawTX) */
     i2s_capture_deinit(); /* stop I2S DMA, uninstall driver */
     wifi_sta_deinit();    /* stop WiFi radio, uninstall driver */
 
@@ -554,7 +553,7 @@ static void cmd_help(void)
     at_send_str("+HELP:AT+WIFI?       - show WiFi settings\r\n");
     at_send_str("+HELP:AT+WIFI=s,pwd  - set WiFi (auto-save, applied immediately)\r\n");
     at_send_str("+HELP:AT+HOST?       - show DHCP hostname\r\n");
-    at_send_str("+HELP:AT+HOST=name   - set hostname (auto-save, restart required)\r\n");
+    at_send_str("+HELP:AT+HOST=name   - set hostname (max 23 chars, auto-save, restart)\r\n");
     at_send_str("+HELP:AT+PORT?       - show service/discovery port\r\n");
     at_send_str("+HELP:AT+PORT=n      - set service port (auto-save, restart required)\r\n");
     at_send_str("+HELP:AT+TXPWR?      - show WiFi TX power\r\n");
@@ -678,9 +677,9 @@ static void cmd_host_set(const char *args)
         at_send_error();
         return;
     }
-    if (strlen(args) >= 32)
+    if (strlen(args) >= 24)
     {
-        at_send_data("+ERR:hostname too long (max 32 chars)\r\n");
+        at_send_data("+ERR:hostname too long (max 23 chars)\r\n");
         at_send_error();
         return;
     }

@@ -12,17 +12,17 @@
  */
 #if BATTERY_ENABLED
 
+/* ---- System / SDK includes ---- */
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
-#include "freertos/FreeRTOS.h"
-#include "board_config.h"
-
-#include "freertos/task.h"
-
-#include "battery.h"
-
 #include "driver/adc.h"
+
+/* ---- Project includes ---- */
+#include "board_config.h"
+#include "battery.h"
 
 static const char *TAG = "battery";
 

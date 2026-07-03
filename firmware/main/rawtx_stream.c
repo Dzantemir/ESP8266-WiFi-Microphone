@@ -6,11 +6,13 @@
  * Independent module — does not share state with udp_stream.c or tcp_stream.c.
  */
 
-
+/* ---- System / SDK includes ---- */
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
+
+/* ---- Project includes ---- */
 #include "rawtx_stream.h"
 
 static const char *TAG = "rawtx";

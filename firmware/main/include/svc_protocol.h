@@ -60,7 +60,7 @@
 #define SVC_ERR_CONFIG      6
 
 /* Payload sizes */
-#define INFO_PAYLOAD_SZ     34   /* v2.1: +1 byte transport_mode (was 33) */
+#define INFO_PAYLOAD_SZ     58   /* v2.2: +24 bytes hostname (was 34) */
 #define CFG_PAYLOAD_SZ      2
 
 /* Header structure (8 bytes, packed) */
@@ -74,9 +74,9 @@ typedef struct __attribute__((packed)) svc_header {
 
 _Static_assert(sizeof(svc_header_t) == SVC_HEADER_SIZE, "svc_header_t must be 8 bytes");
 
-/* INFO payload (34 bytes, packed) - sent in response to DISCOVER/CONFIGURE.
- * v2.1: added transport_mode (1 byte) at the end. Old receivers (expecting
- * 33 bytes) ignore the extra byte — backward compatible over UDP datagram. */
+/* INFO payload (58 bytes, packed) - sent in response to DISCOVER/CONFIGURE.
+ * v2.1: added transport_mode (1 byte).
+ * v2.2: added hostname[24] at the end (max 23 chars + NUL, matches device_config_t). */
 typedef struct __attribute__((packed)) svc_info_payload {
     uint8_t  status;        /* SVC_STATUS_* */
     uint8_t  codec_id;      /* CODEC_ID_ADPCM = 5, CODEC_ID_PCM = 6 */
@@ -91,9 +91,10 @@ typedef struct __attribute__((packed)) svc_info_payload {
     char     firmware[8];   /* FIRMWARE_VERSION */
     uint8_t  bits_per_sample; /* 16 or 24 (from NVS config) */
     uint8_t  transport_mode;  /* v2.1: 0=UDP, 1=TCP, 2=Raw 802.11 TX */
+    char     hostname[24];    /* v2.2: DHCP hostname (NUL-terminated, max 23 chars) */
 } svc_info_payload_t;
 
-_Static_assert(sizeof(svc_info_payload_t) == INFO_PAYLOAD_SZ, "svc_info_payload_t must be 34 bytes");
+_Static_assert(sizeof(svc_info_payload_t) == INFO_PAYLOAD_SZ, "svc_info_payload_t must be 58 bytes");
 
 /* CONFIGURE payload (2 bytes, packed) - server -> device
  *

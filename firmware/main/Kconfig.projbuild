@@ -150,7 +150,7 @@ menu "ADPCM Streamer Configuration"
         config STREAMER_GAIN_16
             bool "+24 dB (16x)"
         config STREAMER_GAIN_32
-            bool "+30 dB (32x) - default"
+            bool "+30 dB (32x) — default"
         config STREAMER_GAIN_48
             bool "+34 dB (48x)"
         config STREAMER_GAIN_64
@@ -173,9 +173,9 @@ menu "ADPCM Streamer Configuration"
                 AGC (Automatic Gain Control) preset modes.
                 Each preset has tuned attack/release speeds:
                 OFF:    AGC disabled, use fixed gain (AT+GAIN).
-                LOW:    attack=50, release=10 - slow, minimal noise hiss.
-                MEDIUM: attack=75, release=20 - balanced (default).
-                HIGH:   attack=90, release=50 - fast reaction, more hiss.
+                LOW:    attack=50, release=10 — slow, minimal noise hiss.
+                MEDIUM: attack=75, release=20 — balanced (default).
+                HIGH:   attack=90, release=50 — fast reaction, more hiss.
                 Target -18 dBFS, max gain 64x, noise gate -42 dBFS.
                 Adjustable at runtime via AT+AGC=0|1|2|3.
 
@@ -184,7 +184,7 @@ menu "ADPCM Streamer Configuration"
         config STREAMER_AGC_LOW
             bool "LOW (minimal hiss, slow)"
         config STREAMER_AGC_MEDIUM
-            bool "MEDIUM (balanced) - default"
+            bool "MEDIUM (balanced) — default"
         config STREAMER_AGC_HIGH
             bool "HIGH (fast reaction, more hiss)"
         endchoice
@@ -232,6 +232,7 @@ menu "ADPCM Streamer Configuration"
    config STREAMER_RAWTX_CHANNEL
             int "WiFi channel for Raw 802.11 TX mode (1-13)"
             default 1
+            depends on STREAMER_TRANSPORT_RAWTX
             help
                 The WiFi channel (frequency) used for broadcasting audio
                 when Raw 802.11 TX transport is selected (STREAMER_TRANSPORT_RAWTX).
@@ -322,7 +323,7 @@ menu "ADPCM Streamer Configuration"
             default 2500
             help
                 Below this, ADC reading is considered erroneous (no battery,
-                broken divider). Does NOT trigger deep sleep - just logs warning.
+                broken divider). Does NOT trigger deep sleep — just logs warning.
 
         config STREAMER_BATT_DIVIDER_RATIO
             int "Voltage divider ratio (x1)"
@@ -391,6 +392,7 @@ menu "ADPCM Streamer Configuration"
     # ===================================================================
 
     menu "WiFi Defaults"
+    depends on STREAMER_TRANSPORT_TCP || STREAMER_TRANSPORT_UDP
 
         config STREAMER_WIFI_SSID
             string "Default WiFi SSID"
@@ -409,7 +411,10 @@ menu "ADPCM Streamer Configuration"
             string "WiFi hostname"
             default "esp-streamer"
             help
-                Device hostname on the network.
+                Device hostname on the network. Max 23 characters
+                (stored in a 24-byte field including NUL terminator).
+                If longer, it will be rejected at runtime by AT+HOST
+                and truncated by the config loader at boot.
 
         config STREAMER_WIFI_CONNECT_TIMEOUT_MS
             int "WiFi connection timeout (ms)"
@@ -433,6 +438,7 @@ menu "ADPCM Streamer Configuration"
     # ===================================================================
 
     menu "Service Port (EASSP)"
+    depends on STREAMER_TRANSPORT_TCP || STREAMER_TRANSPORT_UDP
 
         config STREAMER_SVC_PORT
             int "EASSP service port"
@@ -493,7 +499,7 @@ menu "ADPCM Streamer Configuration"
             range 1 15
             default 5
             help
-                MUST be highest priority - DMA buffers overflow if starved.
+                MUST be highest priority — DMA buffers overflow if starved.
 
         config STREAMER_TASK_PRIO_ADPCM
             int "ADPCM encoder task priority"
@@ -568,7 +574,7 @@ menu "ADPCM Streamer Configuration"
                 Must be greater than UDP_SEND_TIMEOUT_MS (2000ms) so that
                 stream_task_fn blocked in sendto() has time to return.
                 With a smaller value, the task gets force-deleted while
-                inside lwIP sendto() - corrupting state and orphaning mutexes.
+                inside lwIP sendto() — corrupting state and orphaning mutexes.
 
     endmenu
 
@@ -595,16 +601,19 @@ menu "ADPCM Streamer Configuration"
     # ===================================================================
 
     menu "Network / UDP / TCP"
+    depends on STREAMER_TRANSPORT_TCP || STREAMER_TRANSPORT_UDP
 
         config STREAMER_UDP_SEND_TIMEOUT_MS
             int "UDP socket send timeout (ms)"
             range 500 2000
             default 1000
+             depends on STREAMER_TRANSPORT_UDP
 
         config STREAMER_TCP_SEND_TIMEOUT_MS
             int "TCP send timeout (ms)"
             default 2000
             range 500 10000
+             depends on STREAMER_TRANSPORT_TCP
             help
                 Timeout for the blocking send() call, in milliseconds. If the
                 receiver does not read data for longer than this, the connection

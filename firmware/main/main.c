@@ -17,24 +17,23 @@
  * (which would leave the I2S driver mutex locked and deadlock i2s_driver_uninstall).
  */
 
+/* ---- System / SDK includes ---- */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <inttypes.h>
-
 #include "freertos/FreeRTOS.h"
-#include "board_config.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/event_groups.h"
-
 #include "esp_system.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 
-
+/* ---- Project includes ---- */
+#include "board_config.h"
 #include "config_mgr.h"
 #include "wifi_sta.h"
 #include "svc_port.h"

@@ -20,16 +20,16 @@
  *   (low 8 bits are always 0x00 = padding).
  */
 
-
+/* ---- System / SDK includes ---- */
 #include "freertos/FreeRTOS.h"
-#include "board_config.h"
 #include "driver/i2s.h"
 #include "esp_log.h"
 #include "esp8266/i2s_struct.h"
 #include "esp8266/eagle_soc.h"
+
+/* ---- Project includes ---- */
+#include "board_config.h"
 #include "i2s_capture.h"
-
-
 
 static const char *TAG = "i2s_cap";
 #define I2S_PORT I2S_NUM_0

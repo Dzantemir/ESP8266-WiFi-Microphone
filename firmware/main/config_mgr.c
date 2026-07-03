@@ -6,16 +6,16 @@
  * immediately so settings survive reset.
  */
 
-
+/* ---- System / SDK includes ---- */
 #include <string.h>
 #include "freertos/FreeRTOS.h"
-#include "board_config.h"
-
 #include "freertos/semphr.h"
 #include "nvs.h"
 #include "esp_log.h"
-#include "config_mgr.h"
 
+/* ---- Project includes ---- */
+#include "board_config.h"
+#include "config_mgr.h"
 
 static const char *TAG = "config_mgr";
 static const char *NVS_NAMESPACE = "streamer";
