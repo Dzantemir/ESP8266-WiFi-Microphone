@@ -26,7 +26,7 @@
 ### 🎙️ Professional Audio Pipeline
 - **24-bit I2S capture** with INMP441 MEMS microphone
 - **TPDF dithering** (Wannamaker/Vanderkooy/Lipshitz) for 24→16-bit reduction
-- **Software AGC** with 4 presets (OFF/LOW/MEDIUM/HIGH), noise gate, gain smoothing
+- **Software AGC** with 9 presets (Studio→Surveillance), per-preset attack/release/target/noise gate
 - **Fixed digital gain** (0–64×, +0 to +36 dB)
 - **IRAM-optimized** ADPCM encoder (zero flash cache stalls)
 - **DMA alignment fix** — zero-click audio on all sample rates (8–48 kHz)
@@ -80,7 +80,9 @@ Switchable at runtime via `AT+XPORT=0|1|2` + `AT+HOTRESTART`
 - All settings persist in NVS flash
 - `AT+HOTRESTART` applies audio + transport changes instantly
 - `AT+XPORT` — switch transport (UDP/TCP/RawTX)
+- `AT+AGC` — 9 AGC presets (Studio→Surveillance)
 - `AT+TIMING` — I2S RX input delays (sd/ws/bck, 0–3 each)
+- `AT+HOST` — DHCP hostname (max 23 chars, shown in receiver UI)
 - No reboot needed for audio parameter changes
 
 </td>
@@ -174,9 +176,9 @@ Switchable at runtime via `AT+XPORT=0|1|2` + `AT+HOTRESTART`
 
 | Component | Purpose | Price |
 |-----------|---------|-------|
-| ESP8266 (ESP-12F / NodeMCU / Wemos D1) | Microcontroller + WiFi | ~$1 |
-| INMP441 I2S MEMS microphone | Audio capture (24-bit) | ~$1 |
-| USB-to-UART adapter | Flashing + AT commands | ~$1 |
+| ESP8266 (ESP-12F / NodeMCU / Wemos D1) | Microcontroller + WiFi | ~$3 |
+| INMP441 I2S MEMS microphone | Audio capture (24-bit) | ~$2 |
+| USB-to-UART adapter | Flashing + AT commands | ~$2 |
 
 ### Wiring Diagram
 
@@ -347,8 +349,10 @@ Click **DUMP** to record to WAV. Files auto-split at 1 GB:
 | 7 | Limiter | 100 | 5 | -6 dBFS | Peak limiting only, no quiet boost |
 | 8 | Surveillance | 95 | 80 | -12 dBFS | Aggressive, constant level for monitoring |
 
-**Attack** = speed of gain drop when signal is loud (% per frame)
-**Release** = speed of gain rise when signal is quiet (% per frame)
+**Attack** = speed of gain DROP when signal is loud (% per frame, higher = faster)
+**Release** = speed of gain RISE when signal is quiet (% per frame, higher = faster)
+**Target** = desired output level in dBFS (lower = more headroom)
+**Noise gate** = below this level, gain is frozen at 1× (prevents noise amplification)
 
 ---
 
@@ -372,7 +376,7 @@ This project prioritizes audio quality at every stage:
 | Technique | Purpose |
 |-----------|---------|
 | TPDF Dithering | Linearizes quantizer, decorrelates error (24→16 bit) |
-| AGC | Speech-optimized, asymmetric attack/release, noise gate |
+| AGC | 9 presets with per-preset attack/release/target/noise gate |
 | Gain Smoothing | Prevents zipper noise on gain changes |
 | IRAM Encoder | Zero flash cache stalls during WiFi SPI operations |
 | DMA Alignment | `samples_per_frame &= ~7` — eliminates SLC word-boundary artifacts |
@@ -602,7 +606,7 @@ Key configuration options (via `idf.py menuconfig` → ADPCM Streamer Configurat
 | | `STREAMER_TASK_PRIO_I2S` | 5 | I2S capture task priority |
 | | `STREAMER_TASK_PRIO_ADPCM` | 3 | Encoder task priority |
 | | `STREAMER_TASK_PRIO_UDP` | 2 | Sender task priority |
-| **Network / UDP** | `STREAMER_UDP_SEND_TIMEOUT_MS` | 1000 | UDP send timeout |
+| **Network / UDP** | `STREAMER_UDP_SEND_TIMEOUT_MS` | 100 | UDP send timeout |
 | | `STREAMER_TCP_SEND_TIMEOUT_MS` | 2000 | TCP send timeout (ms) |
 
 > **Important**: `CONFIG_LWIP_SO_REUSE=y` must be set in sdkconfig (Component config →
