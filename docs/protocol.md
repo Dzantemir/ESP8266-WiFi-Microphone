@@ -6,13 +6,25 @@
 
 EASSP is a binary UDP protocol for device discovery, streaming control, and status reporting between ESP8266 audio streamer devices and the EASSP Server (Windows receiver).
 
+### Transports
+
+Audio data can be sent via three transports, selectable at runtime via `AT+XPORT`:
+
+| Transport | Discovery | Audio Path | Framing |
+|-----------|-----------|------------|---------|
+| UDP (default) | UDP 3950 | UDP datagrams (port 5000+) | Each datagram = 1 frame (boundaries preserved by UDP) |
+| TCP | UDP 3950 | TCP connection (ESP = listener, server connects) | Length-prefix: `[u16 len BE][frame]` |
+| Raw 802.11 TX | None (auto-start) | Raw WiFi frames (broadcast) | Each frame = 1 802.11 data frame |
+
+Discovery (DISCOVER/CONFIGURE/STOP/INFO) always uses UDP port 3950, even in TCP mode.
+
 ### Ports
 
 | Port  | Direction         | Purpose                        |
 |-------|-------------------|--------------------------------|
 | 3950  | Server -> Device  | DISCOVER, CONFIGURE, STOP      |
 | 3950  | Device -> Server  | INFO (responses, announcements)|
-| 5000+ | Device -> Server  | Audio data stream              |
+| 5000+ | Device -> Server  | Audio data stream (UDP) or TCP listener |
 
 ### Packet Format
 
@@ -51,21 +63,23 @@ Payload: none (payload_len = 0)
 #### INFO (0x81) - Device -> Server
 Status response sent in reply to DISCOVER or CONFIGURE, and periodically while streaming.
 
-Payload (33 bytes):
+Payload (58 bytes, v2.2):
 ```
-Offset  Field           Type     Description
-0       status          u8       0=IDLE, 1=STREAMING, 2=ERROR
-1       codec_id        u8       5=ADPCM, 6=PCM
-2       error           u8       Error code (0=none)
-3       channels        u8       1 or 2
-4       sample_rate     u32      Hz (e.g., 48000)
-8       frame_ms        u8       Frame duration in ms
-9       mac[6]          u8[6]    Device MAC address
-15      packets_sent    u32      Total packets sent since stream start
-19      free_heap       u32      Free heap in bytes
-23      wifi_rssi       i8       WiFi RSSI in dBm
-24      firmware[8]     char[8]  Firmware version string
-32      bits_per_sample u8       16 or 24
+Offset  Field             Type     Description
+0       status            u8       0=IDLE, 1=STREAMING, 2=ERROR
+1       codec_id          u8       5=ADPCM, 6=PCM
+2       error             u8       Error code (0=none)
+3       channels          u8       1 or 2
+4       sample_rate       u32      Hz (e.g., 48000)
+8       frame_ms          u8       Frame duration in ms
+9       mac[6]            u8[6]    Device MAC address
+15      packets_sent      u32      Total packets sent since stream start
+19      free_heap         u32      Free heap in bytes
+23      wifi_rssi         i8       WiFi RSSI in dBm
+24      firmware[8]       char[8]  Firmware version string
+32      bits_per_sample   u8       16 or 24
+33      transport_mode    u8       v2.1: 0=UDP, 1=TCP, 2=Raw 802.11 TX
+34      hostname[24]      char[24] v2.2: DHCP hostname (NUL-terminated, max 23 chars)
 ```
 
 ### Error Codes
@@ -82,7 +96,10 @@ Offset  Field           Type     Description
 
 ## Audio Packet Format
 
-Audio data is sent as UDP packets with a 16-byte header followed by the audio payload.
+Audio data is sent as packets with a 16-byte header followed by the audio payload.
+In UDP mode, each packet is a single datagram. In TCP mode, each packet is
+prefixed with a 2-byte length (see TCP Framing below). In Raw 802.11 TX mode,
+each packet is a single 802.11 data frame.
 
 ### Header (16 bytes)
 
@@ -122,12 +139,41 @@ Raw signed PCM samples, little-endian:
 **16-bit:** 2 bytes per sample per channel (interleaved for stereo)
 **24-bit:** 3 bytes per sample per channel (low 3 bytes of int32, sign-extended)
 
+### TCP Framing
+
+When `transport_mode=1` (TCP), audio frames are sent over a TCP connection.
+Since TCP is a stream protocol (no message boundaries), each frame is
+prefixed with a 2-byte big-endian length:
+
+```
+[u16 length (big-endian)] [16-byte header] [payload]
+        2 bytes                16 bytes       N bytes
+
+length = 16 + payload_len (max 1416, fits in u16)
+```
+
+The ESP8266 opens a listening socket on `stream_port` (from CONFIGURE).
+The server connects to `ESP_IP:stream_port` and reads:
+1. 2 bytes → decode as big-endian u16 `length`
+2. `length` bytes → parse as audio packet (same format as UDP)
+
+The server reconnects automatically on disconnect.
+
+**Backpressure:** The ESP uses blocking `send()` with `SO_SNDTIMEO` (configurable
+via menuconfig, default 2000 ms). If the server stops reading, `send()` blocks
+→ the ADPCM queue fills → I2S drops frames (natural backpressure, same as UDP).
+On timeout, the connection is closed and the accept task picks up a new connect.
+
 ### Frame Duration
 
 Frame duration (`frame_ms`) is computed adaptively by the ESP8266 to satisfy:
 - Even sample count (ADPCM requirement: 2 samples per byte)
 - DMA buffer minimum (32 samples per quarter-frame)
 - UDP MTU limit (packet size <= 1400 bytes)
+- DMA alignment: `samples_per_frame` is rounded down to a multiple of 8
+  (16-bit) or 4 (24-bit) to ensure `blocksize = dma_buf_len * sample_size`
+  is a multiple of 4 (ESP8266 SLC word size). Without this, one sample is
+  lost per DMA buffer boundary → periodic clicks.
 
 Preferred durations (largest that fits): 60, 50, 40, 30, 25, 20, 15, 10, 5 ms
 
