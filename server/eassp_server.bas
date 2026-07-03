@@ -2383,8 +2383,8 @@ SUB RefreshUI()
             CASE ELSE:          szText = TRIM$(STR$(g_Devs(i).dwCodec))
         END SELECT
         SELECT CASE g_Devs(i).dwTransport
+            CASE 0: szText = szText & "/UDP"
             CASE 1: szText = szText & "/TCP"
-            CASE 2: szText = szText & "/Raw"
         END SELECT
         lvi.iSubItem = %LV_COL_CODEC
         lvi.pszText  = VARPTR(szText)
