@@ -181,7 +181,7 @@ esp_err_t config_mgr_init(void)
     {
         s_config.gain = AUDIO_GAIN_DEFAULT;
     }
-    if (s_config.agc_mode > AGC_MODE_HIGH)
+    if (s_config.agc_mode >= AGC_MODE_COUNT)
     {
         s_config.agc_mode = AUDIO_AGC_DEFAULT;
     }
@@ -399,7 +399,7 @@ esp_err_t config_set_gain(uint8_t gain)
 
 esp_err_t config_set_agc_mode(uint8_t mode)
 {
-    if (mode > AGC_MODE_HIGH)
+    if (mode >= AGC_MODE_COUNT)
     {
         return ESP_ERR_INVALID_ARG;
     }

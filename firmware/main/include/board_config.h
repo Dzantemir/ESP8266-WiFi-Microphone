@@ -99,24 +99,80 @@ static inline bool sample_rate_is_valid(uint32_t rate)
 #ifdef CONFIG_STREAMER_AGC_MODE
 #define AUDIO_AGC_DEFAULT CONFIG_STREAMER_AGC_MODE
 #else
-#define AUDIO_AGC_DEFAULT 2   /* MEDIUM */
+#define AUDIO_AGC_DEFAULT 3   /* Voice Balanced */
 #endif
 
-#define AGC_MODE_OFF    0
-#define AGC_MODE_LOW    1
-#define AGC_MODE_MEDIUM 2
-#define AGC_MODE_HIGH   3
+/* AGC (Automatic Gain Control) — 9 presets, each with its own character.
+ *
+ * Parameters per preset:
+ *   attack     — speed of gain DROP when signal is loud (% per frame, 1-100)
+ *   release    — speed of gain RISE when signal is quiet (% per frame, 1-100)
+ *   target_q8  — target output level in Q8.8 fixed-point (e.g. 4096 = -18 dBFS)
+ *                For 16-bit: 32768 = full scale. target_q8 = 32768 * 10^(target_dBFS/20)
+ *   noise_gate_q8 — below this level, gain = 1x (bypass). 0 = no gate.
+ *
+ * Q8.8 encoding: value = level * 256. Examples:
+ *   -18 dBFS = 0.125 * 32768 * 256 = 1048576  (AGC_TARGET_16BIT)
+ *   -12 dBFS = 0.25  * 32768 * 256 = 2097152
+ *   -6 dBFS  = 0.5   * 32768 * 256 = 4194304
+ *   -48 dBFS = 0.004 * 32768 * 256 = 32768
+ *   -60 dBFS = 0.001 * 32768 * 256 = 8192
+ *
+ * For 24-bit mode, the AGC operates in the 24-bit domain (max 8388607).
+ * The same dBFS values apply — we just use the 24-bit equivalents. */
+#define AGC_MODE_COUNT      9
 
-/* AGC preset parameters: attack and release speeds (1-100, % per frame).
- * Attack: how fast gain DROPS when signal is loud (envelope rising).
- * Release: how fast gain RISES when signal is quiet (envelope falling).
- * Lower release = less noise hiss but slower recovery. */
-#define AGC_LOW_ATTACK    50
-#define AGC_LOW_RELEASE   10
-#define AGC_MED_ATTACK    75
-#define AGC_MED_RELEASE   20
-#define AGC_HIGH_ATTACK   90
-#define AGC_HIGH_RELEASE  50
+#define AGC_MODE_OFF            0
+#define AGC_MODE_STUDIO_SOFT    1
+#define AGC_MODE_PODCAST        2
+#define AGC_MODE_VOICE_BALANCED 3
+#define AGC_MODE_VOICE_FAST     4
+#define AGC_MODE_NOISY_ROOM     5
+#define AGC_MODE_MUSIC          6
+#define AGC_MODE_LIMITER        7
+#define AGC_MODE_SURVEILLANCE   8
+
+typedef struct {
+    const char *name;
+    uint8_t  attack;       /* % per frame, gain dropping (1-100) */
+    uint8_t  release;      /* % per frame, gain rising (1-100) */
+    int32_t  target_q8;    /* target level in Q8.8 (0 = use bit-depth default) */
+    int32_t  noise_gate_q8;/* noise gate in Q8.8 (0 = no gate) */
+} agc_preset_t;
+
+/* 16-bit equivalents for target/noise_gate (used when target_q8 = 0) */
+#define AGC_TARGET_16BIT    (1 << 20)   /* -18 dBFS in 16-bit domain (Q8.8) */
+#define AGC_TARGET_24BIT    (1 << 24)   /* -18 dBFS in 24-bit domain (Q8.8) */
+#define AGC_NOISE_GATE_DIV  64          /* noise gate = target / DIV (if preset has 0) */
+
+static const agc_preset_t AGC_PRESETS[AGC_MODE_COUNT] = {
+    /* 0: OFF — bypass, use fixed gain (AT+GAIN) */
+    { "OFF",             0,   0,  0,        0 },
+
+    /* 1: Studio Soft — very smooth, minimal pumping, for clean recordings */
+    { "Studio Soft",    30,   5,  0,        0 },   /* target=-18dBFS, gate=-48dBFS */
+
+    /* 2: Podcast — smooth control for voice, moderate gate */
+    { "Podcast",        50,  15,  0,        0 },   /* target=-18dBFS, gate=-42dBFS */
+
+    /* 3: Voice Balanced — current MEDIUM, good default for speech */
+    { "Voice Balanced", 75,  20,  0,        0 },   /* target=-18dBFS, gate=-42dBFS */
+
+    /* 4: Voice Fast — fast reaction for dynamic speech */
+    { "Voice Fast",     90,  40,  0,        0 },   /* target=-18dBFS, gate=-36dBFS */
+
+    /* 5: Noisy Room — high noise gate, cuts background noise */
+    { "Noisy Room",     60,  25,  0,        0 },   /* target=-15dBFS, gate=-30dBFS */
+
+    /* 6: Music — slow attack (don't compress transients), fast release */
+    { "Music",          15,  60,  0,        0 },   /* target=-12dBFS, gate=-60dBFS */
+
+    /* 7: Limiter — only limits peaks, doesn't boost quiet signal */
+    { "Limiter",       100,   5,  0,        0 },   /* target=-6dBFS, gate=-60dBFS */
+
+    /* 8: Surveillance — aggressive, keeps level constant for monitoring */
+    { "Surveillance",   95,  80,  0,        0 },   /* target=-12dBFS, gate=-60dBFS */
+};
 
 /* I2S RX input timing delays (ESP8266 TRM §10.2.1.6, I2S.timing register).
  * Each delay is 0..3 (2 бита): задержка входного сэмпла в тактах APB

@@ -562,8 +562,8 @@ static void cmd_help(void)
     at_send_str("+HELP:AT+RATE=n      - set rate 8000/11025/16000/22050/32000/44100/48000\r\n");
     at_send_str("+HELP:AT+GAIN?       - show digital gain (0-64)\r\n");
     at_send_str("+HELP:AT+GAIN=n      - set gain 0-64 (0=bypass, 32=+30dB, auto-save, hotrestart)\r\n");
-    at_send_str("+HELP:AT+AGC?        - show AGC mode (0=OFF, 1=LOW, 2=MEDIUM, 3=HIGH)\r\n");
-    at_send_str("+HELP:AT+AGC=0|1|2|3 - set AGC preset (0=off 1=low hiss 2=balanced 3=fast)\r\n");
+    at_send_str("+HELP:AT+AGC?        - show AGC mode (0-8 presets)\r\n");
+    at_send_str("+HELP:AT+AGC=0..8    - set AGC preset (0=off 1=studio 2=podcast 3=balanced 4=fast 5=noisy 6=music 7=limiter 8=surv)\r\n");
     at_send_str("+HELP:AT+CODEC?      - show codec (0=ADPCM, 1=PCM)\r\n");
     at_send_str("+HELP:AT+CODEC=0|1   - set codec (0=adpcm 1=pcm, auto-save, hotrestart)\r\n");
     at_send_str("+HELP:AT+WCH?        - show wifi channel (1-13)\r\n");
@@ -589,7 +589,12 @@ static void cmd_help(void)
     at_send_data("+HELP:  Frame duration: %d ms\r\n", streaming_get_frame_ms());
     at_send_data("+HELP:  Bits: %u-bit (use AT+BITS to change)\r\n", cfg.bits_per_sample);
     at_send_data("+HELP:  Gain: %u (use AT+GAIN to change, 0=bypass)\r\n", (unsigned)cfg.gain);
-    at_send_data("+HELP:  AGC: mode %u (use AT+AGC to change)\r\n", (unsigned)cfg.agc_mode);
+    {
+        const agc_preset_t *p = (cfg.agc_mode < AGC_MODE_COUNT) ?
+            &AGC_PRESETS[cfg.agc_mode] : &AGC_PRESETS[0];
+        at_send_data("+HELP:  AGC: %u %s (use AT+AGC to change, 0-8)\r\n",
+                     (unsigned)cfg.agc_mode, p->name);
+    }
     at_send_data("+HELP:  CODEC: %u (use AT+CODEC to change, 0=ADPCM 1=PCM)\r\n", (unsigned)cfg.codec_mode);
     {
         const char *xname = "UDP";
@@ -969,32 +974,17 @@ static void cmd_agc_query(void)
 {
     device_config_t cfg;
     config_get_copy(&cfg);
-    const char *name;
-    const char *desc;
-    switch (cfg.agc_mode)
+    if (cfg.agc_mode < AGC_MODE_COUNT)
     {
-    case AGC_MODE_OFF:
-        name = "OFF";
-        desc = "fixed gain (use AT+GAIN)";
-        break;
-    case AGC_MODE_LOW:
-        name = "LOW";
-        desc = "attack=50, release=10 - minimal hiss";
-        break;
-    case AGC_MODE_MEDIUM:
-        name = "MEDIUM";
-        desc = "attack=75, release=20 - balanced";
-        break;
-    case AGC_MODE_HIGH:
-        name = "HIGH";
-        desc = "attack=90, release=50 - fast reaction";
-        break;
-    default:
-        name = "?";
-        desc = "unknown";
-        break;
+        const agc_preset_t *p = &AGC_PRESETS[cfg.agc_mode];
+        at_send_data("+AGC:%u (%s, attack=%u, release=%u)\r\n",
+                     (unsigned)cfg.agc_mode, p->name,
+                     (unsigned)p->attack, (unsigned)p->release);
     }
-    at_send_data("+AGC:%u (%s - %s)\r\n", (unsigned)cfg.agc_mode, name, desc);
+    else
+    {
+        at_send_data("+AGC:%u (unknown)\r\n", (unsigned)cfg.agc_mode);
+    }
     at_send_ok();
 }
 
@@ -1002,9 +992,10 @@ static void cmd_agc_set(const char *args)
 {
     char *endptr = NULL;
     long val = strtol(args, &endptr, 10);
-    if (endptr == args || *endptr != '\0' || val < 0 || val > AGC_MODE_HIGH)
+    if (endptr == args || *endptr != '\0' || val < 0 || val >= AGC_MODE_COUNT)
     {
-        at_send_data("+ERR:agc must be 0=OFF, 1=LOW, 2=MEDIUM, 3=HIGH\r\n");
+        at_send_data("+ERR:agc must be 0-8 (0=OFF 1=Studio 2=Podcast 3=Balanced "
+                     "4=Fast 5=Noisy 6=Music 7=Limiter 8=Surveillance)\r\n");
         at_send_error();
         return;
     }
@@ -1017,31 +1008,10 @@ static void cmd_agc_set(const char *args)
         return;
     }
 
-    const char *name;
-    switch (val)
-    {
-    case AGC_MODE_OFF:
-        name = "OFF (use fixed gain)";
-        break;
-    case AGC_MODE_LOW:
-        name = "LOW (minimal hiss, slow)";
-        break;
-    case AGC_MODE_MEDIUM:
-        name = "MEDIUM (balanced)";
-        break;
-    case AGC_MODE_HIGH:
-        name = "HIGH (fast, more hiss)";
-        break;
-    default:
-        name = "?";
-        break;
-    }
-    at_send_data("+AGC:set to %ld (%s, saved, use AT+HOTRESTART to apply)\r\n",
-                 val, name);
-    if (val != AGC_MODE_OFF)
-    {
-        at_send_data("+AGC:target=-18dBFS, max=+36dB, noise gate=-42dBFS\r\n");
-    }
+    const agc_preset_t *p = &AGC_PRESETS[val];
+    at_send_data("+AGC:set to %ld (%s, attack=%u, release=%u, "
+                 "saved, use AT+HOTRESTART to apply)\r\n",
+                 val, p->name, (unsigned)p->attack, (unsigned)p->release);
     at_send_ok();
 }
 
@@ -1348,7 +1318,13 @@ static void cmd_status(void)
     at_send_data("+STATUS:frame_ms=%u (fixed)\r\n", streaming_get_frame_ms());
     at_send_data("+STATUS:bits_per_sample=%u\r\n", cfg.bits_per_sample);
     at_send_data("+STATUS:gain=%u (0=bypass, 32=+30dB)\r\n", (unsigned)cfg.gain);
-    at_send_data("+STATUS:agc=%u (0=OFF 1=LOW 2=MEDIUM 3=HIGH)\r\n", (unsigned)cfg.agc_mode);
+    {
+        const agc_preset_t *ap = (cfg.agc_mode < AGC_MODE_COUNT) ?
+            &AGC_PRESETS[cfg.agc_mode] : &AGC_PRESETS[0];
+        at_send_data("+STATUS:agc=%u (%s, attack=%u, release=%u)\r\n",
+                     (unsigned)cfg.agc_mode, ap->name,
+                     (unsigned)ap->attack, (unsigned)ap->release);
+    }
     at_send_data("+STATUS:codec=%u (%s)\r\n", (unsigned)cfg.codec_mode,
                  cfg.codec_mode == CODEC_MODE_PCM ? "PCM" : "ADPCM");
     {

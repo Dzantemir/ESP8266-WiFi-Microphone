@@ -41,50 +41,21 @@ static uint32_t s_sample_rate = 16000;
 static uint32_t s_frame_ms = 20;
 static uint32_t s_dma_buf_ms = 5;
 static uint8_t s_gain = 32;        /* 0=bypass, 1..64 = multiplier */
-static uint8_t s_agc_mode = 0;     /* 0=OFF, 1=LOW, 2=MEDIUM, 3=HIGH */
-static uint8_t s_agc_attack = 75;  /* derived from s_agc_mode at init */
-static uint8_t s_agc_release = 20; /* derived from s_agc_mode at init */
-static uint8_t s_timing_sd_delay = 0;   /* I2S.timing.rx_sd_in_delay (0..3) */
-static uint8_t s_timing_ws_delay = 0;   /* I2S.timing.rx_ws_in_delay (0..3) */
-static uint8_t s_timing_bck_delay = 0;  /* I2S.timing.rx_bck_in_delay (0..3) */
+static uint8_t s_agc_mode = 0;     /* 0=OFF, 1..8 = preset index */
+static uint8_t s_agc_attack = 75;  /* from preset, % per frame */
+static uint8_t s_agc_release = 20; /* from preset, % per frame */
+static int32_t s_agc_target = 0;   /* target level (raw, bit-depth dependent) */
+static int32_t s_agc_noise_gate = 0; /* noise gate threshold (raw) */
+static uint8_t s_timing_sd_delay = 0;
+static uint8_t s_timing_ws_delay = 0;
+static uint8_t s_timing_bck_delay = 0;
 
-/* AGC state - persists across frames within a stream, reset on init.
- *
- * AGC ALGORITHM (speech-optimized):
- *   1. Peak follower with asymmetric attack/release:
- *      - Attack: 75% new per frame -> catches transients in ~20ms (1 frame)
- *      - Release: 10% new per frame -> decays in ~200ms (10 frames)
- *   2. Noise gate: if envelope < target/32 (~-33dB below target = -50dBFS),
- *      bypass AGC (gain=1x) to avoid amplifying silence/noise.
- *   3. Target gain = target_level / envelope, clamped to [1x, 64x]:
- *      - Target = -18 dBFS (12.5% of full scale) - leaves 18dB headroom
- *      - Max gain 64x (+36dB) - limits noise amplification
- *      - Min gain 1x (0dB) - never attenuates (not a compressor)
- *   4. Gain smoothing (asymmetric, prevents zipper noise):
- *      - Reducing (loud transient): 50% per frame -> 95% in ~80ms
- *      - Increasing (quiet section): 10% per frame -> 95% in ~560ms
- *   5. Per-sample: multiply + hard limiter (brick-wall clamp)
- *
- * Works in the native sample domain:
- *   24-bit: after >>8 extraction, range ±8388607, before TPDF dither
- *   16-bit: after sign-extension, range ±32767, before passthrough
- */
+/* AGC state — persists across frames within a stream, reset on init. */
 static int32_t s_agc_envelope = 0;         /* peak envelope follower */
 static int32_t s_agc_gain_q16 = (1 << 16); /* Q16.16 gain (65536 = 1.0x) */
 
 #define AGC_MAX_GAIN_Q16 (64 << 16) /* 64.0 in Q16.16 = +36 dB */
 #define AGC_MIN_GAIN_Q16 (1 << 16)  /* 1.0 in Q16.16 = 0 dB */
-
-/* Target levels: -18 dBFS = 12.5% of full scale.
- *   24-bit full scale = 2^23 = 8388608, target = 2^20 = 1048576
- *   16-bit full scale = 2^15 = 32768,  target = 2^12 = 4096
- * Noise gate: target / 64 (about -36 dB below target = -54 dBFS).
- * Low enough to amplify quiet speech (-55 dBFS) but still block mic noise
- * floor (-61 dBFS for INMP441). Was /16 (-42 dBFS) - too aggressive,
- * blocked normal speech from quiet microphone. */
-#define AGC_TARGET_24BIT (1 << 20)
-#define AGC_TARGET_16BIT (1 << 12)
-#define AGC_NOISE_GATE_DIV 64
 
 int i2s_capture_channel_count(int channel_format)
 {
@@ -212,8 +183,8 @@ esp_err_t i2s_capture_init(uint32_t sample_rate, int bits, int comm_format,
         return ESP_ERR_INVALID_ARG;
     if (gain > 64)
         gain = 32;
-    if (agc_mode > AGC_MODE_HIGH)
-        agc_mode = AGC_MODE_MEDIUM;
+    if (agc_mode >= AGC_MODE_COUNT)
+        agc_mode = AGC_MODE_VOICE_BALANCED;
     if (timing_sd_delay > I2S_TIMING_DELAY_MAX)
         timing_sd_delay = 0;
     if (timing_ws_delay > I2S_TIMING_DELAY_MAX)
@@ -231,22 +202,41 @@ esp_err_t i2s_capture_init(uint32_t sample_rate, int bits, int comm_format,
     s_timing_ws_delay  = timing_ws_delay;
     s_timing_bck_delay = timing_bck_delay;
 
-    /* Resolve AGC preset to attack/release speeds. */
-    switch (agc_mode)
+    /* Load AGC preset parameters (attack, release, target, noise_gate). */
     {
-    case AGC_MODE_LOW:
-        s_agc_attack = AGC_LOW_ATTACK;
-        s_agc_release = AGC_LOW_RELEASE;
-        break;
-    case AGC_MODE_HIGH:
-        s_agc_attack = AGC_HIGH_ATTACK;
-        s_agc_release = AGC_HIGH_RELEASE;
-        break;
-    case AGC_MODE_MEDIUM:
-    default:
-        s_agc_attack = AGC_MED_ATTACK;
-        s_agc_release = AGC_MED_RELEASE;
-        break;
+        const agc_preset_t *p = &AGC_PRESETS[agc_mode];
+        s_agc_attack  = p->attack;
+        s_agc_release = p->release;
+
+        /* Compute target and noise_gate for current bit depth.
+         * Presets use 0 for target → default (-18 dBFS).
+         * Noise gate = target / 64 (if preset has 0). */
+        if (s_bits == 24)
+        {
+            s_agc_target = (1 << 20);       /* -18 dBFS in 24-bit */
+            s_agc_noise_gate = s_agc_target / 64;
+        }
+        else
+        {
+            s_agc_target = (1 << 12);       /* -18 dBFS in 16-bit */
+            s_agc_noise_gate = s_agc_target / 64;
+        }
+
+        /* Override with preset-specific target/noise_gate if nonzero.
+         * Preset target_q8 is in Q8.8: convert to raw by >>8. */
+        if (p->target_q8 != 0)
+        {
+            /* target_q8 is relative to full scale.
+             * For 24-bit: full = 8388608, target_raw = full * target_q8 / (256*256)
+             * Simplified: target_raw = (8388608 * target_q8) >> 16 */
+            int32_t full_scale = (s_bits == 24) ? 8388608 : 32768;
+            s_agc_target = (int32_t)(((int64_t)full_scale * p->target_q8) >> 16);
+        }
+        if (p->noise_gate_q8 != 0)
+        {
+            int32_t full_scale = (s_bits == 24) ? 8388608 : 32768;
+            s_agc_noise_gate = (int32_t)(((int64_t)full_scale * p->noise_gate_q8) >> 16);
+        }
     }
 
     /* Reset AGC state for fresh stream. */
@@ -381,14 +371,15 @@ esp_err_t i2s_capture_deinit(void)
  * Called after sample extraction (>>8 for 24-bit, sign-extend for 16-bit),
  * before TPDF dither/passthrough. Operates in-place on buf[].
  *
- * Updates s_agc_envelope and s_agc_gain_q16 state (persists across frames). */
+ * 9 presets (AGC_PRESETS[]), each with attack/release/target/noise_gate.
+ * Parameters are loaded in i2s_capture_init() based on s_agc_mode. */
 static void apply_agc(int32_t *buf, int n)
 {
     if (n <= 0)
         return;
 
-    int32_t target_level = (s_bits == 24) ? AGC_TARGET_24BIT : AGC_TARGET_16BIT;
-    int32_t noise_gate = target_level / AGC_NOISE_GATE_DIV;
+    int32_t target_level = s_agc_target;
+    int32_t noise_gate = s_agc_noise_gate;
     int32_t max_sample = (s_bits == 24) ? 8388607 : 32767;
     int32_t min_sample = (s_bits == 24) ? -8388608 : -32768;
 
@@ -401,35 +392,26 @@ static void apply_agc(int32_t *buf, int n)
             frame_peak = a;
     }
 
-    /* 2. Update envelope (asymmetric attack/release, configurable).
-     *    Attack: envelope rises towards peak at s_agc_attack% per frame
-     *    Release: envelope falls towards peak at s_agc_release% per frame
-     *    Formula: new_env = (100-speed)*old_env + speed*peak, all /100 */
+    /* 2. Update envelope (asymmetric attack/release). */
     if (frame_peak > s_agc_envelope)
     {
         s_agc_envelope = ((100 - (int)s_agc_attack) * s_agc_envelope +
-                          (int)s_agc_attack * frame_peak) /
-                         100;
+                          (int)s_agc_attack * frame_peak) / 100;
     }
     else
     {
         s_agc_envelope = ((100 - (int)s_agc_release) * s_agc_envelope +
-                          (int)s_agc_release * frame_peak) /
-                         100;
+                          (int)s_agc_release * frame_peak) / 100;
     }
 
-    /* 3. Compute target gain.
-     *    Noise gate: if envelope below threshold, bypass (gain=1x).
-     *    Otherwise: gain = target_level / envelope, clamped [1x, 64x]. */
+    /* 3. Compute target gain. */
     int32_t target_gain_q16;
     if (s_agc_envelope < noise_gate)
     {
-        /* Signal too quiet - probably noise/silence. Don't amplify. */
         target_gain_q16 = AGC_MIN_GAIN_Q16;
     }
     else
     {
-        /* Q16.16 division: (target << 16) / envelope */
         int64_t num = (int64_t)target_level << 16;
         target_gain_q16 = (int32_t)(num / s_agc_envelope);
         if (target_gain_q16 > AGC_MAX_GAIN_Q16)
@@ -438,25 +420,19 @@ static void apply_agc(int32_t *buf, int n)
             target_gain_q16 = AGC_MIN_GAIN_Q16;
     }
 
-    /* 4. Smooth gain (uses same attack/release speeds, prevents zipper noise).
-     *    Reducing (loud transient): fast, proportional to attack speed
-     *    Increasing (quiet section): slow, proportional to release speed */
+    /* 4. Smooth gain (prevents zipper noise). */
     if (target_gain_q16 < s_agc_gain_q16)
     {
-        /* Gain dropping - use attack speed for smoothing */
         s_agc_gain_q16 = ((100 - (int)s_agc_attack) * s_agc_gain_q16 +
-                          (int)s_agc_attack * target_gain_q16) /
-                         100;
+                          (int)s_agc_attack * target_gain_q16) / 100;
     }
     else
     {
-        /* Gain rising - use release speed for smoothing */
         s_agc_gain_q16 = ((100 - (int)s_agc_release) * s_agc_gain_q16 +
-                          (int)s_agc_release * target_gain_q16) /
-                         100;
+                          (int)s_agc_release * target_gain_q16) / 100;
     }
 
-    /* 5. Apply gain per-sample + hard limiter (brick-wall clamp). */
+    /* 5. Apply gain per-sample + hard limiter. */
     for (int i = 0; i < n; i++)
     {
         int64_t v = (int64_t)buf[i] * (int64_t)s_agc_gain_q16;

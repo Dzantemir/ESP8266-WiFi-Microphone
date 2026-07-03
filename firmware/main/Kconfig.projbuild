@@ -168,33 +168,43 @@ menu "ADPCM Streamer Configuration"
 
         choice STREAMER_AGC_MODE
             prompt "AGC mode (preset)"
-            default STREAMER_AGC_MEDIUM
+            default STREAMER_AGC_VOICE_BALANCED
             help
-                AGC (Automatic Gain Control) preset modes.
-                Each preset has tuned attack/release speeds:
-                OFF:    AGC disabled, use fixed gain (AT+GAIN).
-                LOW:    attack=50, release=10 — slow, minimal noise hiss.
-                MEDIUM: attack=75, release=20 — balanced (default).
-                HIGH:   attack=90, release=50 — fast reaction, more hiss.
-                Target -18 dBFS, max gain 64x, noise gate -42 dBFS.
-                Adjustable at runtime via AT+AGC=0|1|2|3.
+                AGC (Automatic Gain Control) preset. Each preset has its own
+                attack/release speeds, target level, and noise gate threshold.
+                Adjustable at runtime via AT+AGC=0..8.
 
         config STREAMER_AGC_OFF
             bool "OFF (use fixed gain)"
-        config STREAMER_AGC_LOW
-            bool "LOW (minimal hiss, slow)"
-        config STREAMER_AGC_MEDIUM
-            bool "MEDIUM (balanced) — default"
-        config STREAMER_AGC_HIGH
-            bool "HIGH (fast reaction, more hiss)"
+        config STREAMER_AGC_STUDIO_SOFT
+            bool "Studio Soft (very smooth, minimal pumping)"
+        config STREAMER_AGC_PODCAST
+            bool "Podcast (smooth voice control)"
+        config STREAMER_AGC_VOICE_BALANCED
+            bool "Voice Balanced (default, good for speech)"
+        config STREAMER_AGC_VOICE_FAST
+            bool "Voice Fast (fast reaction for dynamic speech)"
+        config STREAMER_AGC_NOISY_ROOM
+            bool "Noisy Room (high noise gate, cuts background)"
+        config STREAMER_AGC_MUSIC
+            bool "Music (slow attack, fast release — no transient squash)"
+        config STREAMER_AGC_LIMITER
+            bool "Limiter (peak limiting only, no quiet boost)"
+        config STREAMER_AGC_SURVEILLANCE
+            bool "Surveillance (aggressive, constant level for monitoring)"
         endchoice
 
         config STREAMER_AGC_MODE
             int
             default 0 if STREAMER_AGC_OFF
-            default 1 if STREAMER_AGC_LOW
-            default 2 if STREAMER_AGC_MEDIUM
-            default 3 if STREAMER_AGC_HIGH
+            default 1 if STREAMER_AGC_STUDIO_SOFT
+            default 2 if STREAMER_AGC_PODCAST
+            default 3 if STREAMER_AGC_VOICE_BALANCED
+            default 4 if STREAMER_AGC_VOICE_FAST
+            default 5 if STREAMER_AGC_NOISY_ROOM
+            default 6 if STREAMER_AGC_MUSIC
+            default 7 if STREAMER_AGC_LIMITER
+            default 8 if STREAMER_AGC_SURVEILLANCE
 
     endmenu
 
