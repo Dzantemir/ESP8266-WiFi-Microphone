@@ -89,6 +89,7 @@ Switchable at runtime via `AT+XPORT=0|1|2` + `AT+HOTRESTART`
 ### 💻 Windows Receiver (EASSP Server)
 - **Multi-device**: Stream from up to 16 ESP8266s simultaneously
 - **Auto-discovery**: UDP broadcast on port 3950
+- **Device names**: Shows `hostname (MAC)` in ListView — identify devices at a glance
 - **Transport auto-detect**: Reads `transport_mode` from INFO payload,
   opens UDP socket or TCP connection automatically
 - **Clock drift fix**: WaveOut opens at ESP's actual I2S rate (e.g. 43860 Hz
@@ -284,7 +285,7 @@ Click **DUMP** to record to WAV. Files auto-split at 1 GB:
 | `AT+RST` | Reboot device | `AT+RST` |
 | `AT+STATUS` | Full device status | `AT+STATUS` |
 | `AT+WIFI=ssid,pass` | Set WiFi credentials | `AT+WIFI=MyHome,secret123` |
-| `AT+HOST=name` | Set DHCP hostname | `AT+HOST=esp-mic` |
+| `AT+HOST=name` | Set DHCP hostname (max 23 chars) | `AT+HOST=esp-mic` |
 | `AT+PORT=n` | Service/discovery port | `AT+PORT=3950` |
 | `AT+TXPWR=n` | WiFi TX power (dBm, 0-20) | `AT+TXPWR=20` |
 | `AT+RATE=n` | Sample rate (Hz) | `AT+RATE=48000` |
@@ -382,7 +383,7 @@ engine handles the final resample to the sound card's native rate.
 | STOP | 0x03 | Server→Device | Stop streaming immediately |
 | INFO | 0x81 | Device→Server | Status response |
 
-### INFO Payload (34 bytes, v2.1)
+### INFO Payload (58 bytes, v2.2)
 
 ```
 Offset  Field             Type     Description
@@ -399,6 +400,7 @@ Offset  Field             Type     Description
 24      firmware[8]       char[8]  Firmware version
 32      bits_per_sample   u8       16 or 24
 33      transport_mode    u8       v2.1: 0=UDP, 1=TCP, 2=Raw 802.11 TX
+34      hostname[24]      char[24] v2.2: DHCP hostname (NUL-terminated, max 23 chars)
 ```
 
 ### Audio Packet Header (16 bytes)
@@ -508,7 +510,7 @@ esp8266-wifi-microphone/
 │           ├── rawtx_stream.h     # RawTX transport API
 │           ├── board_config.h     # Config defaults + TRANSPORT_MODE_* + TCP_*
 │           ├── config_mgr.h       # device_config_t + setters
-│           ├── svc_protocol.h     # EASSP protocol (INFO v2.1, 34 bytes)
+│           ├── svc_protocol.h     # EASSP protocol (INFO v2.2, 58 bytes)
 │           ├── packet_format.h    # Audio packet header (16 bytes)
 │           └── ...                # Other headers
 │
@@ -552,7 +554,7 @@ Key configuration options (via `idf.py menuconfig` → ADPCM Streamer Configurat
 | | `STREAMER_TASK_PRIO_I2S` | 5 | I2S capture task priority |
 | | `STREAMER_TASK_PRIO_ADPCM` | 3 | Encoder task priority |
 | | `STREAMER_TASK_PRIO_UDP` | 2 | Sender task priority |
-| **Network / UDP** | `STREAMER_UDP_SEND_TIMEOUT_MS` | 1000 | UDP send timeout |
+| **Network / UDP** | `STREAMER_UDP_SEND_TIMEOUT_MS` | 100 | UDP send timeout |
 | | `STREAMER_TCP_SEND_TIMEOUT_MS` | 2000 | TCP send timeout (ms) |
 
 > **Important**: `CONFIG_LWIP_SO_REUSE=y` must be set in sdkconfig (Component config →
