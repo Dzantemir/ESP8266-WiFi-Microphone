@@ -389,7 +389,7 @@ SUB ResizeControls()
         hDWP = DeferWindowPos(hDWP, hBtn1, %NULL, 2, y, 90, btnH, dwFlags)
         hDWP = DeferWindowPos(hDWP, hBtn2, %NULL, 96, y, 90, btnH, dwFlags)
         hDWP = DeferWindowPos(hDWP, hBtn3, %NULL, cx - 92, y, 90, btnH, dwFlags)
-        hDWP = DeferWindowPos(hDWP, hBtn4, %NULL, cx - 160, y, 60, btnH, dwFlags)
+        hDWP = DeferWindowPos(hDWP, hBtn4, %NULL, cx - 200, y, 90, btnH, dwFlags)
 
         ' StatusBar: position it at the bottom, full width, fixed height.
         ' Included in DeferWindowPos batch with SWP_NOCOPYBITS to prevent
@@ -852,22 +852,7 @@ FUNCTION RateEnumToHz(BYVAL e AS LONG) AS DWORD
     END SELECT
 END FUNCTION
 
-' EspActualRate - Вычисляет ФАКТИЧЕСКУЮ частоту I2S ESP8266 для данного
-' номинала и бит.глубины I2S. Зеркалит i2s_set_rate() из firmware/i2s.c:
-'   160 МГц / (bits×2ch) / (bck_div × mclk_div), оба делителя целые 1..63.
-'
-' ЗАЧЕМ: ESP не может выдать ровно 44100 Гц — реально 43860 Гц (-0.545%).
-' Если открыть WaveOut на номинале 44100, буфер опустошается быстрее, чем
-' ESP наполняет → underrun → пощипывание/щелчки в LIVE режиме (дамп при
-' этом чистый, т.к. пишет все пакеты синхронно).
-'
-' Открываем WaveOut на фактической частоте ESP → дрейф = 0 → финальный
-' ресамплинг до частоты карты делает Windows-аудиодвижок (качественно).
-'
-' Параметры:
-'   nominalHz - номинал из INFO-пакета (8000/11025/.../48000)
-'   i2sBits   - РЕАЛЬНАЯ бит.глубина I2S (devBits из INFO, 16 или 24).
-'               НЕ outBits! Для ADPCM outBits=16, но I2S может быть 24.
+
 FUNCTION EspActualRate(BYVAL nominalHz AS DWORD, BYVAL i2sBits AS LONG) AS DWORD
     LOCAL scaled AS DOUBLE
     LOCAL i AS LONG, j AS LONG
@@ -1094,10 +1079,6 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
         outBits = 16               ' ADPCM: always 16-bit (dithered on ESP)
     END IF
 
-    ' <<<DRIFT FIX>>> открываем WaveOut на ФАКТИЧЕСКОЙ частоте I2S ESP,
-    ' иначе при 44100 Гц (реально 43860) буфер опустошается быстрее →
-    ' underrun → пощипывание в LIVE (дамп чистый, т.к. пишет синхронно).
-    ' Передаём devBits (реальная бит.глубина I2S), НЕ outBits.
     LOCAL actualSmpRate AS DWORD
     actualSmpRate = EspActualRate(devSmpRate, devBits)
     IF actualSmpRate <> devSmpRate THEN
@@ -2398,7 +2379,7 @@ SUB RefreshUI()
         ' Col 6 - Codec (with transport suffix: ADPCM/UDP, PCM/TCP, etc.)
         SELECT CASE g_Devs(i).dwCodec
             CASE %CODEC_ID:     szText = "ADPCM"
-            CASE %CODEC_ID_PCM: szText = "PCM 16"
+            CASE %CODEC_ID_PCM: szText = "PCM"
             CASE ELSE:          szText = TRIM$(STR$(g_Devs(i).dwCodec))
         END SELECT
         SELECT CASE g_Devs(i).dwTransport
@@ -2830,7 +2811,7 @@ FUNCTION PBMAIN() AS LONG
     CONTROL ADD BUTTON, g_hDlg, %IDC_BTN_START,   "Start Stream", 2, 290, 90, 26
     CONTROL ADD BUTTON, g_hDlg, %IDC_BTN_STOP,    "Stop Stream",  96, 290, 90, 26
     CONTROL ADD BUTTON, g_hDlg, %IDC_BTN_STOPALL, "Stop All",    190, 290, 90, 26
-    CONTROL ADD BUTTON, g_hDlg, %IDC_BTN_DUMP,    "DUMP",        284, 290, 60, 26
+    CONTROL ADD BUTTON, g_hDlg, %IDC_BTN_DUMP,    "DUMP",        284, 290, 90, 26
     CONTROL DISABLE g_hDlg, %IDC_BTN_START
     CONTROL DISABLE g_hDlg, %IDC_BTN_STOP
     CONTROL DISABLE g_hDlg, %IDC_BTN_STOPALL
