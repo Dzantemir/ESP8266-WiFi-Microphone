@@ -43,6 +43,7 @@ GLOBAL g_seqCnt     AS LONG     ' was WORD, changed to LONG for InterlockedIncre
 ' ---- WaveOut device selection (for VB-Cable virtual microphone) ----
 ' g_WaveDeviceId: -1 = WAVE_MAPPER (default), 0..N = specific device
 GLOBAL g_WaveDeviceId AS LONG
+GLOBAL g_sIniFile   AS STRING   ' Path to eassp_server.ini (next to .exe)
 
 GLOBAL g_csDev      AS CRITICAL_SECTION
 
@@ -165,6 +166,30 @@ END SUB
 ' ============================================================================
 '  LISTVIEW HELPERS
 ' ============================================================================
+
+' ---- INI file persistence (per-device output routing) ----
+' Uses Windows API: WritePrivateProfileString / GetPrivateProfileInt
+' INI format:
+'   [devices]
+'   9C9C1F8DAAC5=-1     (MAC without colons = WaveOut device ID, -1 = default)
+'   9C9C1F8DAABE=1
+
+' SaveDeviceOutput - Save a single device's WaveOut ID to INI
+SUB SaveDeviceOutput(BYVAL sMac AS STRING, BYVAL devId AS LONG)
+    LOCAL sKey AS STRING
+    ' Remove colons from MAC: "9C:9C:1F:8D:AA:C5" → "9C9C1F8DAAC5"
+    sKey = REMOVE$(sMac, ":")
+    IF LEN(g_sIniFile) = 0 THEN EXIT SUB
+    WritePrivateProfileString "devices", BYCOPY sKey, BYCOPY TRIM$(STR$(devId)), BYCOPY g_sIniFile
+END SUB
+
+' LoadDeviceOutput - Load a device's WaveOut ID from INI (returns -1 if not found)
+FUNCTION LoadDeviceOutput(BYVAL sMac AS STRING) AS LONG
+    LOCAL sKey AS STRING
+    sKey = REMOVE$(sMac, ":")
+    IF LEN(g_sIniFile) = 0 THEN FUNCTION = -1 : EXIT FUNCTION
+    FUNCTION = GetPrivateProfileInt("devices", BYCOPY sKey, -1, BYCOPY g_sIniFile)
+END FUNCTION
 
 ' PopulateDeviceCombo - Enumerate WaveOut devices and fill the ComboBox.
 ' Adds "Default (WAVE_MAPPER)" as first entry, then all physical/virtual
@@ -599,7 +624,8 @@ SUB UpdateDevice(BYVAL sMac AS STRING, BYVAL dwIP AS DWORD, BYVAL dwPort AS DWOR
         g_Devs(idx).dwActive = 1
         g_Devs(idx).sMac = sMac
         g_Devs(idx).dwDiscovered = tick
-        g_Devs(idx).dwWaveDevice = -1   ' Default: WAVE_MAPPER
+        ' Load saved output device from INI (or -1 = default)
+        g_Devs(idx).dwWaveDevice = LoadDeviceOutput(sMac)
     END IF
 
     g_Devs(idx).dwIP         = dwIP
@@ -2700,6 +2726,7 @@ CALLBACK FUNCTION MainDlgProc()
                         IF selIdx <= 1 THEN
                             IF selDevIdx >= 0 THEN
                                 g_Devs(selDevIdx).dwWaveDevice = -1
+                                SaveDeviceOutput g_Devs(selDevIdx).sMac, -1
                                 AddLog "Output device for " & TRIM$(g_Devs(selDevIdx).sHostname) & _
                                        ": Default (WAVE_MAPPER)"
                             ELSE
@@ -2708,6 +2735,7 @@ CALLBACK FUNCTION MainDlgProc()
                         ELSE
                             IF selDevIdx >= 0 THEN
                                 g_Devs(selDevIdx).dwWaveDevice = selIdx - 2
+                                SaveDeviceOutput g_Devs(selDevIdx).sMac, selIdx - 2
                                 AddLog "Output device for " & TRIM$(g_Devs(selDevIdx).sHostname) & _
                                        ": " & TRIM$(STR$(selIdx - 2)) & " (will apply on next stream start)"
                             ELSE
@@ -2861,6 +2889,7 @@ CALLBACK FUNCTION MainDlgProc()
                                 ' "Default (WAVE_MAPPER)" selected for the focused device
                                 IF selDev >= 0 THEN
                                     g_Devs(selDev).dwWaveDevice = -1
+                                    SaveDeviceOutput g_Devs(selDev).sMac, -1
                                     AddLog "Output device for " & TRIM$(g_Devs(selDev).sHostname) & _
                                            ": Default (WAVE_MAPPER)"
                                 END IF
@@ -2868,6 +2897,7 @@ CALLBACK FUNCTION MainDlgProc()
                                 ' Specific device ID = ctxCmd - &H2101
                                 IF selDev >= 0 THEN
                                     g_Devs(selDev).dwWaveDevice = ctxCmd - &H2101
+                                    SaveDeviceOutput g_Devs(selDev).sMac, ctxCmd - &H2101
                                     AddLog "Output device for " & TRIM$(g_Devs(selDev).sHostname) & _
                                            ": " & TRIM$(STR$(ctxCmd - &H2101)) & _
                                            " (will apply on next stream start)"
@@ -3079,6 +3109,10 @@ FUNCTION PBMAIN() AS LONG
     g_hHeap = GetProcessHeap()
     InitializeCriticalSection g_csDev
     InitializeCriticalSection g_csDump   ' FIX C6: dump file race protection
+
+    ' Build INI file path: same folder as .exe, filename "eassp_server.ini"
+    ' EXE.PATHN$ returns the .exe directory WITH trailing backslash (PowerBASIC built-in).
+    g_sIniFile = EXE.PATH$ & "eassp_server.ini"
 
     ' Init IMA ADPCM Step Table
     InitStepTable
