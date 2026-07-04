@@ -22,12 +22,61 @@
 #DIM ALL
 #OPTION VERSION5
 
-' ---- Application icon (embedded resource) ----
-' "HexaWave" — regular hexagon + microphone + WiFi arcs + amber LED.
-' Resource ID 100 = main EXE icon (shown by Explorer, taskbar, alt-tab).
-' Assigned to the dialog at runtime via DIALOG SET ICON "#100" in
-' WM_INITDIALOG (the DDT idiom — sets both caption + Alt+Tab icons).
+' ============================================================================
+'  RESOURCE SECTION
+'  ============================================================================
+'  All #RESOURCE metastatements must appear BEFORE any executable code.
+'  Order within the section does not matter EXCEPT for the VERSIONINFO
+'  block, which must be a contiguous sequence (VERSIONINFO → FILEFLAGS/
+'  FILEVERSION/PRODUCTVERSION → STRINGINFO → VERSION$ entries).
+'
+'  Contents:
+'    1. ICON       — app icon "Waveform" (Explorer, taskbar, alt-tab)
+'    2. MANIFEST   — Common Controls v6 (visual styles) + Win10/11 compat
+'                    + DPI-unaware (Windows virtualizes for HiDPI)
+'    3. VERSIONINFO — file/product version + standard string metadata
+'                    (shown in Explorer → Properties → Details)
+' ============================================================================
+
+' ---- 1. Icon (resource ID 100) ----
+' "Waveform" — circular frame + emerald sine wave + amber peak dot.
+' Multi-resolution ICO (16/32/48/64/128/256). Assigned to the dialog at
+' runtime via DIALOG SET ICON CB.HNDL, "#100" in WM_INITDIALOG.
 #RESOURCE ICON, 100, "eassp_server.ico"
+
+' ---- 2. Manifest (resource ID 1 = RT_MANIFEST) ----
+' Enables Windows XP+ visual styles (themed buttons/controls instead of
+' Win95 classic look) via Common Controls v6 dependency. Also declares
+' Windows 10/11 compatibility and DPI-unaware status (Windows DPI-
+' virtualizes the fixed-pixel DDT layout for correct sizing on HiDPI).
+#RESOURCE MANIFEST, 1, "eassp_server.manifest"
+
+' ---- 3. Version Info block ----
+' Shown in Explorer → right-click → Properties → Details tab.
+' FILEVERSION/PRODUCTVERSION are binary (4 x 16-bit); the VERSION$ strings
+' are the human-readable display values.
+'
+' Version scheme:
+'   FILEVERSION    1,0,0,0  — server exe version (independent of firmware)
+'   PRODUCTVERSION 2,0,0,0  — product version (matches firmware v2.0)
+'
+' STRINGINFO "0419","04E4":
+'   0419 = Russian (matches UI language)
+'   04E4 = Windows Multilingual (covers Cyrillic + Latin)
+#RESOURCE VERSIONINFO
+#RESOURCE FILEFLAGS      0
+#RESOURCE FILEVERSION    1, 0, 0, 0
+#RESOURCE PRODUCTVERSION 2, 0, 0, 0
+#RESOURCE STRINGINFO     "0419", "04E4"
+#RESOURCE VERSION$ "Comments",         "ESP8266 WiFi Microphone Receiver"
+#RESOURCE VERSION$ "CompanyName",      "EASSP"
+#RESOURCE VERSION$ "FileDescription",  "EASSP Server - ESP8266 WiFi Microphone"
+#RESOURCE VERSION$ "FileVersion",      "1.0.0.0"
+#RESOURCE VERSION$ "InternalName",     "eassp_server"
+#RESOURCE VERSION$ "LegalCopyright",   "Copyright (c) 2024 EASSP Project"
+#RESOURCE VERSION$ "OriginalFilename", "eassp_server.exe"
+#RESOURCE VERSION$ "ProductName",      "EASSP Server"
+#RESOURCE VERSION$ "ProductVersion",   "2.0 (firmware v2.0)"
 
 ' ---- Win32 API includes ----
 $INCLUDE "WIN32API.INC"

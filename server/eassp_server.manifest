@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  EASSP Server — Application Manifest
+  ===================================
+  Embedded into eassp_server.exe via:
+      #RESOURCE MANIFEST, 1, "eassp_server.manifest"
+
+  Purpose:
+    1. Common Controls v6 dependency — enables Windows XP+ visual styles
+       (themed buttons, listviews, scrollbars) instead of the Windows 95
+       classic look. Without this, the GUI looks dated regardless of the
+       user's Windows theme.
+    2. Windows 7/8/8.1/10/11 compatibility GUIDs — tells Windows the app
+       was tested on modern OSes, disabling legacy compatibility shims
+       (e.g. file virtualization, USER32 redirection).
+    3. DPI awareness = false — the app uses fixed-pixel DDT layout
+       (DIALOG NEW PIXELS 750,480). Declaring DPI-unaware lets Windows
+       DPI-virtualize (bitmap-scale) the window on high-DPI displays so
+       it stays the right physical size and readable. A DPI-aware
+       declaration would render at physical pixels = tiny/unreadable on
+       a 4K @ 200% display, since the DDT code doesn't scale controls.
+    4. UTF-8 active code page (Windows 10 1903+) — not enabled; the
+       PowerBASIC runtime uses ANSI strings throughout, so forcing UTF-8
+       would corrupt non-ASCII path handling.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity
+    type="win32"
+    name="EASSP.Server"
+    version="1.0.0.0"
+    processorArchitecture="*"/>
+  <description>EASSP Server — ESP8266 WiFi Microphone Receiver</description>
+
+  <!-- Common Controls v6: visual styles (themed controls) -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"/>
+    </dependentAssembly>
+  </dependency>
+
+  <!-- Windows compatibility: declare tested OSes -->
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 / 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+      <!-- Windows 8.1 -->
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
+      <!-- Windows 8 -->
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/>
+      <!-- Windows 7 -->
+      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/>
+    </application>
+  </compatibility>
+
+  <!--
+    DPI awareness: false (Windows DPI-virtualizes the app).
+    Rationale: DIALOG NEW PIXELS uses fixed 750x480 layout; the DDT code
+    does not scale controls for DPI. Letting Windows virtualize keeps the
+    window at a correct, readable physical size on high-DPI displays
+    (slightly blurry but functional). Declaring dpiAware=true would render
+    at physical pixels → tiny/unreadable on 4K @ 150%+.
+  -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">false</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">unaware</dpiAwareness>
+    </windowsSettings>
+  </application>
+</assembly>
