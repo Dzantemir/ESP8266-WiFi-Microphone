@@ -114,7 +114,7 @@ Switchable at runtime via `AT+XPORT=0|1|2` + `AT+HOTRESTART`
 
 ## 📸 Social Preview
 
-![ESP8266 WiFi Microphone](social_preview.png)
+![ESP8266 WiFi Microphone](social_preview.jpg)
 
 ## 🖥️ EASSP Server (Windows Receiver)
 
