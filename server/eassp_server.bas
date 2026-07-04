@@ -2488,12 +2488,12 @@ SUB RefreshUI()
         ' Col 6 - Codec (with transport suffix: ADPCM/UDP, PCM/TCP, etc.)
         SELECT CASE g_Devs(i).dwCodec
             CASE %CODEC_ID:     szText = "ADPCM"
-            CASE %CODEC_ID_PCM: szText = "PCM 16"
+            CASE %CODEC_ID_PCM: szText = "PCM"
             CASE ELSE:          szText = TRIM$(STR$(g_Devs(i).dwCodec))
         END SELECT
         SELECT CASE g_Devs(i).dwTransport
             CASE 1: szText = szText & "/TCP"
-            CASE 2: szText = szText & "/Raw"
+            CASE 0: szText = szText & "/UDP"
         END SELECT
         lvi.iSubItem = %LV_COL_CODEC
         lvi.pszText  = VARPTR(szText)
