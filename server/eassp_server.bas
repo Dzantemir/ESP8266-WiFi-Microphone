@@ -781,12 +781,7 @@ THREAD FUNCTION HeartbeatThread(BYVAL param AS DWORD) AS DWORD
     LOCAL idx AS LONG
     LOCAL tick AS DWORD
     LOCAL elapsed AS DWORD
-    LOCAL hbIP AS DWORD
-    LOCAL hbPort AS DWORD
-    LOCAL hbAudioPort AS DWORD
     LOCAL hbPktRecv AS DWORD
-    LOCAL hbNeedResend AS LONG
-    LOCAL hbResendIdx AS LONG
     LOCAL hbIter AS LONG          ' DIAG: iteration counter
     LOCAL hbSentThisIter AS LONG  ' DIAG: how many DISCOVER sent this iteration
 
@@ -807,33 +802,69 @@ THREAD FUNCTION HeartbeatThread(BYVAL param AS DWORD) AS DWORD
         DIM hbCount AS LOCAL LONG
         hbCount = 0
 
+        ' FIX (WiFi-drop recovery): collect ALL devices needing a CONFIGURE
+        ' resend, not just one. Two stall cases:
+        '   (a) dwPktRecv = 0  → initial CONFIGURE was lost (startup), 3s
+        '   (b) dwPktRecv > 0  → stream was running then packets stopped
+        '       (WiFi AP dropped; ESP watchdog-timed-out to IDLE after 15s;
+        '        ESP only resumes on a new CONFIGURE). %STREAM_STALL_MS.
+        ' The old code only handled (a) and only one device per iteration,
+        ' so a mid-flight WiFi drop left the server stuck in "Streaming"
+        ' forever while the ESP sat IDLE waiting for CONFIGURE.
+        DIM rsIPs(0 TO %MAX_DEVICES - 1) AS LOCAL DWORD
+        DIM rsPorts(0 TO %MAX_DEVICES - 1) AS LOCAL DWORD
+        DIM rsAudioPorts(0 TO %MAX_DEVICES - 1) AS LOCAL DWORD
+        DIM rsIdxs(0 TO %MAX_DEVICES - 1) AS LOCAL LONG
+        DIM rsReasons(0 TO %MAX_DEVICES - 1) AS LOCAL STRING
+        DIM rsCount AS LOCAL LONG
+        rsCount = 0
+
         EnterCriticalSection g_csDev
         tick = CLNG(TIMER * 1000)
-        hbNeedResend = 0
-        hbResendIdx = -1
 
         FOR idx = 0 TO %MAX_DEVICES - 1
             IF g_Devs(idx).dwActive = 0 THEN ITERATE FOR
 
             IF g_Devs(idx).dwHBActive THEN
-                ' Collect target for sending OUTSIDE CS
+                ' Collect target for DISCOVER heartbeat OUTSIDE CS
                 hbTargets(hbCount) = g_Devs(idx).dwIP
                 hbPorts(hbCount)   = g_Devs(idx).dwPort
                 INCR hbCount
 
-                ' AUTO-RESEND CONFIGURE: if we think we're streaming but ESP hasn't
-                ' sent any audio packets in 3 seconds, the initial CONFIGURE was
-                ' probably lost in WiFi. Resend it. ESP handles duplicate CONFIGURE
-                ' safely (same dest = resets watchdog, different dest = stop+restart).
+                ' ---- Stall detection: decide if this device needs a CONFIGURE resend ----
                 hbPktRecv = g_Devs(idx).dwPktRecv
                 IF hbPktRecv = 0 THEN
+                    ' Case (a): never received any audio since stream start.
+                    ' Initial CONFIGURE was probably lost in WiFi.
                     elapsed = tick - g_Devs(idx).dwStreamStart
                     IF elapsed > 3000 THEN
-                        hbNeedResend = 1
-                        hbResendIdx  = idx
-                        hbIP        = g_Devs(idx).dwIP
-                        hbPort      = g_Devs(idx).dwPort
-                        hbAudioPort = g_Devs(idx).dwAudioPort
+                        rsIPs(rsCount)        = g_Devs(idx).dwIP
+                        rsPorts(rsCount)      = g_Devs(idx).dwPort
+                        rsAudioPorts(rsCount) = g_Devs(idx).dwAudioPort
+                        rsIdxs(rsCount)       = idx
+                        rsReasons(rsCount)    = "no audio " & TRIM$(STR$(elapsed)) & _
+                                                "ms after start (initial CONFIGURE lost?)"
+                        INCR rsCount
+                    END IF
+                ELSE
+                    ' Case (b): stream was running, then packets stopped.
+                    ' dwLastPktTick is updated on every received audio packet
+                    ' (AudioThread stats block). If it hasn't moved for
+                    ' %STREAM_STALL_MS, the ESP is either unreachable (WiFi
+                    ' still down) or has watchdog-timed-out to IDLE. Resend
+                    ' CONFIGURE so that whenever the ESP comes back online it
+                    ' resumes streaming. Harmless if ESP is still STREAMING
+                    ' (same-dest CONFIGURE just resets its watchdog).
+                    elapsed = tick - g_Devs(idx).dwLastPktTick
+                    IF elapsed > %STREAM_STALL_MS THEN
+                        rsIPs(rsCount)        = g_Devs(idx).dwIP
+                        rsPorts(rsCount)      = g_Devs(idx).dwPort
+                        rsAudioPorts(rsCount) = g_Devs(idx).dwAudioPort
+                        rsIdxs(rsCount)       = idx
+                        rsReasons(rsCount)    = "stream stalled - no audio for " & _
+                                                TRIM$(STR$(elapsed)) & _
+                                                "ms (WiFi drop? resending CONFIGURE)"
+                        INCR rsCount
                     END IF
                 END IF
             ELSE
@@ -860,12 +891,11 @@ THREAD FUNCTION HeartbeatThread(BYVAL param AS DWORD) AS DWORD
             AddLog "[HB] iter=" & TRIM$(STR$(hbIter)) & " idle (no HBActive devices)"
         END IF
 
-        ' Resend CONFIGURE outside CS (UDP SEND can block)
-        IF hbNeedResend AND hbResendIdx >= 0 THEN
-            AddLog "No audio from device #" & TRIM$(STR$(hbResendIdx)) & _
-                   " after 3s - resending CONFIGURE"
-            SendConfigure hbIP, hbPort, hbAudioPort
-        END IF
+        ' Resend CONFIGURE to ALL stalled devices OUTSIDE CS (UDP SEND can block)
+        FOR idx = 0 TO rsCount - 1
+            AddLog "[HB] dev #" & TRIM$(STR$(rsIdxs(idx))) & ": " & rsReasons(idx)
+            SendConfigure rsIPs(idx), rsPorts(idx), rsAudioPorts(idx)
+        NEXT idx
     LOOP
 
     FUNCTION = 0
@@ -1108,7 +1138,7 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
         LOOP
         DO
             ERRCLEAR
-            TCP OPEN PORT bindPort AT tcpHost AS #fNum TIMEOUT 5000
+            TCP OPEN PORT bindPort AT tcpHost AS #fNum TIMEOUT 2000
             IF ERR = 0 THEN EXIT DO
             INCR connectAttempts
             IF connectAttempts = 1 OR (connectAttempts MOD 10) = 0 THEN
@@ -1130,7 +1160,15 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
                " (file #" & TRIM$(STR$(fNum)) & ")"
     ELSE
         ' UDP mode (default): open listening UDP socket on bindPort.
-        UDP OPEN PORT bindPort AS #fNum TIMEOUT 60000
+        ' FIX (UDP stop crash): short RECV timeout (500ms) so AudioThread polls
+        ' dwRunning frequently. With the old 60s timeout the thread could be
+        ' blocked deep inside UDP RECV when the main thread signalled stop;
+        ' closing #fNum from the main thread while RECV is in progress races
+        ' on PowerBASIC's process-global file-number table (CLOSE frees the
+        ' slot while RECV still references it -> use-after-free -> crash).
+        ' Now the thread notices dwRunning=0 within 500ms and closes its OWN
+        ' socket in the cleanup section.
+        UDP OPEN PORT bindPort AS #fNum TIMEOUT 500
         IF ERR THEN
             AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
                    ": UDP OPEN PORT " & TRIM$(STR$(bindPort)) & " FAILED err=" & TRIM$(STR$(ERR))
@@ -1296,6 +1334,7 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
     g_Devs(idx).dwBytesRecv   = 0
     g_Devs(idx).wLastSeq      = 0
     g_Devs(idx).dwStreamStart = CLNG(TIMER * 1000)
+    g_Devs(idx).dwLastPktTick = g_Devs(idx).dwStreamStart   ' stall-detection baseline
     LeaveCriticalSection g_csDev
 
     predictor  = 0
@@ -1305,6 +1344,30 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
     lastSeq = 0
     pktRecv = 0
     wIdx = 0
+
+    ' ---- Jitter Buffer / PLC / Adaptive state ----
+    LOCAL jitterTarget AS LONG     ' Current prebuffer target (adaptive)
+    LOCAL jitterFilled AS LONG     ' Frames accumulated in prebuffer phase
+    LOCAL jitterPrebuffering AS LONG  ' 1 = still prebuffering, 0 = playing
+    LOCAL underrunCount AS LONG    ' Underruns in current adaptation interval
+    LOCAL lastAdaptTick AS DWORD   ' Last adaptive adjustment time
+    LOCAL lastPcmPtr AS DWORD      ' Pointer to last decoded PCM (for PLC)
+    LOCAL lastPcmLen AS LONG       ' Length of last decoded PCM (for PLC)
+    LOCAL lastPcmLastSample AS LONG  ' Last sample value from previous frame (for interpolation)
+    LOCAL plcActive AS LONG        ' 1 = PLC interpolation in progress
+
+    jitterTarget = %JITTER_INITIAL
+    jitterFilled = 0
+    jitterPrebuffering = 1
+    underrunCount = 0
+    lastAdaptTick = CLNG(TIMER * 1000)
+    lastPcmPtr = 0
+    lastPcmLen = 0
+    lastPcmLastSample = 0
+    plcActive = 0
+
+    AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+           ": jitter buffer: prebuffer=" & TRIM$(STR$(jitterTarget)) & " frames"
 
     ' ---- Main audio loop ----
     ' TCP framing: [u16 length BE][16-byte pkt_header][payload].
@@ -1358,7 +1421,7 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
                 reconOk = 0
                 DO WHILE g_Devs(idx).dwRunning
                     ERRCLEAR
-                    TCP OPEN PORT bindPort AT tcpHost AS #fNum TIMEOUT 5000
+                    TCP OPEN PORT bindPort AT tcpHost AS #fNum TIMEOUT 2000
                     IF ERR = 0 THEN reconOk = 1 : EXIT DO
                     SLEEP 1000
                 LOOP
@@ -1378,7 +1441,7 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
                 SLEEP 500
                 DO WHILE g_Devs(idx).dwRunning
                     ERRCLEAR
-                    TCP OPEN PORT bindPort AT tcpHost AS #fNum TIMEOUT 5000
+                    TCP OPEN PORT bindPort AT tcpHost AS #fNum TIMEOUT 2000
                     IF ERR = 0 THEN EXIT DO
                     SLEEP 1000
                 LOOP
@@ -1405,7 +1468,7 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
                 ERRCLEAR
                 DO WHILE g_Devs(idx).dwRunning
                     ERRCLEAR
-                    TCP OPEN PORT bindPort AT tcpHost AS #fNum TIMEOUT 5000
+                    TCP OPEN PORT bindPort AT tcpHost AS #fNum TIMEOUT 2000
                     IF ERR = 0 THEN EXIT DO
                     SLEEP 1000
                 LOOP
@@ -1579,27 +1642,46 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
             GOTO reopen_waveout
         END IF
 
-        ' ---- Buffer availability check (CRITICAL FIX) ----
-        ' Check if the target playback buffer is still being played by WaveOut
-        ' BEFORE decoding into it. Previously the decode wrote to pcmPtrs(wIdx)
-        ' unconditionally, and the INQUEUE check only guarded waveOutWrite.
-        ' When the buffer was still in queue, the decode CORRUPTED the audio
-        ' that WaveOut was reading concurrently → race condition → crackling.
-        '
-        ' The WAV dump was clean because it reads decoded data AFTER the write
-        ' completes (consistent snapshot). But WaveOut reads the buffer DURING
-        ' the decode write, getting a mix of old and new samples → pops/clicks.
-        '
-        ' Fix: if the buffer is still in queue, skip the decode entirely.
-        ' Set pcmLen = 0 so dump and waveOutWrite are also skipped. Do NOT
-        ' advance wIdx (see comment at waveOutWrite below) — we retry the
-        ' same buffer on the next packet, by which time WaveOut may have
-        ' finished playing it. This drops at most 1-2 packets instead of
-        ' cycling through all 16 buffers and dropping 320ms of audio.
+        ' ---- Buffer availability check ----
         IF waveOut <> 0 AND (whdrs(wIdx).dwFlags AND %WHDR_INQUEUE) <> 0 THEN
             pcmLen = 0
             GOTO pcm_ready
         END IF
+
+        ' ---- PLC (Packet Loss Concealment) with linear interpolation ----
+        ' When packets are lost (lostPkt > 0), generate a synthetic frame
+        ' by interpolating between the last sample of the previous frame
+        ' and repeating the previous frame's content with a fade.
+        IF lostPkt > 0 AND lastPcmPtr <> 0 AND lastPcmLen > 0 THEN
+            ' Copy previous frame into current buffer
+            POKE$ pcmPtrs(wIdx), PEEK$(lastPcmPtr, lastPcmLen)
+            pcmLen = lastPcmLen
+
+            ' Linear interpolation: ramp from lastPcmLastSample to the
+            ' first sample of the copied frame over the first N samples.
+            ' This smooths the discontinuity at the splice point.
+            IF outBits = 16 AND nCh = 1 THEN
+                LOCAL pPcm16 AS INTEGER PTR
+                LOCAL rampLen AS LONG
+                LOCAL rampI AS LONG
+                LOCAL firstSample AS LONG
+                LOCAL rampStep AS DOUBLE
+                pPcm16 = pcmPtrs(wIdx)
+                rampLen = lastPcmLen \ 4  ' 25% of frame
+                IF rampLen > 64 THEN rampLen = 64  ' cap at 64 samples
+                IF rampLen > 0 THEN
+                    firstSample = @pPcm16[0]
+                    rampStep = (firstSample - lastPcmLastSample) / rampLen
+                    FOR rampI = 0 TO rampLen - 1
+                        @pPcm16[rampI] = CINT(lastPcmLastSample + rampStep * rampI)
+                    NEXT rampI
+                END IF
+            END IF
+
+            plcActive = 1
+            GOTO pcm_ready  ' Skip normal decode, use PLC frame
+        END IF
+        plcActive = 0
 
         ' ---- Raw PCM passthrough (codec == 6) ----
         ' ESP sends raw PCM without compression.
@@ -1791,6 +1873,7 @@ pcm_ready:
         g_Devs(idx).dwPktRecv   = pktRecv
         g_Devs(idx).wLastSeq    = lastSeq
         g_Devs(idx).dwBytesRecv = g_Devs(idx).dwBytesRecv + pcmLen
+        g_Devs(idx).dwLastPktTick = CLNG(TIMER * 1000)   ' stall detection: alive
         IF oooPkt  THEN g_Devs(idx).dwPktOOO  = g_Devs(idx).dwPktOOO  + oooPkt
         IF lostPkt THEN g_Devs(idx).dwPktLost = g_Devs(idx).dwPktLost + lostPkt
         LeaveCriticalSection g_csDev
@@ -1815,16 +1898,80 @@ pcm_ready:
             LeaveCriticalSection g_csDump
         END IF
 
+        ' ---- Save last decoded PCM for PLC (Packet Loss Concealment) ----
+        IF pcmLen > 0 AND plcActive = 0 THEN
+            lastPcmPtr = pcmPtrs(wIdx)
+            lastPcmLen = pcmLen
+            ' Save last sample value (for interpolation on next packet loss)
+            IF outBits = 16 AND pcmLen >= 2 THEN
+                LOCAL pLast AS INTEGER PTR
+                pLast = pcmPtrs(wIdx)
+                lastPcmLastSample = @pLast[(pcmLen \ 2) - 1]
+            END IF
+        END IF
+
+        ' ---- Jitter Buffer: prebuffer before starting playback ----
+        IF jitterPrebuffering AND pcmLen > 0 THEN
+            INCR jitterFilled
+            ' During prebuffer, still submit to WaveOut (buffers queue up)
+            IF waveOut <> 0 AND (whdrs(wIdx).dwFlags AND %WHDR_INQUEUE) = 0 THEN
+                whdrs(wIdx).dwBufferLength = pcmLen
+                whdrs(wIdx).dwBytesRecorded = pcmLen
+                waveOutWrite waveOut, whdrs(wIdx), SIZEOF(WAVEHDR)
+                wIdx = (wIdx + 1) MOD %NUM_WAVE_BUFS
+            END IF
+            IF jitterFilled >= jitterTarget THEN
+                jitterPrebuffering = 0
+                AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+                       ": jitter buffer filled (" & TRIM$(STR$(jitterFilled)) & _
+                       " frames) - playback started"
+            END IF
+            ITERATE DO
+        END IF
+
+        ' ---- Adaptive buffer adjustment ----
+        ' Every JITTER_ADAPT_MS, adjust jitterTarget based on underruns.
+        IF (CLNG(TIMER * 1000) - lastAdaptTick) >= %JITTER_ADAPT_MS THEN
+            IF underrunCount = 0 AND jitterTarget > %JITTER_MIN THEN
+                DECR jitterTarget
+                AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+                       ": adaptive buffer: 0 underruns → decrease to " & _
+                       TRIM$(STR$(jitterTarget))
+            ELSEIF underrunCount >= %JITTER_UNDERRUN_THRESHOLD AND _
+                   jitterTarget < %JITTER_MAX THEN
+                INCR jitterTarget
+                AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+                       ": adaptive buffer: " & TRIM$(STR$(underrunCount)) & _
+                       " underruns → increase to " & TRIM$(STR$(jitterTarget))
+            END IF
+            underrunCount = 0
+            lastAdaptTick = CLNG(TIMER * 1000)
+        END IF
+
+        ' ---- Underrun detection ----
+        ' If all buffers are in queue (INQUEUE), we have an underrun.
+        IF waveOut <> 0 AND pcmLen > 0 THEN
+            LOCAL allInQueue AS LONG
+            allInQueue = 1
+            FOR wIdx2 = 0 TO %NUM_WAVE_BUFS - 1
+                IF (whdrs(wIdx2).dwFlags AND %WHDR_INQUEUE) = 0 THEN
+                    allInQueue = 0
+                    EXIT FOR
+                END IF
+            NEXT wIdx2
+            IF allInQueue THEN
+                INCR underrunCount
+                ' On underrun: restart prebuffering to rebuild buffer
+                IF jitterPrebuffering = 0 THEN
+                    jitterPrebuffering = 1
+                    jitterFilled = 0
+                    AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+                           ": underrun detected - re-prebuffering"
+                END IF
+            END IF
+        END IF
+
         ' ---- Submit to WaveOut ----
-        ' FIX M1+M2: Guard against waveOut=NULL (failed reopen).
-        ' FIX (race condition): Guard with pcmLen > 0 — when the pre-decode
-        ' INQUEUE check skipped the decode, pcmLen is 0 and we must NOT
-        ' submit (would replay stale data from a previous frame).
-        ' Only advance wIdx when we actually submitted a buffer. If we
-        ' skipped (pcmLen = 0 or buffer still in queue), we retry the SAME
-        ' buffer on the next packet — this naturally throttles the decode
-        ' loop to match WaveOut's playback rate, dropping the minimum
-        ' number of packets (1-2) instead of cycling through all 16.
         IF waveOut <> 0 AND pcmLen > 0 AND (whdrs(wIdx).dwFlags AND %WHDR_INQUEUE) = 0 THEN
             whdrs(wIdx).dwBufferLength = pcmLen
             whdrs(wIdx).dwBytesRecorded = pcmLen
@@ -1851,6 +1998,15 @@ reopen_waveout:
         predictor2 = 0
         stepIndex2 = 0
         lastSeq = 0
+
+        ' Reset jitter buffer state for new format
+        jitterPrebuffering = 1
+        jitterFilled = 0
+        underrunCount = 0
+        lastAdaptTick = CLNG(TIMER * 1000)
+        lastPcmPtr = 0
+        lastPcmLen = 0
+        plcActive = 0
 
         ' Set up WAVEFORMATEX - bits per sample depends on CODEC:
         '   ADPCM (codec=5): ALWAYS 16-bit (ESP dithers 24->16 before encoding)
@@ -2120,11 +2276,16 @@ SUB StopCheckedStreams()
         ' (instead of waiting for watchdog timeout)
         SendStop stopIP, stopPort
 
-        ' Close UDP socket outside CS to avoid deadlock with AudioThread
-        IF fNum THEN
-            ERRCLEAR
-            UDP CLOSE #fNum
-        END IF
+        ' FIX (UDP stop crash): Do NOT close the audio socket here. The
+        ' AudioThread OWNS this socket and may be blocked inside UDP RECV on
+        ' it right now. Calling UDP CLOSE #fNum from this (GUI) thread while
+        ' RECV is in progress races on PowerBASIC's process-global file-number
+        ' table (CLOSE frees the slot while RECV still references it ->
+        ' use-after-free -> instant crash). The AudioThread polls dwRunning
+        ' every <=500ms (UDP RECV timeout), sees 0, and closes its OWN socket
+        ' in its cleanup section. Phase 2 below then just waits for the thread.
+        ' (fNum is captured only for diagnostics / bookkeeping; fAudioFile is
+        '  cleared above so a restart won't see a stale handle.)
 
         INCR stopped
         AddLog "Stream stopping: " & sMac
@@ -2190,14 +2351,14 @@ SUB StopAllStreams()
         END IF
     NEXT idx
 
-    ' Close audio UDP sockets OUTSIDE CS to avoid deadlock
-    ' (AudioThread might be trying to enter CS when we close its socket)
-    FOR idx = 0 TO %MAX_DEVICES - 1
-        IF fNums(idx) THEN
-            ERRCLEAR
-            UDP CLOSE #fNums(idx)
-        END IF
-    NEXT idx
+    ' FIX (UDP stop crash): Do NOT close audio sockets here. Each AudioThread
+    ' OWNS its socket and closes it in its own cleanup section. Closing from
+    ' this thread while an AudioThread is blocked in UDP RECV races on PB's
+    ' process-global file-number table (close frees the slot while RECV still
+    ' references it -> use-after-free -> instant crash, seen in UDP mode).
+    ' Threads see dwRunning=0 within their RECV timeout (<=500ms UDP, <=2s TCP)
+    ' and exit cleanly. WaitForAllThreads() (called after this on shutdown)
+    ' waits for them. (fNums() captured above only to clear fAudioFile slots.)
 END SUB
 
 ' WaitForAllThreads - Wait for all worker threads to finish (max 3s each)
@@ -2643,6 +2804,11 @@ CALLBACK FUNCTION MainDlgProc()
             SetTimer CB.HNDL, %IDT_REFRESH, %REFRESH_MS, %NULL
             ' Initial layout
             ResizeControls
+            ' Populate StatusBar immediately so it isn't blank for the first
+            ' %REFRESH_MS (2s) until the timer's first tick. Safe: the bar and
+            ' its 5 parts are created in WinMain before DIALOG SHOW MODAL, and
+            ' RefreshUI has an hLV=0 guard.
+            RefreshUI
             ' Initial button states (all disabled)
             UpdateButtonStates
 
@@ -3111,7 +3277,7 @@ FUNCTION PBMAIN() AS LONG
     InitializeCriticalSection g_csDump   ' FIX C6: dump file race protection
 
     ' Build INI file path: same folder as .exe, filename "eassp_server.ini"
-    ' EXE.PATHN$ returns the .exe directory WITH trailing backslash (PowerBASIC built-in).
+    ' EXE.PATH$ returns the .exe directory WITH trailing backslash (PowerBASIC built-in).
     g_sIniFile = EXE.PATH$ & "eassp_server.ini"
 
     ' Init IMA ADPCM Step Table

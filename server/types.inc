@@ -31,6 +31,7 @@ TYPE DeviceInfo
     wLastSeq     AS WORD
     dwBytesRecv  AS DWORD
     dwStreamStart AS DWORD
+    dwLastPktTick AS DWORD    ' ms tick of last received audio packet (stall detection)
     hWaveOut     AS DWORD
     hAudioThread AS DWORD
     fAudioFile   AS LONG       ' file number for UDP OPEN audio

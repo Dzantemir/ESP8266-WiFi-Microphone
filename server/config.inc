@@ -32,6 +32,17 @@
 %RECV_BUF_SZ      = 2048
 %AUDIO_PORT_BASE  = 5000
 
+' ---- Stream stall / WiFi-drop recovery ----
+' If a streaming device sends no audio packets for this long, HeartbeatThread
+' resends CONFIGURE to restart the ESP's stream. Must be > a few heartbeat
+' intervals (to avoid false positives during brief congestion) and is
+' independent of the ESP's own SVC_WATCHDOG_TIMEOUT_MS (15s): if the ESP
+' watchdog fires first, the ESP goes IDLE and only a CONFIGURE can resume it;
+' if WiFi comes back before the ESP watchdog, the ESP auto-resumes and the
+' stall clears on its own. Resending CONFIGURE is harmless in both cases
+' (same-dest CONFIGURE just resets the ESP watchdog; the ESP dedupes).
+%STREAM_STALL_MS  = 10000
+
 ' ---- Control IDs ----
 %IDC_LISTVIEW     = 101
 %IDC_LOG          = 106
@@ -73,6 +84,13 @@
 %WAVE_FORMAT_PCM  = 1
 %CALLBACK_NULL    = 0
 %WHDR_INQUEUE     = &H10
+
+' ---- Jitter Buffer / PLC / Adaptive ----
+%JITTER_INITIAL   = 3     ' Frames to prebuffer before starting WaveOut playback
+%JITTER_MIN       = 2     ' Minimum prebuffer (adaptive, frames)
+%JITTER_MAX       = 7     ' Maximum prebuffer (adaptive, frames)
+%JITTER_ADAPT_MS  = 10000 ' Adaptive adjustment interval (ms)
+%JITTER_UNDERRUN_THRESHOLD = 2  ' Underruns in interval to trigger increase
 
 ' ---- String Constants ----
 $APP_TITLE        = "EASSP Server - ESP8266 WiFi Microphone"
