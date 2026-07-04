@@ -22,6 +22,13 @@
 #DIM ALL
 #OPTION VERSION5
 
+' ---- Application icon (embedded resource) ----
+' "HexaWave" — regular hexagon + microphone + WiFi arcs + amber LED.
+' Resource ID 100 = main EXE icon (shown by Explorer, taskbar, alt-tab).
+' Assigned to the dialog at runtime via DIALOG SET ICON "#100" in
+' WM_INITDIALOG (the DDT idiom — sets both caption + Alt+Tab icons).
+#RESOURCE ICON, 100, "eassp_server.ico"
+
 ' ---- Win32 API includes ----
 $INCLUDE "WIN32API.INC"
 
@@ -2800,6 +2807,14 @@ CALLBACK FUNCTION MainDlgProc()
     SELECT CASE CB.MSG
 
         CASE %WM_INITDIALOG
+            ' Set the dialog icon (caption bar + Alt+Tab task list) from the
+            ' embedded #RESOURCE ICON, 100. Per PowerBASIC docs, DIALOG SET
+            ' ICON takes the resource ID as "#<id>" (integral) or the text
+            ' name, and assigns BOTH the small (caption) and large (Alt+Tab)
+            ' icons in one call. No LoadImage/WM_SETICON needed — that is the
+            ' raw SDK way; this is the DDT way.
+            DIALOG SET ICON CB.HNDL, "#100"
+
             ' Set timer for UI refresh
             SetTimer CB.HNDL, %IDT_REFRESH, %REFRESH_MS, %NULL
             ' Initial layout
