@@ -116,6 +116,10 @@ Switchable at runtime via `AT+XPORT=0|1|2` + `AT+HOTRESTART`
 
 ![ESP8266 WiFi Microphone](social_preview.png)
 
+## 🖥️ EASSP Server (Windows Receiver)
+
+![EASSP Server Screenshot](server.jpg)
+
 ---
 
 ## 🏗️ Architecture
@@ -553,6 +557,7 @@ esp8266-wifi-microphone/
 ├── README.md                      # You are here
 ├── LICENSE                        # MIT
 ├── social_preview.png             # GitHub social preview image
+├── server.jpg                     # EASSP Server screenshot
 ├── SOLUTION.md                    # Audio fix documentation (DMA alignment, drift)
 │
 ├── firmware/                      # ESP8266 firmware (ESP8266 RTOS SDK v3.4)
