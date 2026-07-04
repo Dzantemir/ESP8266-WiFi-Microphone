@@ -420,7 +420,11 @@ static void build_info_payload(svc_info_payload_t *info)
     info->channels = s_channels;
     xSemaphoreGive(s_mutex);
 
-    if (info->error != SVC_ERR_NONE)
+    /* Only override status to ERROR when streaming.
+     * When IDLE (after stop), leftover error codes from the stop process
+     * (e.g. send() fail on closed socket) should NOT be shown as ERROR —
+     * the device is simply idle. */
+    if (info->error != SVC_ERR_NONE && s_state == SVC_STREAMING)
     {
         info->status = SVC_STATUS_ERROR;
     }

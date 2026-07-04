@@ -570,7 +570,13 @@ static void stream_task_fn(void *arg)
         {
             ESP_LOGW(TAG, "[%s] send fail (drops: %" PRIu32 ")",
                      ops->name, dropped);
-            svc_port_set_error(SVC_ERR_NETWORK);
+            /* Only report network error if stream is still active.
+             * During stop, transport_close_client() closes the socket →
+             * send() fails with errno=128 (ENOTCONN) — this is expected,
+             * not a real error. Reporting it causes STATUS_ERROR in INFO
+             * packets, showing "Error" in the receiver UI after stop. */
+            if (streaming_is_active())
+                svc_port_set_error(SVC_ERR_NETWORK);
         }
 
         svc_port_update_stats(sent);
@@ -1259,3 +1265,4 @@ void app_main(void)
         }
     }
 }
+ 
