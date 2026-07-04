@@ -11,7 +11,13 @@
 
 **24-bit I2S capture • TPDF dithering • IMA ADPCM / PCM • UDP / TCP / Raw 802.11 TX • Real-time playback • WAV recording**
 
-*Developed in collaboration with AI (Z.ai Code)*
+> Real-time high-quality wireless microphone using ESP8266 and INMP441 I2S MEMS
+> microphone. Streams audio to a Windows PC over WiFi with professional-grade
+> 24-bit capture, TPDF dithering, and IMA ADPCM/PCM encoding. Supports UDP
+> (via router), TCP (reliable delivery with framing), and Raw 802.11 TX
+> (no router needed) transport modes. The Windows receiver supports per-device
+> output routing to virtual microphones (VB-Cable) for use in Discord, Zoom,
+> OBS, and any other application. Developed in collaboration with AI (Z.ai Code).
 
 </div>
 
@@ -176,9 +182,37 @@ Switchable at runtime via `AT+XPORT=0|1|2` + `AT+HOTRESTART`
 
 | Component | Purpose | Price |
 |-----------|---------|-------|
-| ESP8266 (ESP-12F / NodeMCU / Wemos D1) | Microcontroller + WiFi | ~$1 |
-| INMP441 I2S MEMS microphone | Audio capture (24-bit) | ~$1 |
-| USB-to-UART adapter | Flashing + AT commands | ~$1 |
+| ESP8266 / ESP8285 (ESP-12F, ESP-12S, NodeMCU, Wemos D1, ESP-07S) | Microcontroller + WiFi | ~$2–4 |
+| INMP441 I2S MEMS microphone module | 24-bit audio capture | ~$1–2 |
+| USB-to-UART adapter (CP2102 / CH340) | Flashing + AT commands | ~$1–2 |
+
+> **ESP8285**: This project is fully compatible with the ESP8285 — it's an
+> ESP8266 with integrated 1 MB flash in a single chip. Any ESP8285-based module
+> (e.g., ESP-M1, ESP-M2, WROOM-02) works without modifications.
+
+### Alternative I2S MEMS Microphones
+
+The project is designed for the INMP441 but works with any I2S MEMS microphone
+that supports **Philips I2S** (MSB-first) or **LSB-justified** format. Configure
+via `AT+FMT=0` (Philips) or `AT+FMT=1` (LSB).
+
+| Microphone | Bits | Format | Notes |
+|------------|:----:|--------|-------|
+| **INMP441** | 24-bit | Philips I2S | Default, recommended. Best SNR (61 dB). |
+| **ICS-43434** | 24-bit | Philips I2S | Drop-in compatible, similar quality. |
+| **ICS-43432** | 24-bit | Philips I2S | Lower power variant of ICS-43434. |
+| **SPH0645LM4H-B** | 18-bit | LSB-justified | Use `AT+FMT=1` (LSB mode). 18-bit left-justified in 32-bit word. |
+| **MSM261S4030H0R** | 16-bit | Philips I2S | 16-bit output, use `AT+BITS=16`. |
+| **SPH0641LU4H-1** | 16-bit | LSB-justified | Use `AT+FMT=1` + `AT+BITS=16`. |
+
+> **Wiring is identical** for all listed microphones: SCK→GPIO13, WS→GPIO14,
+> SD→GPIO12, L/R→GND (left) or VDD (right). No hardware changes needed — only
+> `AT+FMT` and `AT+BITS` settings differ.
+>
+> **24-bit vs 16-bit**: The firmware supports both natively. In 24-bit mode,
+> TPDF dithering is applied before ADPCM encoding. In 16-bit mode, samples
+> pass through directly (no dithering needed). Use `AT+BITS=16` for 16-bit mics
+> to avoid unnecessary processing.
 
 ### Wiring Diagram
 
@@ -206,34 +240,28 @@ Switchable at runtime via `AT+XPORT=0|1|2` + `AT+HOTRESTART`
 
 ### 1. Build & Flash Firmware
 
-We recommend using [ESP8266-IDF](https://github.com/Dzantemir/ESP8266-IDF) Docker build environment:
+We recommend using [ESP8266-IDF](https://github.com/Dzantemir/ESP8266-IDF) — a
+VS Code extension that provides a complete development environment for ESP8266
+RTOS SDK, including toolchain, SDK, build system, and flash/monitor — all
+integrated into VS Code.
 
 ```bash
-# Clone build environment
-git clone https://github.com/Dzantemir/ESP8266-IDF.git
-cd ESP8266-IDF
-
 # Clone this project
-git clone https://github.com/yourname/esp8266-wifi-microphone.git projects/esp8266-wifi-microphone
+git clone https://github.com/yourname/esp8266-wifi-microphone.git
 
-# Build
-docker-compose run --rm esp8266 bash -c "
-  cd /projects/esp8266-wifi-microphone/firmware &&
-  export IDF_PATH=/opt/esp8266-rtos-sdk &&
-  cp i2s.c \$IDF_PATH/components/esp8266/driver/i2s.c &&
-  idf.py build
-"
+# Open in VS Code with ESP8266-IDF extension installed
+code esp8266-wifi-microphone/firmware
 
-# Flash
-docker-compose run --rm esp8266 --device /dev/ttyUSB0 bash -c "
-  cd /projects/esp8266-wifi-microphone/firmware &&
-  export IDF_PATH=/opt/esp8266-rtos-sdk &&
-  idf.py -p /dev/ttyUSB0 flash
-"
+# In VS Code:
+# 1. Copy patched I2S driver to SDK:
+#    cp i2s.c <IDF_PATH>/components/esp8266/driver/i2s.c
+# 2. Press F7 (Build) or use Command Palette → "ESP8266-IDF: Build"
+# 3. Press F8 (Flash) or use Command Palette → "ESP8266-IDF: Flash"
+# 4. Press F9 (Monitor) or use Command Palette → "ESP8266-IDF: Monitor"
 ```
 
 <details>
-<summary>📖 Manual build (without Docker)</summary>
+<summary>📖 Manual build (without VS Code extension)</summary>
 
 ```bash
 # Install ESP8266 RTOS SDK v3.4
