@@ -11,14 +11,6 @@
 
 **24-bit I2S capture • TPDF dithering • IMA ADPCM / PCM • UDP / TCP / Raw 802.11 TX • Real-time playback • WAV recording**
 
-> Real-time high-quality wireless microphone using ESP8266 and INMP441 I2S MEMS
-> microphone. Streams audio to a Windows PC over WiFi with professional-grade
-> 24-bit capture, TPDF dithering, and IMA ADPCM/PCM encoding. Supports UDP
-> (via router), TCP (reliable delivery with framing), and Raw 802.11 TX
-> (no router needed) transport modes. The Windows receiver supports per-device
-> output routing to virtual microphones (VB-Cable) for use in Discord, Zoom,
-> OBS, and any other application. Developed in collaboration with AI (Z.ai Code).
-
 </div>
 
 ---
