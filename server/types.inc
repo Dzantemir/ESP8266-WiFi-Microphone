@@ -37,6 +37,8 @@ TYPE DeviceInfo
     fAudioFile   AS LONG       ' file number for UDP OPEN audio
     dwRunning    AS DWORD
     dwActive     AS DWORD
+    bReopenWaveOut AS LONG     ' FIX (L39): 'b' prefix is misleading - this is a LONG flag, not BYTE. Kept the name for source compat; treat as 'fReopenWaveOut'. 1 = reopen WaveOut (device change / write error)
+    dwLastReopenTick AS DWORD  ' GetTickCount() of last WaveOut reopen (suppress duplicates)
 END TYPE
 
 ' ---- LV Column (custom, avoids pszText type issues) ----

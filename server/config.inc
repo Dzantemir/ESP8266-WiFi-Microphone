@@ -29,7 +29,7 @@
 %HB_INTERVAL      = 3000
 %DEV_TIMEOUT_MS   = 30000
 %REFRESH_MS       = 2000
-%RECV_BUF_SZ      = 2048
+%RECV_BUF_SZ      = 2048   ' NOTE (L35): declared but never referenced in eassp_server.bas - safe to remove
 %AUDIO_PORT_BASE  = 5000
 
 ' ---- Stream stall / WiFi-drop recovery ----
@@ -56,6 +56,8 @@
 
 ' ---- Timer / Menu ----
 %IDT_REFRESH      = 1
+%IDT_DEVCHANGE    = 2    ' Debounce timer for WM_DEVICECHANGE (wait for all audio devices to settle)
+%DEVCHANGE_DEBOUNCE_MS = 2000   ' 2s after last WM_DEVICECHANGE before reopening WaveOut
 %IDM_ABOUT        = &H1000   ' Must be multiple of 16 (WM_SYSCOMMAND uses low 4 bits)
 %IDM_ADD_DEVICE   = &H1010
 
@@ -86,11 +88,26 @@
 %WHDR_INQUEUE     = &H10
 
 ' ---- Jitter Buffer / PLC / Adaptive ----
-%JITTER_INITIAL   = 3     ' Frames to prebuffer before starting WaveOut playback
-%JITTER_MIN       = 2     ' Minimum prebuffer (adaptive, frames)
-%JITTER_MAX       = 7     ' Maximum prebuffer (adaptive, frames)
+%JITTER_INITIAL   = 5     ' Frames to prebuffer before starting WaveOut playback
+%JITTER_MIN       = 3     ' Minimum prebuffer (adaptive, frames)
+%JITTER_MAX       = 8     ' Maximum prebuffer (adaptive, frames)
 %JITTER_ADAPT_MS  = 10000 ' Adaptive adjustment interval (ms)
 %JITTER_UNDERRUN_THRESHOLD = 2  ' Underruns in interval to trigger increase
+
+' ---- Startup click suppression ----
+' Skip the first N ms of received audio after stream start. The INMP441 I2S
+' MEMS mic has a startup transient (DC offset settling + membrane ringing,
+' ~10-15ms) and I2S DMA buffers may contain stale data. Skipping 1 second
+' ensures the mic is fully stable before playback begins. The skip consumes
+' packets (keeping the socket drained) but discards them before decode/playback.
+%STARTUP_SKIP_MS  = 1000
+
+' After the skip completes, apply a linear fade-in over FADE_IN_MS to smooth
+' the transition from digital silence (WaveOut buffers) to the real signal.
+' This prevents any residual click from the silence→signal boundary (e.g.
+' if the mic still has a tiny DC step after 1 second). 1 second fade-in is
+' imperceptible to the ear but guarantees a click-free start.
+%FADE_IN_MS       = 1000
 
 ' ---- String Constants ----
 $APP_TITLE        = "EASSP Server - ESP8266 WiFi Microphone"
