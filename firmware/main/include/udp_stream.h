@@ -13,7 +13,9 @@
  * Each audio frame = one UDP datagram (boundaries preserved by UDP).
  */
 
-/* Open a UDP socket and set up the destination address. */
+/* Open a UDP socket and set up the destination address.
+ * FIX (L16): host_ip MUST be in NETWORK byte order (e.g. ip_addr_t.addr).
+ * Passing a host-order IP would silently send to the wrong address. */
 esp_err_t udp_stream_init(uint32_t host_ip, uint16_t host_port);
 
 /* Close the UDP socket. */

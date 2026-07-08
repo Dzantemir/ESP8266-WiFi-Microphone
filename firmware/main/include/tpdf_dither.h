@@ -13,7 +13,7 @@
  * the standard Wannamaker / Vanderkooy / Lipshitz (1991) recipe.
  *
  * TPDF = difference of two independent RPDFs uniform in [0, 255],
- * giving a triangular distribution over [-255, +255] - exactly 1 LSB p-p
+ * giving a triangular distribution over [-255, +255] - exactly 2 LSB p-p
  * at 16-bit, the mathematically optimal amplitude.
  *
  * == INPUT CONTRACT (verify with your I2S driver) ==

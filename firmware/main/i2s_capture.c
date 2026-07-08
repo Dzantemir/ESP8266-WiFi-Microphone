@@ -179,7 +179,15 @@ esp_err_t i2s_capture_init(uint32_t sample_rate, int bits, int comm_format,
         (channel_format != I2S_CAP_CHFMT_LEFT &&
          channel_format != I2S_CAP_CHFMT_RIGHT &&
          channel_format != I2S_CAP_CHFMT_STEREO) ||
-        samples_per_frame < 16 || frame_ms == 0)
+        /* FIX (L7): validate comm_format. Any value != I2S_CAP_CFMT_LSB
+         * previously silently selected Philips - now reject explicitly. */
+        (comm_format != I2S_CAP_CFMT_PHILIPS &&
+         comm_format != I2S_CAP_CFMT_LSB) ||
+        /* FIX (L4): enforce documented DMA minimum (samples_per_frame/4 >=
+         * 32 -> samples_per_frame >= 128). The previous < 16 was too
+         * lenient; main.c always passes a compute_frame_ms-derived value
+         * (>=128) so this is a defensive guard. */
+        samples_per_frame < 128 || frame_ms == 0)
         return ESP_ERR_INVALID_ARG;
     if (gain > 64)
         gain = 32;
@@ -223,19 +231,19 @@ esp_err_t i2s_capture_init(uint32_t sample_rate, int bits, int comm_format,
         }
 
         /* Override with preset-specific target/noise_gate if nonzero.
-         * Preset target_q8 is in Q8.8: convert to raw by >>8. */
-        if (p->target_q8 != 0)
+         * target_q16 is in Q16.16: raw_target = (full_scale * target_q16) >> 16.
+         * This works for both 16-bit (full_scale=32768) and 24-bit (8388608)
+         * because the preset stores a fraction of full scale, not an absolute
+         * raw value. */
+        if (p->target_q16 != 0)
         {
-            /* target_q8 is relative to full scale.
-             * For 24-bit: full = 8388608, target_raw = full * target_q8 / (256*256)
-             * Simplified: target_raw = (8388608 * target_q8) >> 16 */
             int32_t full_scale = (s_bits == 24) ? 8388608 : 32768;
-            s_agc_target = (int32_t)(((int64_t)full_scale * p->target_q8) >> 16);
+            s_agc_target = (int32_t)(((int64_t)full_scale * p->target_q16) >> 16);
         }
-        if (p->noise_gate_q8 != 0)
+        if (p->noise_gate_q16 != 0)
         {
             int32_t full_scale = (s_bits == 24) ? 8388608 : 32768;
-            s_agc_noise_gate = (int32_t)(((int64_t)full_scale * p->noise_gate_q8) >> 16);
+            s_agc_noise_gate = (int32_t)(((int64_t)full_scale * p->noise_gate_q16) >> 16);
         }
     }
 
@@ -278,6 +286,16 @@ esp_err_t i2s_capture_init(uint32_t sample_rate, int bits, int comm_format,
            (uint32_t)dma_buf_count * (uint32_t)dma_buf_len * 4U > 8192U)
     {
         dma_buf_count--;
+    }
+    /* FIX (M4): if dma_buf_len is large (samples_per_frame > 1024), the
+     * count floor of 4 may still exceed the 8 KB cap. Also reduce
+     * dma_buf_len in that case so the total stays under 8 KB. Without
+     * this, a caller bypassing compute_frame_ms with a huge
+     * samples_per_frame would exceed the cap and exhaust heap. */
+    while (dma_buf_len > 8 &&
+           (uint32_t)dma_buf_count * (uint32_t)dma_buf_len * 4U > 8192U)
+    {
+        dma_buf_len--;
     }
 
     s_dma_buf_ms = (uint32_t)dma_buf_len * 1000U / sample_rate;
@@ -362,7 +380,14 @@ esp_err_t i2s_capture_deinit(void)
 {
     if (!s_initialized)
         return ESP_OK;
-    i2s_driver_uninstall(I2S_PORT);
+    /* FIX (L2): propagate the uninstall return so the caller knows if the
+     * driver was in a bad state. The next init may otherwise fail. */
+    esp_err_t err = i2s_driver_uninstall(I2S_PORT);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW("i2s_capture", "i2s_driver_uninstall: %s", esp_err_to_name(err));
+        return err;
+    }
     s_initialized = false;
     return ESP_OK;
 }
@@ -406,18 +431,27 @@ static void apply_agc(int32_t *buf, int n)
 
     /* 3. Compute target gain. */
     int32_t target_gain_q16;
-    if (s_agc_envelope < noise_gate)
+    /* FIX (M2): use <= so envelope==0 (silence, possible with a future
+     * preset that has noise_gate_q16 small enough to produce
+     * noise_gate==0 for 16-bit) is caught here instead of falling through
+     * to the division by zero below. */
+    if (s_agc_envelope <= noise_gate)
     {
         target_gain_q16 = AGC_MIN_GAIN_Q16;
     }
     else
     {
         int64_t num = (int64_t)target_level << 16;
-        target_gain_q16 = (int32_t)(num / s_agc_envelope);
-        if (target_gain_q16 > AGC_MAX_GAIN_Q16)
-            target_gain_q16 = AGC_MAX_GAIN_Q16;
-        if (target_gain_q16 < AGC_MIN_GAIN_Q16)
-            target_gain_q16 = AGC_MIN_GAIN_Q16;
+        /* FIX (M3): clamp in 64-bit BEFORE the narrowing cast to int32_t.
+         * With current presets the ratio is well under INT32_MAX, but a
+         * future preset could push it over -> implementation-defined cast
+         * before the clamp runs. */
+        int64_t raw = num / s_agc_envelope;
+        if (raw > AGC_MAX_GAIN_Q16)
+            raw = AGC_MAX_GAIN_Q16;
+        if (raw < AGC_MIN_GAIN_Q16)
+            raw = AGC_MIN_GAIN_Q16;
+        target_gain_q16 = (int32_t)raw;
     }
 
     /* 4. Smooth gain (prevents zipper noise). */
@@ -509,15 +543,18 @@ esp_err_t i2s_capture_read(int32_t *buf, int buf_len, int *samples_read)
         for (int i = n - 1; i >= 0; i--)
             buf[i] = (int32_t)s[i];
 
-        /* Apply AGC (if enabled) or fixed gain (if gain > 0). */
+        /* Apply AGC (if enabled) or fixed gain (if gain > 0).
+         * FIX (M1): skip fixed gain in 16-bit mode. board_config.h documents
+         * gain as "Applied to 24-bit sample before TPDF dither, only in
+         * 24-bit mode". In 16-bit mode the samples are already at correct
+         * level; applying gain=32 saturates any sample |val|>=1023 (~-30
+         * dBFS), clipping speech/music. AGC is fine in both modes because
+         * it targets a level, not a fixed multiplier. */
         if (s_agc_mode != AGC_MODE_OFF)
         {
             apply_agc(buf, n);
         }
-        else
-        {
-            apply_fixed_gain(buf, n);
-        }
+        /* else: 16-bit + AGC off = bypass. No fixed gain. */
         *samples_read = n;
     }
     else
@@ -529,7 +566,7 @@ esp_err_t i2s_capture_read(int32_t *buf, int buf_len, int *samples_read)
          * are ALWAYS 0x00 (padding), confirming left-justified.
          *
          * After extraction, apply AGC (if enabled) or fixed gain.
-         * Gain/AGC operates in 24-bit domain (±8388607), before TPDF
+         * Gain/AGC operates in 24-bit domain (+/-8388607), before TPDF
          * dither does the 24->16 reduction. */
         for (int i = 0; i < n; i++)
             buf[i] >>= 8;

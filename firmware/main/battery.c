@@ -10,11 +10,11 @@
  * When CONFIG_STREAMER_BATTERY_ENABLED is NOT set, all functions compile
  * to no-ops / return 0, so callers need no #ifdefs around battery_* calls.
  */
-#if BATTERY_ENABLED
 
 /* ---- System / SDK includes ---- */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
@@ -22,6 +22,9 @@
 
 /* ---- Project includes ---- */
 #include "board_config.h"
+
+#if BATTERY_ENABLED
+
 #include "battery.h"
 
 static const char *TAG = "battery";
@@ -29,6 +32,17 @@ static const char *TAG = "battery";
 /* Last measured voltage - written by monitor task, read by anyone.
  * 32-bit aligned write is atomic on Xtensa LX106, so no mutex needed. */
 static volatile uint32_t s_last_mv = 0;
+
+/* FIX (M26): the ESP8266 ADC driver is NOT reentrant. battery_get_voltage_mv
+ * was previously callable from the AT task (cmd_batt_query) while the
+ * monitor task was inside adc_read(), producing garbage readings or driver
+ * corruption. Serialize all adc_read() calls with this mutex. */
+static SemaphoreHandle_t s_adc_mutex = NULL;
+static void ensure_adc_mutex(void)
+{
+    if (!s_adc_mutex)
+        s_adc_mutex = xSemaphoreCreateMutex();
+}
 
 esp_err_t battery_init(void)
 {
@@ -49,6 +63,16 @@ esp_err_t battery_init(void)
 
 uint32_t battery_get_voltage_mv(void)
 {
+    /* FIX (M26): serialize ADC access so the AT task and monitor task can't
+     * both call adc_read() at the same time. */
+    ensure_adc_mutex();
+    if (!s_adc_mutex ||
+        xSemaphoreTake(s_adc_mutex, pdMS_TO_TICKS(2000)) != pdTRUE)
+    {
+        ESP_LOGW(TAG, "battery_get_voltage_mv: ADC mutex timeout");
+        return s_last_mv; /* return last cached value */
+    }
+
     uint32_t adc_sum = 0;
     int valid_samples = 0;
     const int samples = BATT_ADC_SAMPLES;
@@ -64,6 +88,8 @@ uint32_t battery_get_voltage_mv(void)
         valid_samples++;
         vTaskDelay(pdMS_TO_TICKS(BATT_ADC_DELAY_MS));
     }
+
+    xSemaphoreGive(s_adc_mutex);
 
     if (valid_samples == 0)
     {
@@ -113,6 +139,18 @@ void battery_monitor_task(void *arg)
         battery_enter_deep_sleep(BATT_SLEEP_MIN);
         return; /* never reached */
     }
+    else if (v_batt < BATT_START_MV)
+    {
+        /* FIX (H14): enforce BATT_START_MV at boot. board_config.h documents
+         * this as "below on boot -> don't start" but the previous code only
+         * checked CRITICAL_MV, allowing the device to boot and stream with
+         * a nearly-dead battery (between CRITICAL=3700 and START=3900),
+         * draining it further into deep-sleep territory. */
+        ESP_LOGW(TAG, "Battery LOW (%u mV < %u) - deep sleeping",
+                 (unsigned)v_batt, (unsigned)BATT_START_MV);
+        battery_enter_deep_sleep(BATT_SLEEP_MIN);
+        return; /* never reached */
+    }
     else
     {
         ESP_LOGI(TAG, "Battery OK: %u mV (%u%%)",
@@ -121,9 +159,13 @@ void battery_monitor_task(void *arg)
 
     /* Periodic monitoring loop. */
     const TickType_t check_period = pdMS_TO_TICKS(BATT_CHECK_MIN * 60U * 1000U);
+    /* FIX (M27): use vTaskDelayUntil for accurate periodic timing. vTaskDelay
+     * adds the measurement time (~750 ms) to the period, drifting ~40% over
+     * time at BATT_CHECK_MIN=1. */
+    TickType_t last_wake = xTaskGetTickCount();
     while (1)
     {
-        vTaskDelay(check_period);
+        vTaskDelayUntil(&last_wake, check_period);
 
         v_batt = battery_get_voltage_mv();
         s_last_mv = v_batt;

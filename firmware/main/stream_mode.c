@@ -280,6 +280,10 @@ static const stream_mode_ops_t s_tcp_ops = {
  * ==================================================================== */
 
 static const stream_mode_ops_t *s_active_ops = &s_udp_ops;
+/* FIX (split): remember the transport mode so main.c can pick the right
+ * STREAM_STOP_TIMEOUT_*_MS (UDP vs TCP). RawTX has no send timeout but
+ * uses the UDP value as a safe default. */
+static uint8_t s_active_transport = TRANSPORT_MODE_UDP;
 
 void stream_mode_init(const device_config_t *cfg)
 {
@@ -296,12 +300,18 @@ void stream_mode_init(const device_config_t *cfg)
         s_active_ops = &s_udp_ops;
         break;
     }
+    s_active_transport = cfg->transport_mode;
     ESP_LOGI(TAG, "Stream mode: %s", s_active_ops->name);
 }
 
 const stream_mode_ops_t *stream_mode_ops(void)
 {
     return s_active_ops;
+}
+
+uint8_t stream_mode_current_transport(void)
+{
+    return s_active_transport;
 }
 
 /* ---- Transport-agnostic wrappers (pure vtable dispatch, no if-branches) ---- */

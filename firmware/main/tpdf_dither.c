@@ -102,7 +102,7 @@ IRAM_ATTR __attribute__((optimize("O2"))) void dither_buffer_24_to_16(const int3
         int32_t sample = in[i];
 
         /* Two independent RPDFs uniform in [0, 255].
-         * Difference = TPDF over [-255, +255] = 1 LSB p-p at 16-bit.
+         * Difference = TPDF over [-255, +255] = 2 LSB p-p at 16-bit (510/256 = 1.99).
          * Linearises the quantizer, decorrelates error from signal
          * (Wannamaker/Vanderkooy/Lipshitz, 1991). */
         s = xorshift32_step(s);

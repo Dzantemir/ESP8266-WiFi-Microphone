@@ -115,7 +115,14 @@ static int s_adpcm_pool_size = 6;
 static uint32_t s_frame_ms = 20;
 
 /* Accessor for other modules (svc_port, at_cmd) - returns current frame_ms. */
-uint32_t streaming_get_frame_ms(void) { return s_frame_ms; }
+uint32_t streaming_get_frame_ms(void)
+{
+    /* FIX (L25): return the actual computed frame_ms (s_frame_ms) which is
+     * updated in start_streaming(). The default of 20 is only seen before
+     * the first stream start - documented in AT+GMR / AT+STATUS as
+     * "post-last-stream value". */
+    return s_frame_ms;
+}
 
 /* ---- Stream control API (for AT commands) ---- */
 
@@ -144,11 +151,15 @@ bool streaming_request_restart(void)
      * HOTRESTART from overriding an intentional stop. */
     if (!streaming_is_active())
         return false;
-    /* Set STOP first, then START. Main loop processes bits in order:
-     * STOP_REQ -> stop_streaming(), then START_REQ -> start_streaming().
-     * This gives a clean restart with fresh NVS config (~200ms vs ~1s reboot). */
-    xEventGroupSetBits(s_stream_evt_grp, STREAM_EVT_STOP_REQ);
-    xEventGroupSetBits(s_stream_evt_grp, STREAM_EVT_START_REQ);
+    /* FIX (H5): set BOTH bits in a single xEventGroupSetBits call. The
+     * previous two-call sequence had a check-then-set race: between
+     * is_active() and the bit sets, the main loop could process a prior
+     * STOP_REQ and clear ACTIVE. The subsequent START_REQ then auto-started
+     * a stream the user/server intended to keep stopped. Setting both bits
+     * atomically lets the main loop re-check is_active() before honoring
+     * START, and processes them in the order STOP then START. */
+    xEventGroupSetBits(s_stream_evt_grp,
+                       STREAM_EVT_STOP_REQ | STREAM_EVT_START_REQ);
     return true;
 }
 
@@ -193,7 +204,7 @@ static void drain_and_delete_queue(QueueHandle_t *q)
 
 static void i2s_task_fn(void *arg)
 {
-    int idx = (int)arg;
+    int idx = (int)(intptr_t)arg;  /* FIX (L26): intptr_t cast */
     ESP_LOGI(TAG, "[I2S] Task started (idx=%d)", idx);
 
     int total = s_samples_per_frame * s_channels;
@@ -286,7 +297,7 @@ task_exit:
 
 static void adpcm_task_fn(void *arg)
 {
-    int idx = (int)arg;
+    int idx = (int)(intptr_t)arg;  /* FIX (L26): intptr_t cast */
     ESP_LOGI(TAG, "[ADPCM] Task started (idx=%d, %d ch)", idx, s_channels);
 
     uint32_t frame_count = 0;
@@ -396,7 +407,7 @@ task_exit:
  * ==================================================================== */
 static void pcm_task_fn(void *arg)
 {
-    int idx = (int)arg;
+    int idx = (int)(intptr_t)arg;  /* FIX (L26): intptr_t cast */
     ESP_LOGI(TAG, "[PCM] Task started (idx=%d, %d ch, %d-bit)",
              idx, s_channels, s_bits_per_sample);
 
@@ -445,12 +456,17 @@ static void pcm_task_fn(void *arg)
             int32_t *s32 = (int32_t *)pcm->samples;
             for (int i = 0; i < n; i++)
             {
+                /* FIX (H4): bounds check BEFORE the 3-byte write. The
+                 * previous code wrote 3 bytes first then checked, so if
+                 * s_pkt_data_len % 3 != 0 (or < 3 from a future bug) the
+                 * first iteration wrote past the packet buffer -> heap
+                 * corruption / overwritten pkt_header_t. */
+                if (written + 3 > (size_t)s_pkt_data_len)
+                    break;
                 int32_t s = s32[i];
                 dst[written++] = (uint8_t)(s & 0xFF);
                 dst[written++] = (uint8_t)((s >> 8) & 0xFF);
                 dst[written++] = (uint8_t)((s >> 16) & 0xFF);
-                if (written + 3 > (size_t)s_pkt_data_len)
-                    break;
             }
         }
 
@@ -480,7 +496,7 @@ static void pcm_task_fn(void *arg)
 
 static void stream_task_fn(void *arg)
 {
-    int idx = (int)arg;
+    int idx = (int)(intptr_t)arg;  /* FIX (L26): intptr_t cast */
     const stream_mode_ops_t *ops = stream_mode_ops();
     ESP_LOGI(TAG, "[%s] Task started (idx=%d)", ops->name, idx);
 
@@ -653,9 +669,19 @@ static esp_err_t start_streaming(void)
     const stream_mode_ops_t *ops = stream_mode_ops();
     if (ops != old_ops)
     {
-        ESP_LOGI(TAG, "Transport changed — deinitializing old transport (%s)",
+        ESP_LOGI(TAG, "Transport changed -- deinitializing old transport (%s)",
                  old_ops->name);
         old_ops->deinit();
+        /* FIX (H7): if switching FROM a svc_port-using transport (UDP/TCP)
+         * TO one that doesn't (RAWTX), tear down svc_port. Without this
+         * the old svc_port task + UDP listener live forever, leaking
+         * memory + socket, and rogue EASSP discovery packets keep going
+         * out in RAWTX mode. */
+        if (old_ops->uses_svc_port && !ops->uses_svc_port)
+        {
+            ESP_LOGI(TAG, "Switching to non-svc_port transport - deinit svc_port");
+            svc_port_deinit();
+        }
     }
 
     /* Resolve stream destination (UDP: from server CONFIGURE; RAWTX: none). */
@@ -705,25 +731,43 @@ static esp_err_t start_streaming(void)
      *   С выравниванием: samples=656, dl=164, want=1312, buf=328,
      *     1312/328=4.0 → rw_pos=0, swap-pairs OK, дрейфа НЕТ */
     if (cfg.bits_per_sample == 16)
-        s_samples_per_frame &= ~7;   /* кратно 8: 661→656, 882→880, 220→216 */
+        s_samples_per_frame &= ~7;   /* кратно 8: 661->656, 882->880, 220->216 */
     else
         s_samples_per_frame &= ~3;   /* кратно 4 (24-bit) */
+
+    /* FIX (M14): post-condition check. If frame_ms was so small that
+     * samples_per_frame < 8, the alignment could zero it (8 & ~7 = 0),
+     * leading to division by zero in pool sizing (100 / s_frame_ms) and
+     * empty packets. */
+    if (s_samples_per_frame < 8)
+    {
+        ESP_LOGE(TAG, "samples_per_frame=%d too small (frame_ms=%u, rate=%u) - aborting",
+                 s_samples_per_frame, (unsigned)s_frame_ms, (unsigned)s_sample_rate);
+        return ESP_ERR_INVALID_STATE;
+    }
 
     ESP_LOGI(TAG, "Computed frame_ms=%u -> samples_per_frame=%d (rate=%u, ch=%u)",
              (unsigned)s_frame_ms, s_samples_per_frame,
              (unsigned)s_sample_rate, s_channels);
 
     s_adpcm_frame_bytes = s_samples_per_frame / 2;
+    /* Update codec mode + bit depth from config BEFORE computing bitrate.
+     * Previously these were assigned AFTER the bitrate calc, so on the first
+     * stream after boot (or after AT+CODEC / AT+BITS change + HOTRESTART) the
+     * bitrate used stale s_codec_mode/s_bits_per_sample values — e.g. an ADPCM
+     * bitrate (4 bits/sample) was reported in the packet header for a PCM
+     * stream. The receiver then displays the wrong kbps and may mis-size
+     * buffers. */
+    s_codec_mode = cfg.codec_mode;
+    s_bits_per_sample = cfg.bits_per_sample;
+    s_sample_rate_enum = sample_rate_to_enum(s_sample_rate);
     /* Bitrate depends on codec: ADPCM = 4 bits/sample, PCM = bits_per_sample
-     * bits/sample. Previously always used 4, showing wrong bitrate for PCM. */
+     * bits/sample. Now uses the just-updated s_codec_mode/s_bits_per_sample. */
     {
         int bits_per_codec = (s_codec_mode == CODEC_MODE_PCM)
                                  ? s_bits_per_sample : 4;
         s_audio_bitrate = s_sample_rate * (uint32_t)bits_per_codec * s_channels;
     }
-    s_sample_rate_enum = sample_rate_to_enum(s_sample_rate);
-    s_codec_mode = cfg.codec_mode;
-    s_bits_per_sample = cfg.bits_per_sample;
 
     /* Codec-dependent packet payload size:
      * ADPCM: [DVI4 hdr 4B][adpcm nibbles] per channel -> s_channels x (4 + samples/2)
@@ -828,7 +872,7 @@ static esp_err_t start_streaming(void)
                 adpcm_enc_destroy(adpcm_enc[j]);
                 adpcm_enc[j] = NULL;
             }
-            i2s_capture_deinit();
+            { esp_err_t derr = i2s_capture_deinit(); if (derr != ESP_OK) ESP_LOGW(TAG, "i2s_capture_deinit: %s", esp_err_to_name(derr)); }
             return ESP_FAIL;
         }
     }
@@ -843,7 +887,7 @@ static esp_err_t start_streaming(void)
             adpcm_enc_destroy(adpcm_enc[i]);
             adpcm_enc[i] = NULL;
         }
-        i2s_capture_deinit();
+        { esp_err_t derr = i2s_capture_deinit(); if (derr != ESP_OK) ESP_LOGW(TAG, "i2s_capture_deinit: %s", esp_err_to_name(derr)); }
         return err;
     }
 
@@ -984,12 +1028,17 @@ cleanup_on_fail:
 
     /* FIX (C3): Wait for any already-created pipeline tasks to exit before
      * deleting semaphores/queues. Without this, a task created at step 9
-     * (before the failure) could still be accessing them -> use-after-free. */
+     * (before the failure) could still be accessing them -> use-after-free.
+     * FIX (split): use the transport-specific stop timeout (UDP vs TCP)
+     * so the wait always covers the corresponding send timeout. */
+    uint32_t stop_to = (stream_mode_current_transport() == TRANSPORT_MODE_TCP)
+                       ? STREAM_STOP_TIMEOUT_TCP_MS
+                       : STREAM_STOP_TIMEOUT_UDP_MS;
     for (int i = 0; i < TASK_IDX_COUNT; i++)
     {
         if (s_task_handles[i])
         {
-            wait_for_task_exit(i, STREAM_STOP_TIMEOUT_MS);
+            wait_for_task_exit(i, stop_to);
         }
     }
 
@@ -1019,7 +1068,7 @@ cleanup_on_fail:
             adpcm_enc[i] = NULL;
         }
     }
-    i2s_capture_deinit();
+    { esp_err_t derr = i2s_capture_deinit(); if (derr != ESP_OK) ESP_LOGW(TAG, "i2s_capture_deinit: %s", esp_err_to_name(derr)); }
     /* Same 50ms delay as in stop_streaming() - I2S hardware needs time to
      * power down before a potential restart. See comment in stop_streaming. */
     vTaskDelay(pdMS_TO_TICKS(50));
@@ -1060,11 +1109,15 @@ static void stop_streaming(void)
      * so it exits cleanly — see the EBADF comment above. */
     transport_close_client();
 
-    /* Wait for each task to exit cleanly. */
+    /* Wait for each task to exit cleanly.
+     * FIX (split): use the transport-specific stop timeout (UDP vs TCP). */
+    uint32_t stop_to = (stream_mode_current_transport() == TRANSPORT_MODE_TCP)
+                       ? STREAM_STOP_TIMEOUT_TCP_MS
+                       : STREAM_STOP_TIMEOUT_UDP_MS;
     int clean_exits = 0;
     for (int i = 0; i < TASK_IDX_COUNT; i++)
     {
-        if (wait_for_task_exit(i, STREAM_STOP_TIMEOUT_MS))
+        if (wait_for_task_exit(i, stop_to))
         {
             clean_exits++;
         }
@@ -1099,7 +1152,7 @@ static void stop_streaming(void)
         }
     }
 
-    i2s_capture_deinit();
+    { esp_err_t derr = i2s_capture_deinit(); if (derr != ESP_OK) ESP_LOGW(TAG, "i2s_capture_deinit: %s", esp_err_to_name(derr)); }
     /* Give I2S hardware time to fully power down before a potential restart.
      * Without this delay, a rapid CONFIGURE (stop+start) or AT+HOTRESTART
      * causes LoadStoreAlignment crash during DMA queue rebuild in the next
@@ -1169,16 +1222,18 @@ void app_main(void)
     err = config_mgr_init();
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "Config manager init failed");
-        return;
+        ESP_LOGE(TAG, "Config manager init failed - rebooting in 5s");
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        esp_restart();
     }
 
     /* 3. Stream control EventGroup. */
     s_stream_evt_grp = xEventGroupCreate();
     if (!s_stream_evt_grp)
     {
-        ESP_LOGE(TAG, "Failed to create stream event group");
-        return;
+        ESP_LOGE(TAG, "Failed to create stream event group - rebooting in 5s");
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        esp_restart();
     }
 
     /* 5. WiFi init - mode-specific (UDP: connect to AP; RAWTX: radio+channel). */
@@ -1265,4 +1320,3 @@ void app_main(void)
         }
     }
 }
- 

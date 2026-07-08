@@ -5,6 +5,40 @@
  * 1. UDP mode: connects to AP, gets IP via DHCP.
  * 2. Raw 802.11 TX mode: starts radio without AP connection,
  *    sets a fixed channel, and marks WiFi as "ready" for esp_wifi_80211_tx.
+ *
+ * =====================  DESIGN (follows Espressif's official example)  =====================
+ *
+ * The event handler follows the canonical pattern from ESP8266_RTOS_SDK and
+ * ESP-IDF examples/wifi/getting_started/station/main/station_example_main.c:
+ *
+ *   WIFI_EVENT_STA_START       → esp_wifi_connect()       (directly in handler)
+ *   WIFI_EVENT_STA_DISCONNECTED → schedule reconnect       (via event-group bit)
+ *   IP_EVENT_STA_GOT_IP        → reset backoff, set CONNECTED bit
+ *
+ * Per Espressif's Wi-Fi Driver doc (wifi.rst §"Wi-Fi Reconnect"):
+ *   "The recommended reconnect strategy is to call esp_wifi_connect() on
+ *    receiving event WIFI_EVENT_STA_DISCONNECTED."
+ *   "If the event is raised because esp_wifi_disconnect() is called, the
+ *    application should not call esp_wifi_connect() to reconnect. It's
+ *    application's responsibility to distinguish."
+ *
+ * We distinguish via the s_intentional_disconnect flag (set before our own
+ * esp_wifi_disconnect() calls), NOT via reason codes — AUTH_LEAVE (3) and
+ * ASSOC_LEAVE (8) can come from the AP too (arduino-esp32#7210).
+ *
+ * Backoff: a dedicated lightweight task applies exponential backoff
+ * (1 s → 2 s → 4 s → 8 s → 15 s max, reset to 1 s on GOT_IP) and retries
+ * indefinitely. The task is needed because calling esp_wifi_connect() directly
+ * in the STA_DISCONNECTED handler with a vTaskDelay for backoff would block
+ * the event-loop task (which processes ALL events). Using esp_timer for backoff
+ * risks the #3458 deadlock (timer task ↔ WiFi task mutex cross-acquisition),
+ * which is NOT fixed in ESP8266 RTOS SDK v3.4. A dedicated task avoids both
+ * problems.
+ *
+ * NO reboot, NO failure cap. NO_AP_FOUND (201), BEACON_TIMEOUT, AP kicks, auth
+ * failures — all retried with the same infinite backoff. These are transient
+ * conditions; rebooting on them is wrong.
+ * ==========================================================================================
  */
 
 /* ---- System / SDK includes ---- */
@@ -16,30 +50,55 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
-#include "esp_timer.h"
 #include "tcpip_adapter.h"
 
 /* ---- Project includes ---- */
 #include "board_config.h"
 #include "wifi_sta.h"
 #include "svc_port.h"
+#include "stream_control.h"
+/* FIX (WiFi reconnect): needed for tcp_stream_reinit_listener() call when
+ * the TCP transport is active. Header is safe to include unconditionally
+ * (tcp_stream.c is always compiled, even when transport_mode != TCP). */
+#include "tcp_stream.h"
 
 static const char *TAG = "wifi_sta";
 
-#define WIFI_EVT_CONNECTED (1 << 0)
+/* Event-group bits. */
+#define WIFI_EVT_CONNECTED (1 << 0) /* GOT_IP received (UDP mode) */
 #define WIFI_EVT_GOT_IP (1 << 1)
-#define WIFI_EVT_STA_STARTED (1 << 2) /* raw TX: WIFI_EVENT_STA_START fired -> radio up */
+#define WIFI_EVT_STA_STARTED (1 << 2)   /* raw TX: STA_START fired, radio up */
+#define WIFI_EVT_RECONNECT_REQ (1 << 3) /* set by STA_DISCONNECTED handler */
+#define WIFI_EVT_EXIT (1 << 4)          /* set by deinit to stop the task */
+#define WIFI_EVT_APPLY_CACHED (1 << 5)  /* set by STA_CONNECTED: apply cached IP */
+/* FIX (H9): set by IP_EVENT_STA_GOT_IP handler; the reconnect task performs
+ * the heavy svc_port_reinit_socket() / svc_port_update_broadcast() calls
+ * instead of running them in the event-loop task (which serializes all
+ * WiFi/IP events and has a small stack on ESP8266). */
+#define WIFI_EVT_REINIT_SOCKET (1 << 6)
 
 static EventGroupHandle_t s_wifi_evt = NULL;
 static SemaphoreHandle_t s_backoff_mtx = NULL;
 static uint32_t s_backoff_ms = WIFI_RECONNECT_BACKOFF_MIN_MS;
 static bool s_initialized = false;
 
-/* Reconnect timer — scheduled by wifi_event_handler on STA_DISCONNECTED to
- * call esp_wifi_connect() after a backoff delay. File-scope (not
- * function-static) so wifi_sta_deinit() can stop it before esp_wifi_stop(),
- * preventing the callback from firing on a shut-down radio. */
-static esp_timer_handle_t s_reconnect_timer = NULL;
+/* Reconnect task — applies backoff and calls esp_wifi_connect(). */
+static TaskHandle_t s_reconnect_task = NULL;
+#define RECONNECT_TASK_STACK 2048
+#define RECONNECT_TASK_PRIO 4
+
+/* Set to true by code that intentionally calls esp_wifi_disconnect() so the
+ * resulting STA_DISCONNECTED event does not schedule a reconnect. */
+static volatile bool s_intentional_disconnect = false;
+
+/* Cached IP info from the last successful DHCP. On WiFi reconnect, we
+ * re-apply this IP directly via tcpip_adapter_set_ip_info() instead of
+ * waiting for DHCP (which is unreliable after reconnect on ESP8266 RTOS SDK
+ * v3.4). DHCP lease is typically valid for hours, so reuse is safe.
+ * See RFC 2131 §4.3.2 "INIT-REBOOT" state — DHCP clients MAY reuse a
+ * previously assigned address. */
+static bool s_have_cached_ip = false;
+static tcpip_adapter_ip_info_t s_cached_ip_info;
 
 /* Increase raw TX data rate from default 1 Mbps to 54 Mbps.
  * Without this, esp_wifi_80211_tx() uses 1 Mbps base rate -> at 200 pkt/s
@@ -50,35 +109,45 @@ static esp_timer_handle_t s_reconnect_timer = NULL;
  * Declared in NON-OS SDK user_interface.h, not in RTOS SDK v3.4 public
  * headers - must be extern-declared locally. */
 extern esp_err_t wifi_set_user_fixed_rate(uint8_t enable_mask, uint8_t rate);
-#define FIXED_RATE_MASK_NONE 0x00 // Фиксация отключена (автоматический выбор скорости)
-#define FIXED_RATE_MASK_STA 0x01  // Фиксированная скорость для Station (клиент)
-#define FIXED_RATE_MASK_AP 0x02   // Фиксированная скорость для SoftAP (точка доступа)
-#define FIXED_RATE_MASK_ALL 0x03  // Фиксированная скорость для всех режимов (STA + AP)
-#define WIFI_RATE_1M 0x00         // 1 Mbps
-#define WIFI_RATE_2M 0x01         // 2 Mbps
-#define WIFI_RATE_5_5M 0x02       // 5.5 Mbps
-#define WIFI_RATE_11M 0x03        // 11 Mbps
-#define WIFI_RATE_6M 0x0b         // 6 Mbps
-#define WIFI_RATE_9M 0x0f         // 9 Mbps
-#define WIFI_RATE_12M 0x0a        // 12 Mbps
-#define WIFI_RATE_18M 0x0e        // 18 Mbps
-#define WIFI_RATE_24M 0x09        // 24 Mbps
-#define WIFI_RATE_36M 0x0d        // 36 Mbps
-#define WIFI_RATE_48M 0x08        // 48 Mbps
-#define WIFI_RATE_54M 0x0c        // 54 Mbps
-#define WIFI_RATE_MCS0 0x10       // MCS0 (6.5 Mbps при 20 МГц)
-#define WIFI_RATE_MCS1 0x11       // MCS1 (13 Mbps)
-#define WIFI_RATE_MCS2 0x12       // MCS2 (19.5 Mbps)
-#define WIFI_RATE_MCS3 0x13       // MCS3 (26 Mbps)
-#define WIFI_RATE_MCS4 0x14       // MCS4 (39 Mbps)
-#define WIFI_RATE_MCS5 0x15       // MCS5 (52 Mbps)
-#define WIFI_RATE_MCS6 0x16       // MCS6 (58.5 Mbps)
-#define WIFI_RATE_MCS7 0x17       // MCS7 (65 Mbps при 20 МГц)
+#define FIXED_RATE_MASK_NONE 0x00
+#define FIXED_RATE_MASK_STA 0x01
+#define FIXED_RATE_MASK_AP 0x02
+#define FIXED_RATE_MASK_ALL 0x03
+#define WIFI_RATE_1M 0x00
+#define WIFI_RATE_2M 0x01
+#define WIFI_RATE_5_5M 0x02
+#define WIFI_RATE_11M 0x03
+#define WIFI_RATE_6M 0x0b
+#define WIFI_RATE_9M 0x0f
+#define WIFI_RATE_12M 0x0a
+#define WIFI_RATE_18M 0x0e
+#define WIFI_RATE_24M 0x09
+#define WIFI_RATE_36M 0x0d
+#define WIFI_RATE_48M 0x08
+#define WIFI_RATE_54M 0x0c
+#define WIFI_RATE_MCS0 0x10
+#define WIFI_RATE_MCS1 0x11
+#define WIFI_RATE_MCS2 0x12
+#define WIFI_RATE_MCS3 0x13
+#define WIFI_RATE_MCS4 0x14
+#define WIFI_RATE_MCS5 0x15
+#define WIFI_RATE_MCS6 0x16
+#define WIFI_RATE_MCS7 0x17
 
-/* Event handler - only active in UDP mode.
- * In raw TX mode a separate, smaller handler (wifi_raw_event_handler) is
- * used: it only needs WIFI_EVENT_STA_START as a radio-ready signal and must
- * NOT call esp_wifi_connect() (raw TX has no AP). */
+/* ---- Forward declarations ---- */
+static void wifi_reconnect_task(void *arg);
+
+/* ====================================================================
+ *  Event handler (UDP mode)
+ *
+ *  Follows the canonical pattern from ESP8266_RTOS_SDK and ESP-IDF
+ *  examples/wifi/getting_started/station/main/station_example_main.c.
+ *  esp_wifi_connect() on STA_START is called directly in the handler
+ *  (runs in the event-loop task — safe, per Espressif's API contract).
+ *  On STA_DISCONNECTED, we schedule a reconnect via an event-group bit
+ *  (NOT esp_wifi_connect() directly) so a dedicated task can apply backoff
+ *  without blocking the event loop.
+ * ==================================================================== */
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data)
 {
@@ -88,6 +157,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         {
         case WIFI_EVENT_STA_START:
             ESP_LOGI(TAG, "WIFI_EVENT_STA_START - connecting...");
+            /* Direct esp_wifi_connect() in the handler — same as the official
+             * Espressif station example. Safe: runs in the event-loop task. */
             esp_wifi_connect();
             break;
 
@@ -95,31 +166,65 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         {
             wifi_event_sta_disconnected_t *evt = data;
             xEventGroupClearBits(s_wifi_evt, WIFI_EVT_CONNECTED | WIFI_EVT_GOT_IP);
-            xSemaphoreTake(s_backoff_mtx, portMAX_DELAY);
-            uint32_t delay = s_backoff_ms;
-            s_backoff_ms <<= 1;
-            if (s_backoff_ms > WIFI_RECONNECT_BACKOFF_MAX_MS)
-            {
-                s_backoff_ms = WIFI_RECONNECT_BACKOFF_MAX_MS;
-            }
-            xSemaphoreGive(s_backoff_mtx);
 
-            ESP_LOGW(TAG, "WIFI_EVENT_STA_DISCONNECTED - reason: %d, reconnecting in %u ms...",
-                     evt->reason, (unsigned)delay);
-            /* FIX B3: Use a timer instead of vTaskDelay to avoid blocking the
-             * event loop task. The default event task processes ALL events
-             * (WiFi, IP, etc.) - blocking it for up to 30s starves everything. */
-            if (!s_reconnect_timer)
+            /* CRITICAL FIX (per PDF 123.pdf recommendation): stop the audio
+             * stream immediately on WiFi disconnect. While the stream is
+             * running, I2S/PCM/TCP tasks consume CPU and hold sockets,
+             * blocking the network stack. When WiFi reconnects, DHCP can't
+             * run properly → no GOT_IP → ESP stuck in zombie state → no
+             * broadcast announcements → server can't rediscover the device.
+             *
+             * Stopping the stream frees all resources. It will restart
+             * automatically when the server sends CONFIGURE after reconnect. */
+            if (streaming_is_active())
             {
-                const esp_timer_create_args_t timer_args = {
-                    .callback = (void *)esp_wifi_connect,
-                    .name = "wifi_reconnect"};
-                esp_timer_create(&timer_args, &s_reconnect_timer);
+                ESP_LOGW(TAG, "STA_DISCONNECTED reason %d - stopping stream + reconnect",
+                         evt->reason);
+                streaming_request_stop();
             }
-            esp_timer_stop(s_reconnect_timer);
-            esp_timer_start_once(s_reconnect_timer, (uint64_t)delay * 1000);
+            else
+            {
+                ESP_LOGW(TAG, "STA_DISCONNECTED reason %d - reconnect scheduled",
+                         evt->reason);
+            }
+
+            /* Per Espressif's Wi-Fi Reconnect doc: if the disconnect was
+             * caused by our own esp_wifi_disconnect() call, do NOT reconnect.
+             * We track this via the s_intentional_disconnect flag (NOT via
+             * reason codes — AUTH_LEAVE/ASSOC_LEAVE can come from the AP too,
+             * see arduino-esp32#7210). */
+            if (s_intentional_disconnect)
+            {
+                s_intentional_disconnect = false;
+                ESP_LOGI(TAG, "  (intentional disconnect - no reconnect this cycle)");
+                break;
+            }
+
+            /* Schedule a reconnect via the dedicated task (which applies
+             * backoff). Every reason code gets the SAME backoff reconnect. */
+            xEventGroupSetBits(s_wifi_evt, WIFI_EVT_RECONNECT_REQ);
             break;
         }
+
+        case WIFI_EVENT_STA_CONNECTED:
+            /* Associated. If we have a cached IP, signal the reconnect task
+             * to apply it (heavy work — tcpip_adapter_set_ip_info, broadcast
+             * update — is done in the task, NOT here, to avoid stack overflow
+             * in the event-loop task which has a small stack on ESP8266). */
+            if (s_have_cached_ip)
+            {
+                ESP_LOGI(TAG, "STA_CONNECTED - cached IP available, signaling task");
+                xEventGroupSetBits(s_wifi_evt, WIFI_EVT_APPLY_CACHED);
+            }
+            else
+            {
+                ESP_LOGI(TAG, "STA_CONNECTED - waiting for DHCP (first boot)");
+            }
+            /* Reset the svc_port DISCOVER watchdog (lightweight — just a
+             * semaphore + tick read, safe for the event-loop task). */
+            svc_port_reset_watchdog();
+            break;
+
         default:
             break;
         }
@@ -129,17 +234,204 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         if (id == IP_EVENT_STA_GOT_IP)
         {
             ip_event_got_ip_t *evt = data;
-            ESP_LOGI(TAG, "IP_EVENT_STA_GOT_IP: " IPSTR, IP2STR(&evt->ip_info.ip));
-            svc_port_update_broadcast();
+            ESP_LOGI(TAG, "GOT_IP: " IPSTR, IP2STR(&evt->ip_info.ip));
 
+            /* Guard against duplicate GOT_IP: when we apply cached IP via
+             * tcpip_adapter_set_ip_info() in the reconnect task, the SDK
+             * fires IP_EVENT_STA_GOT_IP. But by that time, the reconnect
+             * task has ALREADY set WIFI_EVT_GOT_IP and done svc_port_update_broadcast.
+             *
+             * BUT: if DHCP assigned a DIFFERENT IP than our cached one (router
+             * changed its mind, lease pool rotated, etc.), we must NOT skip —
+             * we need to update the cache, reinit the socket (bound to old IP),
+             * and restart the stream (configured to old IP). Only skip if the
+             * IP matches our cached value. */
+            if ((xEventGroupGetBits(s_wifi_evt) & WIFI_EVT_GOT_IP) &&
+                s_have_cached_ip &&
+                evt->ip_info.ip.addr == s_cached_ip_info.ip.addr &&
+                evt->ip_info.gw.addr == s_cached_ip_info.gw.addr &&
+                evt->ip_info.netmask.addr == s_cached_ip_info.netmask.addr)
+            {
+                ESP_LOGI(TAG, "GOT_IP duplicate (same IP, already processed) - skipping");
+                return;
+            }
+
+            /* Either first GOT_IP, or IP changed since cached — process fully. */
+            if (s_have_cached_ip &&
+                evt->ip_info.ip.addr != s_cached_ip_info.ip.addr)
+            {
+                ESP_LOGW(TAG, "IP changed: cached " IPSTR " → new " IPSTR " — restarting stream",
+                         IP2STR(&s_cached_ip_info.ip),
+                         IP2STR(&evt->ip_info.ip));
+                /* IP changed — stop stream (configured to old IP), then
+                 * let the server rediscover us with the new IP. */
+                if (streaming_is_active())
+                    streaming_request_stop();
+                xEventGroupClearBits(s_wifi_evt, WIFI_EVT_CONNECTED | WIFI_EVT_GOT_IP);
+            }
+
+            /* Cache the IP info for fast reconnect next time. */
+            s_cached_ip_info = evt->ip_info;
+            s_have_cached_ip = true;
+
+            /* FIX (H9): defer the heavy svc_port_reinit_socket() /
+             * svc_port_update_broadcast() calls to the reconnect task.
+             * Running them in the event-loop task (small stack, serializes
+             * ALL events) blocks all WiFi/IP events while socket close +
+             * reopen + broadcast setup runs. The reconnect task sets the
+             * CONNECTED / GOT_IP bits itself after performing the work. */
+            xEventGroupSetBits(s_wifi_evt, WIFI_EVT_REINIT_SOCKET);
+
+            /* Reset backoff to MIN — connection succeeded. */
             xSemaphoreTake(s_backoff_mtx, portMAX_DELAY);
             s_backoff_ms = WIFI_RECONNECT_BACKOFF_MIN_MS;
             xSemaphoreGive(s_backoff_mtx);
 
             xEventGroupSetBits(s_wifi_evt, WIFI_EVT_CONNECTED | WIFI_EVT_GOT_IP);
         }
+        else if (id == IP_EVENT_STA_LOST_IP)
+        {
+            /* IP was lost (DHCP lease expired, or IP lost timer fired after
+             * 120s without recovering). The SDK has already reset the IP to
+             * 0.0.0.0. WiFi is STILL associated with the AP — only the IP
+             * is gone.
+             *
+             * We must NOT call esp_wifi_connect() (it would fail with
+             * "already connected"). Instead, re-apply the cached IP directly
+             * via WIFI_EVT_APPLY_CACHED — same path as STA_CONNECTED. The
+             * reconnect task does tcpip_adapter_set_ip_info(), which triggers
+             * IP_EVENT_STA_GOT_IP → full recovery without WiFi disconnect.
+             *
+             * Without this handler, the code would think it's still connected
+             * (CONNECTED/GOT_IP bits stay set) while all sends silently fail. */
+            ESP_LOGW(TAG, "IP_EVENT_STA_LOST_IP - IP lost, re-applying cached IP");
+            xEventGroupClearBits(s_wifi_evt, WIFI_EVT_CONNECTED | WIFI_EVT_GOT_IP);
+            if (streaming_is_active())
+                streaming_request_stop();
+            /* Signal reconnect task to re-apply cached IP (NOT reconnect WiFi). */
+            xEventGroupSetBits(s_wifi_evt, WIFI_EVT_APPLY_CACHED);
+        }
     }
 }
+
+/* ====================================================================
+ *  Reconnect task
+ *
+ *  Owns esp_wifi_connect() calls that need backoff. The event handler only
+ *  sets an event-group bit (non-blocking, thread-safe); this task blocks on
+ *  xEventGroupWaitBits and applies exponential backoff before calling
+ *  esp_wifi_connect(). Runs in its own task context — does NOT block the
+ *  event loop, does NOT risk the #3458 timer-task deadlock.
+ * ==================================================================== */
+static void wifi_reconnect_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "Reconnect task started");
+
+    while (s_initialized)
+    {
+        EventBits_t bits = xEventGroupWaitBits(
+            s_wifi_evt,
+            WIFI_EVT_RECONNECT_REQ | WIFI_EVT_APPLY_CACHED |
+                WIFI_EVT_REINIT_SOCKET | WIFI_EVT_EXIT,
+            pdTRUE,  /* clearOnExit */
+            pdFALSE, /* wake on ANY */
+            portMAX_DELAY);
+
+        if (!s_initialized || (bits & WIFI_EVT_EXIT))
+            break;
+
+        /* FIX (H9): handle deferred socket reinit from IP_EVENT_STA_GOT_IP.
+         * The event handler sets this bit instead of doing the work inline
+         * (the work involves closing + reopening a socket, which can block
+         * and would stall the event-loop task). */
+        if (bits & WIFI_EVT_REINIT_SOCKET)
+        {
+            svc_port_update_broadcast();
+            if (svc_port_is_running())
+            {
+                esp_err_t rerr = svc_port_reinit_socket();
+                if (rerr != ESP_OK)
+                    ESP_LOGW(TAG, "svc_port_reinit_socket: %s", esp_err_to_name(rerr));
+            }
+            /* FIX (WiFi reconnect): also reinit the TCP listening socket if
+             * it exists. When WiFi disconnects, lwIP destroys the netif;
+             * the old TCP listener becomes a zombie and never receives new
+             * connections even after WiFi reconnects with the same IP.
+             * Without this, the server cannot connect after a WiFi drop
+             * until the device reboots. tcp_stream_reinit_listener() is a
+             * no-op if TCP is not active (s_listen_sock < 0). */
+            esp_err_t terr = tcp_stream_reinit_listener();
+            if (terr != ESP_OK)
+                ESP_LOGW(TAG, "tcp_stream_reinit_listener: %s", esp_err_to_name(terr));
+            /* Don't continue - fall through in case RECONNECT_REQ is also
+             * set (unlikely but possible). */
+        }
+
+        /* ---- Apply cached IP (signaled by STA_CONNECTED handler).
+         * Done here (not in the event handler) because tcpip_adapter_set_ip_info
+         * + svc_port_update_broadcast are heavy and overflow the event-loop
+         * task's small stack on ESP8266. Our task has a 2048-byte stack. */
+        if (bits & WIFI_EVT_APPLY_CACHED)
+        {
+            if (s_have_cached_ip)
+            {
+                ESP_LOGI(TAG, "Applying cached IP " IPSTR, IP2STR(&s_cached_ip_info.ip));
+                tcpip_adapter_dhcpc_stop(TCPIP_ADAPTER_IF_STA);
+                esp_err_t ip_err = tcpip_adapter_set_ip_info(TCPIP_ADAPTER_IF_STA,
+                                                             &s_cached_ip_info);
+                if (ip_err == ESP_OK)
+                {
+                    svc_port_update_broadcast();
+                    xSemaphoreTake(s_backoff_mtx, portMAX_DELAY);
+                    s_backoff_ms = WIFI_RECONNECT_BACKOFF_MIN_MS;
+                    xSemaphoreGive(s_backoff_mtx);
+                    xEventGroupSetBits(s_wifi_evt, WIFI_EVT_CONNECTED | WIFI_EVT_GOT_IP);
+                    ESP_LOGI(TAG, "Cached IP applied - GOT_IP signaled");
+                }
+                else
+                {
+                    ESP_LOGW(TAG, "set_ip_info failed: %s — falling back to DHCP",
+                             esp_err_to_name(ip_err));
+                }
+            }
+            /* Continue waiting for the next event — don't fall through to
+             * the reconnect path (we're already connected). */
+            continue;
+        }
+
+        /* ---- Reconnect request from STA_DISCONNECTED handler ---- */
+        /* Exponential backoff: 1s → 2s → 4s → 8s → 15s (max).
+         * Reset to 1s on GOT_IP. Retries INDEFINITELY — no reboot, no cap. */
+        xSemaphoreTake(s_backoff_mtx, portMAX_DELAY);
+        uint32_t delay_ms = s_backoff_ms;
+        s_backoff_ms <<= 1;
+        if (s_backoff_ms > WIFI_RECONNECT_BACKOFF_MAX_MS)
+            s_backoff_ms = WIFI_RECONNECT_BACKOFF_MAX_MS;
+        xSemaphoreGive(s_backoff_mtx);
+
+        ESP_LOGW(TAG, "Reconnect in %u ms", (unsigned)delay_ms);
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        if (!s_initialized)
+            break;
+
+        esp_err_t err = esp_wifi_connect();
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(err));
+            /* Re-schedule — backoff will continue climbing. */
+            xEventGroupSetBits(s_wifi_evt, WIFI_EVT_RECONNECT_REQ);
+        }
+    }
+
+    ESP_LOGI(TAG, "Reconnect task exiting");
+    s_reconnect_task = NULL;
+    vTaskDelete(NULL);
+}
+
+/* ====================================================================
+ *  Raw TX mode (unchanged)
+ * ==================================================================== */
 
 /* Raw TX configuration context - shared between wifi_sta_init_raw()
  * (calling task) and wifi_raw_event_handler() (event-loop task).
@@ -238,7 +530,9 @@ static void wifi_raw_event_handler(void *arg, esp_event_base_t base,
         xEventGroupSetBits(s_wifi_evt, WIFI_EVT_STA_STARTED);
 }
 
-/* ---- Common WiFi hardware init (shared by both modes) ---- */
+/* ====================================================================
+ *  Common WiFi hardware init (shared by both modes)
+ * ==================================================================== */
 static esp_err_t wifi_hw_init(void)
 {
     tcpip_adapter_init();
@@ -276,6 +570,27 @@ static esp_err_t wifi_hw_start(uint8_t tx_power)
         return err;
     }
 
+    /* CRITICAL: Disable WiFi power save (Modem-sleep).
+     *
+     * ESP8266 enables Modem-sleep by default — the radio sleeps between
+     * beacons to save power. During audio streaming (high traffic: 768 kbps
+     * PCM), the radio can't keep up: beacons are missed, encryption keys
+     * desync, and the AP kicks the station with reason 7 (NOT_ASSOCED) after
+     * ~15 seconds. The symptom is "drop unencrypted frame" errors followed by
+     * a disconnect.
+     *
+     * WIFI_PS_NONE keeps the radio fully awake at all times. This increases
+     * power consumption (~70 mA vs ~20 mA idle) but is REQUIRED for reliable
+     * streaming. Espressif FAQ recommends this for high-traffic applications.
+     *
+     * Must be called AFTER esp_wifi_start() (the WiFi driver must be running
+     * for set_ps to take effect). */
+    err = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (err != ESP_OK)
+        ESP_LOGW(TAG, "esp_wifi_set_ps(WIFI_PS_NONE) failed: %s", esp_err_to_name(err));
+    else
+        ESP_LOGI(TAG, "Power save disabled (WIFI_PS_NONE) — streaming-optimized");
+
     if (tx_power > WIFI_TX_POWER_MAX)
         tx_power = WIFI_TX_POWER_MAX;
     err = esp_wifi_set_max_tx_power(tx_power * 4);
@@ -289,10 +604,14 @@ static esp_err_t wifi_hw_start(uint8_t tx_power)
     return ESP_OK;
 }
 
-/* ---- UDP mode: connect to AP ---- */
+/* ====================================================================
+ *  UDP mode: connect to AP
+ * ==================================================================== */
 esp_err_t wifi_sta_init(const char *ssid, const char *password,
                         const char *hostname, uint8_t tx_power)
 {
+    esp_err_t err = ESP_FAIL;
+
     if (s_initialized)
     {
         wifi_sta_deinit();
@@ -306,66 +625,117 @@ esp_err_t wifi_sta_init(const char *ssid, const char *password,
         hostname = WIFI_HOSTNAME_DEFAULT;
     }
 
+    /* FIX (C5): create sync primitives; if a later step fails, jump to
+     * fail_init which frees them and unregisters partially-registered
+     * handlers (otherwise a retry would double-register handlers). */
     s_wifi_evt = xEventGroupCreate();
     s_backoff_mtx = xSemaphoreCreateMutex();
     if (!s_wifi_evt || !s_backoff_mtx)
     {
-        return ESP_ERR_NO_MEM;
+        ESP_LOGE(TAG, "Failed to create event group / mutex");
+        goto fail_init_noinit;
     }
     s_backoff_ms = WIFI_RECONNECT_BACKOFF_MIN_MS;
+    s_intentional_disconnect = false;
 
-    /* 1. Init WiFi hardware (esp_wifi_init, set_mode). */
-    esp_err_t err = wifi_hw_init();
+    /* 1. Init WiFi hardware (esp_wifi_init, set_mode).
+     * FIX (build): initialize err to ESP_FAIL so the fail_init_noinit path
+     * (reached from the sync-primitive creation failure above, before
+     * wifi_hw_init is called) has a defined value to return. Without this,
+     * -Werror=maybe-uninitialized fires because GCC can't prove err is
+     * always set before the goto path reads it. */
+
+    err = wifi_hw_init();
     if (err != ESP_OK)
-        return err;
+        goto fail_init_noinit;
 
     /* 2. Register event handlers BEFORE esp_wifi_start.
-     *
-     * Register the specific events we actually handle rather than
-     * ESP_EVENT_ANY_ID: the switch in wifi_event_handler only acts on
-     * STA_START / STA_DISCONNECTED, so listening on ANY_ID would needlessly
-     * wake the event-loop task for every WIFI_EVENT (SCAN_DONE, etc.).
-     * Symmetric with the raw TX mode, which also registers STA_START
-     * specifically.
-     *
-     * CAVEAT: esp_event_handler_unregister(base, ESP_EVENT_ANY_ID, h) does
-     * NOT remove handlers registered for specific ids - it only clears the
-     * base's "any-id" list. So the deinit path MUST unregister the exact
-     * same three (base,id) pairs registered here. */
-    err = esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_START,
+     *    WIFI_EVENT (all) + IP_EVENT_STA_GOT_IP + IP_EVENT_STA_LOST_IP. */
+    err = esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                      wifi_event_handler, NULL);
     if (err != ESP_OK)
-        return err;
-    err = esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,
-                                     wifi_event_handler, NULL);
-    if (err != ESP_OK)
-        return err;
+        goto fail_init;
     err = esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                      wifi_event_handler, NULL);
     if (err != ESP_OK)
-        return err;
+        goto fail_init;
+    err = esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP,
+                                     wifi_event_handler, NULL);
+    if (err != ESP_OK)
+        goto fail_init;
 
     /* 3. Configure STA (requires esp_wifi_init and set_mode). */
     wifi_config_t wifi_cfg = {0};
     strncpy((char *)wifi_cfg.sta.ssid, ssid, sizeof(wifi_cfg.sta.ssid) - 1);
+    wifi_cfg.sta.ssid[sizeof(wifi_cfg.sta.ssid) - 1] = '\0';
     strncpy((char *)wifi_cfg.sta.password, password, sizeof(wifi_cfg.sta.password) - 1);
+    wifi_cfg.sta.password[sizeof(wifi_cfg.sta.password) - 1] = '\0';
     esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_cfg);
 
     /* 4. Set hostname (DHCP/mDNS). */
     tcpip_adapter_set_hostname(TCPIP_ADAPTER_IF_STA, hostname);
     ESP_LOGI(TAG, "Hostname set to '%s'", hostname);
 
-    /* 5. Start WiFi hardware (generates WIFI_EVENT_STA_START). */
+    /* 5. Start the reconnect task BEFORE esp_wifi_start, so it's ready to
+     *    handle the first disconnect if the AP is unreachable. */
+    s_initialized = true;
+    if (xTaskCreate(wifi_reconnect_task, "wifi_recon", RECONNECT_TASK_STACK,
+                    NULL, RECONNECT_TASK_PRIO, &s_reconnect_task) != pdPASS)
+    {
+        ESP_LOGE(TAG, "Failed to create reconnect task");
+        s_reconnect_task = NULL;
+        /* Non-fatal: WiFi still works, just no auto-reconnect. */
+    }
+
+    /* 6. Start WiFi hardware (generates WIFI_EVENT_STA_START -> esp_wifi_connect). */
     err = wifi_hw_start(tx_power);
     if (err != ESP_OK)
-        return err;
+    {
+        /* FIX (C5): Full cleanup on failure, mirroring wifi_sta_deinit. */
+        s_initialized = false;
+        if (s_wifi_evt)
+            xEventGroupSetBits(s_wifi_evt, WIFI_EVT_EXIT);
+        if (s_reconnect_task)
+        {
+            vTaskDelay(pdMS_TO_TICKS(300));
+            vTaskDelete(s_reconnect_task);
+            s_reconnect_task = NULL;
+        }
+        esp_wifi_stop();
+        esp_wifi_deinit();
+        goto fail_init;
+    }
 
-    s_initialized = true;
+    /* FIX (L29): Zero the wifi_cfg struct (including plaintext password)
+     * before returning so it doesn't linger on the stack. */
+    memset(&wifi_cfg, 0, sizeof(wifi_cfg));
+
     ESP_LOGI(TAG, "WiFi STA initialized (UDP mode), connecting to %s...", ssid);
     return ESP_OK;
+
+fail_init:
+    /* Handlers were registered - unregister them. */
+    esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler);
+    esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler);
+    esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_LOST_IP, wifi_event_handler);
+fail_init_noinit:
+    /* Only sync primitives to free (handlers may not be registered yet). */
+    if (s_backoff_mtx)
+    {
+        vSemaphoreDelete(s_backoff_mtx);
+        s_backoff_mtx = NULL;
+    }
+    if (s_wifi_evt)
+    {
+        vEventGroupDelete(s_wifi_evt);
+        s_wifi_evt = NULL;
+    }
+    return err != ESP_OK ? err : ESP_FAIL;
 }
 
-/* ---- Raw 802.11 TX mode: no AP, just radio + channel ---- */
+/* ====================================================================
+ *  Raw 802.11 TX mode: no AP, just radio + channel
+ * ==================================================================== */
 esp_err_t wifi_sta_init_raw(uint8_t channel, uint8_t tx_power)
 {
     if (s_initialized)
@@ -383,9 +753,11 @@ esp_err_t wifi_sta_init_raw(uint8_t channel, uint8_t tx_power)
         return ESP_ERR_NO_MEM;
     }
 
+    /* Raw TX mode has no reconnect task (no AP to reconnect to). */
+    s_intentional_disconnect = false;
+
     /* Set up the context shared with the STA_START handler BEFORE registering
-     * the handler / starting WiFi. The handler reads s_raw_ctx.channel and
-     * writes s_raw_ctx.configured / .config_err. */
+     * the handler / starting WiFi. */
     s_raw_ctx.channel = channel;
     s_raw_ctx.configured = false;
     s_raw_ctx.config_err = ESP_OK;
@@ -395,16 +767,7 @@ esp_err_t wifi_sta_init_raw(uint8_t channel, uint8_t tx_power)
     if (err != ESP_OK)
         return err;
 
-    /* 2. Register the STA_START handler BEFORE esp_wifi_start().
-     *    esp_wifi_start() is asynchronous: it queues the start request and
-     *    returns immediately - the radio comes up shortly afterwards in the
-     *    WiFi driver task, which then posts WIFI_EVENT_STA_START. Registering
-     *    before start() guarantees we don't race and miss the event.
-     *
-     *    The handler performs ALL radio configuration (set_channel,
-     *    set_protocol, set_rate) - per the esp_wifi_set_protocol() API doc
-     *    ("@attention Please call this API in SYSTEM_EVENT_STA_START event")
-     *    the protocol call MUST happen inside the STA_START event. */
+    /* 2. Register the STA_START handler BEFORE esp_wifi_start(). */
     err = esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_START,
                                      wifi_raw_event_handler, NULL);
     if (err != ESP_OK)
@@ -415,17 +778,7 @@ esp_err_t wifi_sta_init_raw(uint8_t channel, uint8_t tx_power)
     if (err != ESP_OK)
         return err;
 
-    /* 4. Wait for the STA_START handler to finish configuring the radio.
-     *    The handler sets WIFI_EVT_STA_STARTED only AFTER set_channel,
-     *    set_protocol and set_rate have all run, so by the time this bit is
-     *    set the radio is up AND fully configured. This is the critical fix
-     *    for the "initial drop" at stream start: esp_wifi_start() returns
-     *    before the radio is actually up, so without this wait the first
-     *    few esp_wifi_80211_tx() calls would hit an uncalibrated radio and
-     *    be dropped.
-     *
-     *    Typical bring-up time on ESP8266 is ~100-300 ms; the timeout is a
-     *    safety net for a wedged radio, not the expected wait. */
+    /* 4. Wait for the STA_START handler to finish configuring the radio. */
     EventBits_t bits = xEventGroupWaitBits(s_wifi_evt,
                                            WIFI_EVT_STA_STARTED,
                                            pdFALSE, pdTRUE,
@@ -438,9 +791,7 @@ esp_err_t wifi_sta_init_raw(uint8_t channel, uint8_t tx_power)
         return ESP_ERR_TIMEOUT;
     }
 
-    /* 5. Surface any fatal config error captured by the handler
-     *    (set_channel or set_protocol failure; set_rate is non-fatal and
-     *    only logged inside the handler). */
+    /* 5. Surface any fatal config error captured by the handler. */
     if (s_raw_ctx.config_err != ESP_OK)
     {
         ESP_LOGE(TAG, "Raw TX radio configuration failed: %s",
@@ -459,41 +810,61 @@ esp_err_t wifi_sta_init_raw(uint8_t channel, uint8_t tx_power)
     return ESP_OK;
 }
 
-/* ---- Common API ---- */
+/* ====================================================================
+ *  Common API
+ * ==================================================================== */
 
 esp_err_t wifi_sta_deinit(void)
 {
     if (!s_initialized)
         return ESP_OK;
 
-    /* Unregister event handlers. Each registration in wifi_sta_init() /
-     * wifi_sta_init_raw() has a matching unregister here. unregister() is
-     * safe even if the handler was never registered (no-op in that case).
-     *
-     * Note: we unregister by the EXACT (base,id) pair -
-     * esp_event_handler_unregister(base, ESP_EVENT_ANY_ID, h) would NOT
-     * remove handlers registered for specific ids (it only clears the
-     * base's any-id list), so the pairs below must mirror the register()
-     * calls exactly. */
-    /* UDP-mode handlers (registered by wifi_sta_init). */
-    esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_STA_START,
-                                 wifi_event_handler);
-    esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,
-                                 wifi_event_handler);
-    esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                 wifi_event_handler);
-    /* Raw-TX-mode handler (registered by wifi_sta_init_raw). */
+    /* Unregister event handlers first, so no new events fire into a task
+     * that's about to exit. */
+    esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler);
+    esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler);
+    esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_LOST_IP, wifi_event_handler);
     esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_STA_START,
                                  wifi_raw_event_handler);
 
-    /* Stop any pending reconnect timer before shutting down the radio.
-     * Without this, a STA_DISCONNECTED that arrived just before deinit
-     * would schedule esp_wifi_connect() after esp_wifi_stop()/deinit(),
-     * calling into a shut-down driver (esp_wifi_connect on a stopped
-     * radio returns an error or crashes depending on SDK state). */
-    if (s_reconnect_timer)
+    /* FIX (C3/M18): give any in-flight event handler a brief grace period to
+     * finish before we tear down the event group / mutex it may touch.
+     * esp_event_handler_unregister() does NOT guarantee the handler has
+     * completed when it returns on ESP8266 RTOS SDK v3.4. 50 ms is enough
+     * for the handler's own work to drain. */
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    /* FIX (C4/H8): Set the intentional_disconnect flag so the DISCONNECTED
+     * event (fired by esp_wifi_disconnect below) does NOT schedule a
+     * reconnect while we're tearing down. */
+    s_intentional_disconnect = true;
+    /* Disconnect first so the SDK posts STA_DISCONNECTED with our flag set,
+     * then stop the radio. */
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    /* Signal the reconnect task to exit, then wait for it (real join via
+     * the EXIT bit + notification pattern). */
+    s_initialized = false;
+    if (s_wifi_evt)
+        xEventGroupSetBits(s_wifi_evt, WIFI_EVT_EXIT);
+
+    if (s_reconnect_task)
     {
-        esp_timer_stop(s_reconnect_timer);
+        /* FIX (C4): wait up to 5s for the reconnect task to exit on its own
+         * (it may be inside esp_wifi_connect() which can block several
+         * seconds). Only force-delete as a last resort. Force-deleting a
+         * task inside esp_wifi_connect orphans the WiFi driver mutex. */
+        for (int i = 0; i < 50 && s_reconnect_task; i++)
+        {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        if (s_reconnect_task)
+        {
+            ESP_LOGW(TAG, "wifi_sta_deinit: reconnect task did not exit, force-deleting");
+            vTaskDelete(s_reconnect_task);
+            s_reconnect_task = NULL;
+        }
     }
 
     esp_wifi_stop();
@@ -509,8 +880,8 @@ esp_err_t wifi_sta_deinit(void)
         vSemaphoreDelete(s_backoff_mtx);
         s_backoff_mtx = NULL;
     }
+    s_intentional_disconnect = false;
 
-    s_initialized = false;
     ESP_LOGI(TAG, "WiFi deinitialized");
     return ESP_OK;
 }
@@ -537,8 +908,15 @@ void wifi_sta_set_tx_power(uint8_t tx_power)
 {
     if (tx_power > WIFI_TX_POWER_MAX)
         tx_power = WIFI_TX_POWER_MAX;
-    esp_wifi_set_max_tx_power(tx_power * 4);
-    ESP_LOGI(TAG, "TX power set to %u dBm", tx_power);
+    /* FIX (H10): check the return code so the user is not told "TX power
+     * set to N dBm" when the SDK rejected the value. */
+    uint8_t raw = (tx_power > 63) ? 255 : (uint8_t)(tx_power * 4);
+    esp_err_t err = esp_wifi_set_max_tx_power(raw);
+    if (err != ESP_OK)
+        ESP_LOGW(TAG, "esp_wifi_set_max_tx_power(%u) failed: %s",
+                 (unsigned)tx_power, esp_err_to_name(err));
+    else
+        ESP_LOGI(TAG, "TX power set to %u dBm", tx_power);
 }
 
 esp_err_t wifi_sta_reconfigure(const char *ssid, const char *password)
@@ -548,15 +926,44 @@ esp_err_t wifi_sta_reconfigure(const char *ssid, const char *password)
 
     wifi_config_t wifi_cfg = {0};
     strncpy((char *)wifi_cfg.sta.ssid, ssid, sizeof(wifi_cfg.sta.ssid) - 1);
+    wifi_cfg.sta.ssid[sizeof(wifi_cfg.sta.ssid) - 1] = '\0';
     strncpy((char *)wifi_cfg.sta.password, password, sizeof(wifi_cfg.sta.password) - 1);
+    wifi_cfg.sta.password[sizeof(wifi_cfg.sta.password) - 1] = '\0';
 
     esp_err_t err = esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_cfg);
     if (err != ESP_OK)
         return err;
 
+    /* Reset backoff for the new credentials. */
     xSemaphoreTake(s_backoff_mtx, portMAX_DELAY);
     s_backoff_ms = WIFI_RECONNECT_BACKOFF_MIN_MS;
     xSemaphoreGive(s_backoff_mtx);
 
-    return esp_wifi_connect();
+    /* FIX (C6/H8): Set the intentional_disconnect flag BEFORE calling
+     * esp_wifi_connect(). If the STA is currently associated, esp_wifi_connect
+     * will internally disconnect first -> STA_DISCONNECTED event fires. The
+     * handler checks s_intentional_disconnect; if it's false (the old bug),
+     * it schedules a reconnect via the task while this function is also
+     * calling esp_wifi_connect -> two concurrent esp_wifi_connect calls ->
+     * reconnect loop and driver confusion.
+     *
+     * The flag is cleared in the event handler when the DISCONNECTED event
+     * arrives (so the subsequent esp_wifi_connect from this function is
+     * not suppressed), and the handler will NOT schedule a task reconnect. */
+    s_intentional_disconnect = true;
+
+    /* esp_wifi_connect() here runs in the caller's task. If it triggers a
+     * DISCONNECTED event, the handler will see our flag and NOT schedule a
+     * reconnect. */
+    err = esp_wifi_connect();
+
+    /* Clear the flag in case esp_wifi_connect returned without firing a
+     * DISCONNECTED event (STA was not associated). Otherwise the next
+     * organic disconnect would be wrongly suppressed. */
+    s_intentional_disconnect = false;
+
+    /* FIX (L29): wipe the password from the stack. */
+    memset(&wifi_cfg, 0, sizeof(wifi_cfg));
+
+    return err;
 }

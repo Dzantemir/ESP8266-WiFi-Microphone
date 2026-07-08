@@ -154,6 +154,13 @@ void stream_mode_init(const device_config_t *cfg);
  * Always returns a valid pointer (never NULL after stream_mode_init). */
 const stream_mode_ops_t *stream_mode_ops(void);
 
+/* FIX (split): transport-type query for transport-specific timeouts.
+ * Returns the current transport mode (0=UDP, 1=TCP, 2=RawTX). Used by
+ * main.c stop_streaming() to pick STREAM_STOP_TIMEOUT_UDP_MS vs
+ * STREAM_STOP_TIMEOUT_TCP_MS (RawTX has no send timeout, uses UDP value
+ * as a safe default). */
+uint8_t stream_mode_current_transport(void);
+
 /* ---- Transport-agnostic wrappers (thin proxies to ops table) ----
  * main.c calls these. No if-branches on transport type — pure vtable dispatch. */
 bool      transport_is_ready(void);

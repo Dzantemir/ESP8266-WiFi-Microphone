@@ -105,21 +105,30 @@ static inline bool sample_rate_is_valid(uint32_t rate)
 /* AGC (Automatic Gain Control) — 9 presets, each with its own character.
  *
  * Parameters per preset:
- *   attack     — speed of gain DROP when signal is loud (% per frame, 1-100)
- *   release    — speed of gain RISE when signal is quiet (% per frame, 1-100)
- *   target_q8  — target output level in Q8.8 fixed-point (e.g. 4096 = -18 dBFS)
- *                For 16-bit: 32768 = full scale. target_q8 = 32768 * 10^(target_dBFS/20)
- *   noise_gate_q8 — below this level, gain = 1x (bypass). 0 = no gate.
+ *   attack        — speed of gain DROP when signal is loud (% per frame, 1-100)
+ *   release       — speed of gain RISE when signal is quiet (% per frame, 1-100)
+ *   target_q16    — target output level in Q16.16 fixed-point
+ *                   (level as fraction of full scale, scaled by 65536).
+ *                   0 = use bit-depth default (-18 dBFS).
+ *   noise_gate_q16 — below this level, gain = 1x (bypass). 0 = use default.
  *
- * Q8.8 encoding: value = level * 256. Examples:
- *   -18 dBFS = 0.125 * 32768 * 256 = 1048576  (AGC_TARGET_16BIT)
- *   -12 dBFS = 0.25  * 32768 * 256 = 2097152
- *   -6 dBFS  = 0.5   * 32768 * 256 = 4194304
- *   -48 dBFS = 0.004 * 32768 * 256 = 32768
- *   -60 dBFS = 0.001 * 32768 * 256 = 8192
+ * Q16.16 encoding: value = level * 65536. Examples (level = 10^(dBFS/20)):
+ *   -18 dBFS: level=0.1259, q16 =  8248   (bit-depth default)
+ *   -15 dBFS: level=0.1778, q16 = 11658
+ *   -12 dBFS: level=0.2512, q16 = 16463
+ *    -6 dBFS: level=0.5012, q16 = 32846
+ *   -48 dBFS: level=0.0040, q16 =   261
+ *   -42 dBFS: level=0.0079, q16 =   521
+ *   -36 dBFS: level=0.0158, q16 =  1039
+ *   -30 dBFS: level=0.0316, q16 =  2073
+ *   -60 dBFS: level=0.0010, q16 =    66
+ *
+ * i2s_capture.c converts q16 → raw sample value via:
+ *   raw_target = (full_scale * target_q16) >> 16
+ * which works for both 16-bit (full_scale=32768) and 24-bit (8388608).
  *
  * For 24-bit mode, the AGC operates in the 24-bit domain (max 8388607).
- * The same dBFS values apply — we just use the 24-bit equivalents. */
+ * The same q16 values apply — the conversion handles bit depth. */
 #define AGC_MODE_COUNT      9
 
 #define AGC_MODE_OFF            0
@@ -134,44 +143,52 @@ static inline bool sample_rate_is_valid(uint32_t rate)
 
 typedef struct {
     const char *name;
-    uint8_t  attack;       /* % per frame, gain dropping (1-100) */
-    uint8_t  release;      /* % per frame, gain rising (1-100) */
-    int32_t  target_q8;    /* target level in Q8.8 (0 = use bit-depth default) */
-    int32_t  noise_gate_q8;/* noise gate in Q8.8 (0 = no gate) */
+    uint8_t  attack;        /* % per frame, gain dropping (1-100) */
+    uint8_t  release;       /* % per frame, gain rising (1-100) */
+    int32_t  target_q16;    /* target level in Q16.16 (0 = use bit-depth default) */
+    int32_t  noise_gate_q16;/* noise gate in Q16.16 (0 = use default) */
 } agc_preset_t;
 
-/* 16-bit equivalents for target/noise_gate (used when target_q8 = 0) */
-#define AGC_TARGET_16BIT    (1 << 20)   /* -18 dBFS in 16-bit domain (Q8.8) */
-#define AGC_TARGET_24BIT    (1 << 24)   /* -18 dBFS in 24-bit domain (Q8.8) */
+/* 16-bit equivalents for target/noise_gate (used when target_q16 = 0) */
+#define AGC_TARGET_16BIT    (1 << 12)   /* -18 dBFS raw in 16-bit domain (4096) */
+#define AGC_TARGET_24BIT    (1 << 20)   /* -18 dBFS raw in 24-bit domain (1048576) */
 #define AGC_NOISE_GATE_DIV  64          /* noise gate = target / DIV (if preset has 0) */
 
 static const agc_preset_t AGC_PRESETS[AGC_MODE_COUNT] = {
     /* 0: OFF — bypass, use fixed gain (AT+GAIN) */
     { "OFF",             0,   0,  0,        0 },
 
-    /* 1: Studio Soft — very smooth, minimal pumping, for clean recordings */
-    { "Studio Soft",    30,   5,  0,        0 },   /* target=-18dBFS, gate=-48dBFS */
+    /* 1: Studio Soft — very smooth, minimal pumping, for clean recordings.
+     *   target=-18dBFS (0.126), gate=-48dBFS (0.004) */
+    { "Studio Soft",    30,   5,  8248,     261 },
 
-    /* 2: Podcast — smooth control for voice, moderate gate */
-    { "Podcast",        50,  15,  0,        0 },   /* target=-18dBFS, gate=-42dBFS */
+    /* 2: Podcast — smooth control for voice, moderate gate.
+     *   target=-18dBFS, gate=-42dBFS (0.008) */
+    { "Podcast",        50,  15,  8248,     521 },
 
-    /* 3: Voice Balanced — current MEDIUM, good default for speech */
-    { "Voice Balanced", 75,  20,  0,        0 },   /* target=-18dBFS, gate=-42dBFS */
+    /* 3: Voice Balanced — current MEDIUM, good default for speech.
+     *   target=-18dBFS, gate=-42dBFS */
+    { "Voice Balanced", 75,  20,  8248,     521 },
 
-    /* 4: Voice Fast — fast reaction for dynamic speech */
-    { "Voice Fast",     90,  40,  0,        0 },   /* target=-18dBFS, gate=-36dBFS */
+    /* 4: Voice Fast — fast reaction for dynamic speech.
+     *   target=-18dBFS, gate=-36dBFS (0.016) */
+    { "Voice Fast",     90,  40,  8248,    1039 },
 
-    /* 5: Noisy Room — high noise gate, cuts background noise */
-    { "Noisy Room",     60,  25,  0,        0 },   /* target=-15dBFS, gate=-30dBFS */
+    /* 5: Noisy Room — high noise gate, cuts background noise.
+     *   target=-15dBFS (0.178, slightly louder), gate=-30dBFS (0.032) */
+    { "Noisy Room",     60,  25, 11658,    2073 },
 
-    /* 6: Music — slow attack (don't compress transients), fast release */
-    { "Music",          15,  60,  0,        0 },   /* target=-12dBFS, gate=-60dBFS */
+    /* 6: Music — slow attack (don't compress transients), fast release.
+     *   target=-12dBFS (0.251, preserves dynamics), gate=-60dBFS (0.001) */
+    { "Music",          15,  60, 16463,      66 },
 
-    /* 7: Limiter — only limits peaks, doesn't boost quiet signal */
-    { "Limiter",       100,   5,  0,        0 },   /* target=-6dBFS, gate=-60dBFS */
+    /* 7: Limiter — only limits peaks, doesn't boost quiet signal.
+     *   target=-6dBFS (0.501, high threshold), gate=-60dBFS */
+    { "Limiter",       100,   5, 32846,      66 },
 
-    /* 8: Surveillance — aggressive, keeps level constant for monitoring */
-    { "Surveillance",   95,  80,  0,        0 },   /* target=-12dBFS, gate=-60dBFS */
+    /* 8: Surveillance — aggressive, keeps level constant for monitoring.
+     *   target=-12dBFS, gate=-60dBFS */
+    { "Surveillance",   95,  80, 16463,      66 },
 };
 
 /* I2S RX input timing delays (ESP8266 TRM §10.2.1.6, I2S.timing register).
@@ -315,8 +332,15 @@ uint32_t i2s_capture_compute_frame_ms(uint32_t sample_rate, int channels,
 #define RAWTX_CHANNEL_DEFAULT 1
 #endif
 
-/* Firmware version - single source of truth. */
-#define FIRMWARE_VERSION    "v2.0"
+/* Firmware version - single source of truth.
+ * Must match the protocol version implemented:
+ *   v2.0 = INFO payload 34 bytes (no transport_mode, no hostname)
+ *   v2.1 = +1 byte transport_mode (35 bytes)
+ *   v2.2 = +24 bytes hostname (58 bytes)  <-- current
+ * The receiver reads the fixed 58-byte v2.2 INFO payload regardless of this
+ * string, but reporting the correct version lets the UI show accurate info
+ * and avoids confusion when debugging protocol mismatches. */
+#define FIRMWARE_VERSION    "v2.2"
 
 /* samples_per_frame and adpcm_frame_bytes are computed at runtime in
  * start_streaming() from frame_ms - no compile-time constants. */
@@ -367,7 +391,7 @@ uint32_t i2s_capture_compute_frame_ms(uint32_t sample_rate, int channels,
 #ifdef CONFIG_STREAMER_WIFI_RECONNECT_BACKOFF_MAX_MS
 #define WIFI_RECONNECT_BACKOFF_MAX_MS  CONFIG_STREAMER_WIFI_RECONNECT_BACKOFF_MAX_MS
 #else
-#define WIFI_RECONNECT_BACKOFF_MAX_MS  30000
+#define WIFI_RECONNECT_BACKOFF_MAX_MS  15000
 #endif
 
 /* Raw 802.11 TX mode: how long to wait for WIFI_EVENT_STA_START after
@@ -502,15 +526,39 @@ uint32_t i2s_capture_compute_frame_ms(uint32_t sample_rate, int channels,
 /* PCM/ADPCM pool sizes are computed at runtime in start_streaming() from
  * free heap and frame_ms - see main.c. No compile-time setting needed. */
 
-#ifdef CONFIG_STREAMER_STREAM_STOP_TIMEOUT_MS
-#define STREAM_STOP_TIMEOUT_MS  CONFIG_STREAMER_STREAM_STOP_TIMEOUT_MS
+/* FIX (split): separate stop timeouts for UDP and TCP. Previously a single
+ * STREAM_STOP_TIMEOUT_MS was used for both, but UDP and TCP have different
+ * send timeouts (UDP_SEND_TIMEOUT_MS, TCP_SEND_TIMEOUT_MS), and the stop
+ * timeout must be > the corresponding send timeout. Splitting lets the user
+ * tune each transport independently. */
+#ifdef CONFIG_STREAMER_STREAM_STOP_TIMEOUT_UDP_MS
+#define STREAM_STOP_TIMEOUT_UDP_MS  CONFIG_STREAMER_STREAM_STOP_TIMEOUT_UDP_MS
 #else
-/* FIX (H1): Must be > UDP_SEND_TIMEOUT_MS (2000ms) so that stream_task_fn
- * blocked in sendto() has time to return. With 500ms, the task gets force-
- * deleted while inside lwIP sendto() -> corrupted state + orphaned mutex
- * -> deadlock on next start_streaming(). 3000ms gives a safe margin. */
-#define STREAM_STOP_TIMEOUT_MS  3000
+/* Default if Kconfig is not included: must be > UDP_SEND_TIMEOUT_MS (2000). */
+#define STREAM_STOP_TIMEOUT_UDP_MS  3000
 #endif
+
+#ifdef CONFIG_STREAMER_STREAM_STOP_TIMEOUT_TCP_MS
+#define STREAM_STOP_TIMEOUT_TCP_MS  CONFIG_STREAMER_STREAM_STOP_TIMEOUT_TCP_MS
+#else
+/* Default if Kconfig is not included: must be > TCP_SEND_TIMEOUT_MS (2000). */
+#define STREAM_STOP_TIMEOUT_TCP_MS  3000
+#endif
+
+/* Legacy alias for code that hasn't been updated to use the transport-
+ * specific variant. Uses the max of UDP/TCP so the wait always covers the
+ * worst case. New code should use STREAM_STOP_TIMEOUT_UDP_MS or
+ * STREAM_STOP_TIMEOUT_TCP_MS directly. */
+#define STREAM_STOP_TIMEOUT_MS  \
+    (STREAM_STOP_TIMEOUT_UDP_MS > STREAM_STOP_TIMEOUT_TCP_MS ? \
+     STREAM_STOP_TIMEOUT_UDP_MS : STREAM_STOP_TIMEOUT_TCP_MS)
+
+/* FIX (M31): cross-validation checks moved to END of this file (after all
+ * timeout macros are defined). Earlier placement here caused #error to
+ * fire on undefined UDP_SEND_TIMEOUT_MS / BATT_* macros (treated as 0 by
+ * the preprocessor). See "Cross-validation checks" section near EOF. */
+
+/* FIX (M32): see M31 — battery threshold cross-check moved to EOF. */
 
 /* I2S DMA buffer dimensions are DERIVED from samples_per_frame at runtime
  * (see i2s_capture_init). One PCM frame = 4 DMA buffers, so each DMA
@@ -643,5 +691,38 @@ uint32_t i2s_capture_compute_frame_ms(uint32_t sample_rate, int channels,
  */
 #define PKT_HDR_SIZE        16
 #define DVI4_HEADER_SIZE    4        /* predict(2) + index(1) + reserved(1) */
+
+/* ====================================================================
+ *  Cross-validation checks (M31, M32)
+ * ====================================================================
+ * FIX (M31/M32): these checks MUST live at the END of this file, AFTER all
+ * the macros they reference have been defined. Earlier placement (right
+ * after STREAM_STOP_TIMEOUT_MS) caused #error to fire on still-undefined
+ * UDP_SEND_TIMEOUT_MS / BATT_* macros (the C preprocessor treats undefined
+ * identifiers as 0 in #if expressions, so "0 <= 0" was always true).
+ *
+ * Now all macros are defined above, so these checks fire only when the
+ * actual user-configured values violate the invariants. */
+
+/* M31: STREAM_STOP_TIMEOUT_*_MS must be > corresponding send timeout,
+ * otherwise a task blocked in sendto()/send() could be force-deleted by
+ * stop_streaming() while still inside lwIP -> orphaned mutex ->
+ * deadlock on next start_streaming(). */
+#if (STREAM_STOP_TIMEOUT_UDP_MS <= UDP_SEND_TIMEOUT_MS)
+#error "STREAM_STOP_TIMEOUT_UDP_MS must be > UDP_SEND_TIMEOUT_MS (force-deleting a task blocked in sendto() corrupts lwIP state)"
+#endif
+#if (STREAM_STOP_TIMEOUT_TCP_MS <= TCP_SEND_TIMEOUT_MS)
+#error "STREAM_STOP_TIMEOUT_TCP_MS must be > TCP_SEND_TIMEOUT_MS (force-deleting a task blocked in send() corrupts lwIP state)"
+#endif
+
+/* M32: BATT_START_MV must be > BATT_CRITICAL_MV, otherwise the boot check
+ * is inverted (start threshold below deep-sleep threshold — the device
+ * would deep-sleep at boot with a battery that's considered OK during run). */
+#if BATTERY_ENABLED
+#if (BATT_START_MV <= BATT_CRITICAL_MV)
+#error "BATT_START_MV must be > BATT_CRITICAL_MV (boot deep-sleep threshold inverted)"
+#endif
+#endif
+
 
 #endif /* BOARD_CONFIG_H */

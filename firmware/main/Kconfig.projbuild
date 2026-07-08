@@ -241,8 +241,8 @@ menu "ADPCM Streamer Configuration"
  
    config STREAMER_RAWTX_CHANNEL
             int "WiFi channel for Raw 802.11 TX mode (1-13)"
+            range 1 13
             default 1
-            depends on STREAMER_TRANSPORT_RAWTX
             help
                 The WiFi channel (frequency) used for broadcasting audio
                 when Raw 802.11 TX transport is selected (STREAMER_TRANSPORT_RAWTX).
@@ -402,7 +402,6 @@ menu "ADPCM Streamer Configuration"
     # ===================================================================
 
     menu "WiFi Defaults"
-    depends on STREAMER_TRANSPORT_TCP || STREAMER_TRANSPORT_UDP
 
         config STREAMER_WIFI_SSID
             string "Default WiFi SSID"
@@ -439,7 +438,14 @@ menu "ADPCM Streamer Configuration"
         config STREAMER_WIFI_RECONNECT_BACKOFF_MAX_MS
             int "Maximum WiFi reconnect backoff delay (ms)"
             range 1000 120000
-            default 30000
+            default 15000
+            help
+              FIX (DHCP wedged bug): lowered from 30000 to 15000. Long backoff
+              cycles (30s) increase the window in which the lwIP DHCP client
+              can get wedged after the AP returns. 15s is enough to avoid
+              hammering the AP during brief drops while keeping the zombie-state
+              window small. The IP watchdog (wifi_sta.c) catches the remaining
+              cases where DHCP still hangs despite the shorter backoff.
 
     endmenu
 
@@ -448,8 +454,7 @@ menu "ADPCM Streamer Configuration"
     # ===================================================================
 
     menu "Service Port (EASSP)"
-    depends on STREAMER_TRANSPORT_TCP || STREAMER_TRANSPORT_UDP
-
+ 
         config STREAMER_SVC_PORT
             int "EASSP service port"
             range 1 65535
@@ -576,15 +581,29 @@ menu "ADPCM Streamer Configuration"
                 for accept + setsockopt + logging. Increase if extended
                 diagnostics are needed.
 
-        config STREAMER_STREAM_STOP_TIMEOUT_MS
-            int "Stream stop timeout (ms)"
+        config STREAMER_STREAM_STOP_TIMEOUT_UDP_MS
+            int "Stream stop timeout for UDP transport (ms)"
             range 1000 10000
             default 3000
             help
-                Must be greater than UDP_SEND_TIMEOUT_MS (2000ms) so that
-                stream_task_fn blocked in sendto() has time to return.
-                With a smaller value, the task gets force-deleted while
-                inside lwIP sendto() — corrupting state and orphaning mutexes.
+                Max wait for the UDP stream_task_fn to exit when stop_streaming
+                is called. Must be > UDP_SEND_TIMEOUT_MS so that a task
+                blocked in sendto() has time to return. With a smaller value,
+                the task gets force-deleted while inside lwIP sendto() -
+                corrupting state and orphaning mutexes -> deadlock on next
+                start_streaming().
+
+        config STREAMER_STREAM_STOP_TIMEOUT_TCP_MS
+            int "Stream stop timeout for TCP transport (ms)"
+            range 1000 15000
+            default 3000
+            help
+                Max wait for the TCP stream_task_fn to exit when stop_streaming
+                is called. Must be > TCP_SEND_TIMEOUT_MS so that a task
+                blocked in send() has time to return. With a smaller value,
+                the task gets force-deleted while inside lwIP send() -
+                corrupting state and orphaning mutexes -> deadlock on next
+                start_streaming().
 
     endmenu
 
@@ -611,19 +630,16 @@ menu "ADPCM Streamer Configuration"
     # ===================================================================
 
     menu "Network / UDP / TCP"
-    depends on STREAMER_TRANSPORT_TCP || STREAMER_TRANSPORT_UDP
 
         config STREAMER_UDP_SEND_TIMEOUT_MS
             int "UDP socket send timeout (ms)"
             range 500 2000
-            default 1000
-             depends on STREAMER_TRANSPORT_UDP
+            default 2000
 
         config STREAMER_TCP_SEND_TIMEOUT_MS
             int "TCP send timeout (ms)"
             default 2000
             range 500 10000
-             depends on STREAMER_TRANSPORT_TCP
             help
                 Timeout for the blocking send() call, in milliseconds. If the
                 receiver does not read data for longer than this, the connection

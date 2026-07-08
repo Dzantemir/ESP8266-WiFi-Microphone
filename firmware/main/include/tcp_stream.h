@@ -39,6 +39,13 @@ esp_err_t tcp_stream_init_listen(uint16_t port);
 /* Закрыть listener + активный коннект + остановить accept-задачу. */
 esp_err_t tcp_stream_deinit(void);
 
+/* FIX (WiFi reconnect): пересоздать listening socket после WiFi
+ * disconnect/reconnect. Старый socket становится "zombie" (привязан к
+ * уничтоженному netif) и не принимает новые подключения. Без этого
+ * сервер не может подключиться после WiFi drop до перезагрузки устройства.
+ * No-op если TCP не инициализирован (s_listen_sock < 0). */
+esp_err_t tcp_stream_reinit_listener(void);
+
 /* Закрыть ТОЛЬКО активный клиентский коннект (не listener, не accept task).
  * Используется при stream stop — listening socket остаётся живым для
  * быстрого restart без EADDRINUSE. */

@@ -7,19 +7,19 @@
  * Согласовано с server/eassp_server.bas (TCP OPEN + framing read).
  */
 
+/* ---- System / SDK includes ---- */
 #include <string.h>
 #include <errno.h>
 #include "freertos/FreeRTOS.h"
-#include "board_config.h"
-
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "lwip/sockets.h"
 #include "esp_log.h"
-#include "tcp_stream.h"
 
-#ifndef IPTOS_DSCP_EF
-#define IPTOS_DSCP_EF 0xB8
-#endif
+/* ---- Project includes ---- */
+#include "board_config.h"
+#include "tcp_stream.h"
+#include "svc_port.h" /* FIX (H1): for svc_port_get_server_ip() */
 
 static const char *TAG = "tcp_stream";
 
@@ -32,6 +32,16 @@ static uint16_t s_listen_port = 0;
 /* Accept task handle. */
 static TaskHandle_t s_accept_task = NULL;
 static bool s_running = false;
+
+/* FIX (Bug #2): mutex guarding s_client_sock. Previously the accept task
+ * (tcp_accept_task_fn) and the send path (tcp_stream_send) both read/wrote
+ * s_client_sock without synchronization -> race: send() could fire on a
+ * socket that accept() was about to close (EBADF) or on the new socket
+ * before it was fully established (ENOTCONN). Now both paths take the
+ * mutex around their access; send() copies the fd to a local under the
+ * mutex and uses the local (does NOT hold the mutex during the blocking
+ * send() itself). */
+static SemaphoreHandle_t s_client_mutex = NULL;
 
 /* Drop counter for backpressure logging. */
 static uint32_t s_drop_count = 0;
@@ -54,29 +64,111 @@ static void tcp_accept_task_fn(void *arg)
             continue;
         }
 
-        // Configure client socket: optional
+        /* FIX (H1): authorize the client. Without this, ANY host on the LAN
+         * can connect to the TCP audio port and instantly hijack the stream
+         * (the previous code shutdown+close'd the current client and
+         * installed the new one unconditionally). DoS is trivial: connect/
+         * disconnect repeatedly, or connect-and-never-read to backpressure
+         * the SO_SNDTIMEO=2s and stall the audio pipeline.
+         *
+         * Only accept the client whose IP matches the most recent
+         * CONFIGURE's source IP (stored in svc_port.c as s_server_svc_addr).
+         * If no CONFIGURE has been received yet, refuse (no legitimate
+         * client should be connecting before configuring). */
+        uint32_t allowed_ip = 0;
+        bool have_server = svc_port_get_server_ip(&allowed_ip);
+        if (!have_server || client_addr.sin_addr.s_addr != allowed_ip)
+        {
+            ESP_LOGW(TAG, "rejecting unauthorized TCP client %d.%d.%d.%d:%d",
+                     (int)(client_addr.sin_addr.s_addr & 0xFF),
+                     (int)((client_addr.sin_addr.s_addr >> 8) & 0xFF),
+                     (int)((client_addr.sin_addr.s_addr >> 16) & 0xFF),
+                     (int)((client_addr.sin_addr.s_addr >> 24) & 0xFF),
+                     (int)ntohs(client_addr.sin_port));
+            shutdown(new_sock, SHUT_RDWR);
+            close(new_sock);
+            continue;
+        }
 
-        //  int flag = 1;
-        //  setsockopt(new_sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+        /* Configure client socket:
+         * - TCP_NODELAY: disable Nagle (send each frame immediately, no
+         *   coalescing). ALWAYS set - critical for low-latency audio.
+         *   Does NOT depend on WiFi QoS; it's a standard socket option.
+         * - IP_TOS: Expedited Forwarding (voice priority in IP header).
+         *   Routers with QoS may prioritize this traffic class.
+         * - SO_SNDBUF 4 KB: send buffer for burst absorption.
+         * - SO_SNDTIMEO: blocking send timeout (TCP_SEND_TIMEOUT_MS from
+         *   menuconfig, default 2000 ms). On timeout -> close + reconnect.
+         * - SO_KEEPALIVE (M7/T4): half-open detection during silence.
+         *   Without keepalive, a crashed server that didn't send FIN/RST
+         *   stays ESTABLISHED forever if stream_task_fn isn't calling
+         *   send() (e.g. AGC noise gate below threshold). 10s idle,
+         *   3s interval, 3 probes = dead in ~19s. */
+        int flag = 1;
+        if (setsockopt(new_sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) != 0)
+            ESP_LOGW(TAG, "TCP_NODELAY setsockopt failed: errno=%d", errno);
 
-        /* Set TOS (Type of Service) to Expedited Forwarding (Voice). */
-        //  int tos = IPTOS_DSCP_EF;
-        //   setsockopt(new_sock, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+#ifndef IPTOS_DSCP_EF
+#define IPTOS_DSCP_EF 0xB8
+#endif
+        int tos = IPTOS_DSCP_EF;
+        if (setsockopt(new_sock, IPPROTO_IP, IP_TOS, &tos, sizeof(tos)) != 0)
+            ESP_LOGW(TAG, "IP_TOS setsockopt failed: errno=%d", errno);
 
-        // int sndbuf = 32768;
-        // setsockopt(new_sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+        // int sndbuf = 4096;
+        // if (setsockopt(new_sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) != 0)
+        //     ESP_LOGW(TAG, "SO_SNDBUF setsockopt failed: errno=%d", errno);
 
         struct timeval sndto = {.tv_sec = TCP_SEND_TIMEOUT_MS / 1000,
                                 .tv_usec = (TCP_SEND_TIMEOUT_MS % 1000) * 1000};
-        setsockopt(new_sock, SOL_SOCKET, SO_SNDTIMEO, &sndto, sizeof(sndto));
+        if (setsockopt(new_sock, SOL_SOCKET, SO_SNDTIMEO, &sndto, sizeof(sndto)) != 0)
+            ESP_LOGW(TAG, "SO_SNDTIMEO setsockopt failed: errno=%d", errno);
 
-        /* Replace current client (close old, accept new). 1 client at a time. */
-        int old = s_client_sock;
-        s_client_sock = new_sock;
-        if (old >= 0)
+        /* FIX (M7/T4): TCP keepalive so a crashed server is detected even
+         * when the audio pipeline is silent (no send() calls to time out). */
+        int keepalive = 1;
+        int keepidle = 10; /* seconds before first probe */
+        int keepintvl = 3; /* seconds between probes */
+        int keepcnt = 3;   /* failed probes = dead */
+        setsockopt(new_sock, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+        setsockopt(new_sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+        setsockopt(new_sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+        setsockopt(new_sock, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+
+        /* FIX (Bug #2): close old client and install new one ATOMICALLY under
+         * the mutex. Previously the order was:
+         *   s_client_sock = new_sock;     // send path may now use new_sock
+         *   if (old >= 0) close(old);     // but old is still being read
+         * which races with tcp_stream_send (different task) that may have
+         * already captured old into a local and is mid-send(). Closing old
+         * under it -> EBADF; and send() on new_sock before TCP handshake
+         * completes -> ENOTCONN (errno 128, seen in logs).
+         *
+         * New order: under mutex, shutdown+close old FIRST (so any in-flight
+         * send() on old fails fast with EPIPE/ENOTCONN, which the send path
+         * handles), THEN publish new_sock. The send path always re-reads
+         * s_client_sock under the mutex, so it never races. */
+        int old;
+        if (s_client_mutex && xSemaphoreTake(s_client_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
         {
-            ESP_LOGI(TAG, "new client, closing old connection (sock=%d)", old);
-            close(old);
+            old = s_client_sock;
+            if (old >= 0)
+            {
+                shutdown(old, SHUT_RDWR);
+                close(old);
+                ESP_LOGI(TAG, "new client, closing old connection (sock=%d)", old);
+            }
+            s_client_sock = new_sock;
+            xSemaphoreGive(s_client_mutex);
+        }
+        else
+        {
+            /* Mutex timeout (rare) — close the new socket, refuse the client.
+             * Safer than installing without synchronization. */
+            ESP_LOGW(TAG, "accept: client_mutex timeout -- refusing new client");
+            shutdown(new_sock, SHUT_RDWR);
+            close(new_sock);
+            continue;
         }
 
         ESP_LOGI(TAG, "client connected: %d.%d.%d.%d:%d (sock=%d)",
@@ -108,12 +200,26 @@ esp_err_t tcp_stream_init_listen(uint16_t port)
      * task are alive — just reset client state and we're done. */
     if (s_listen_sock >= 0 && s_listen_port == port && s_accept_task)
     {
-        /* Close any stale client connection from previous stream. */
-        if (s_client_sock >= 0)
+        /* FIX (H2): close any stale client connection under the mutex.
+         * The previous code closed s_client_sock WITHOUT taking
+         * s_client_mutex, racing with tcp_stream_send (in stream_task_fn)
+         * which may have already snapshotted s_client_sock into a local
+         * and be mid-send(). Closing under it -> EBADF on the snapshot,
+         * handled by the send path, but the race violated the documented
+         * invariant established by Bug #2. */
+        if (s_client_mutex && xSemaphoreTake(s_client_mutex, pdMS_TO_TICKS(200)) == pdTRUE)
         {
-            shutdown(s_client_sock, SHUT_RDWR);
-            close(s_client_sock);
-            s_client_sock = -1;
+            if (s_client_sock >= 0)
+            {
+                shutdown(s_client_sock, SHUT_RDWR);
+                close(s_client_sock);
+                s_client_sock = -1;
+            }
+            xSemaphoreGive(s_client_mutex);
+        }
+        else
+        {
+            ESP_LOGW(TAG, "init_listen reuse: client_mutex timeout - client not closed");
         }
         s_drop_count = 0;
         ESP_LOGI(TAG, "TCP reusing listening socket on port %u (accept task alive)",
@@ -134,6 +240,19 @@ esp_err_t tcp_stream_init_listen(uint16_t port)
     {
         ESP_LOGE(TAG, "socket() failed: errno=%d", errno);
         return ESP_FAIL;
+    }
+
+    /* FIX (Bug #2): create the client mutex once, on first init. */
+    if (!s_client_mutex)
+    {
+        s_client_mutex = xSemaphoreCreateMutex();
+        if (!s_client_mutex)
+        {
+            ESP_LOGE(TAG, "Failed to create client mutex");
+            close(s_listen_sock);
+            s_listen_sock = -1;
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     /* SO_REUSEADDR — allows bind() to succeed even if a previous socket
@@ -197,8 +316,23 @@ esp_err_t tcp_stream_deinit(void)
         close(s_listen_sock);
         s_listen_sock = -1;
     }
-    if (s_client_sock >= 0)
+    /* FIX (Bug #2): close client under the mutex so tcp_stream_send can't
+     * race on a half-closed fd. */
+    if (s_client_mutex && xSemaphoreTake(s_client_mutex, pdMS_TO_TICKS(200)) == pdTRUE)
     {
+        if (s_client_sock >= 0)
+        {
+            shutdown(s_client_sock, SHUT_RDWR);
+            close(s_client_sock);
+            s_client_sock = -1;
+        }
+        xSemaphoreGive(s_client_mutex);
+    }
+    else if (s_client_sock >= 0)
+    {
+        /* Fallback if mutex timed out (shouldn't happen — send path never
+         * holds it for long). Close without the mutex; worst case is a
+         * benign EBADF in the send path. */
         shutdown(s_client_sock, SHUT_RDWR);
         close(s_client_sock);
         s_client_sock = -1;
@@ -220,6 +354,33 @@ esp_err_t tcp_stream_deinit(void)
     return ESP_OK;
 }
 
+/* FIX (WiFi reconnect): re-create the TCP listening socket after WiFi
+ * disconnect/reconnect. When WiFi disconnects, lwIP destroys the netif
+ * structure. The old listening socket becomes a "zombie" — bound to a
+ * destroyed interface, it never receives new incoming connections even
+ * after WiFi reconnects with the same IP. Without this reinit, the server
+ * cannot connect after a WiFi drop until the device reboots.
+ *
+ * Analogous to svc_port_reinit_socket() for the UDP service socket.
+ *
+ * Safe to call when TCP is not active (no-op if s_listen_sock < 0). */
+esp_err_t tcp_stream_reinit_listener(void)
+{
+    if (s_listen_sock < 0)
+        return ESP_OK; /* TCP not initialized - nothing to do */
+
+    uint16_t port = s_listen_port;
+    ESP_LOGI(TAG, "Reinitializing TCP listening socket after WiFi reconnect (port %u)",
+             (unsigned)port);
+
+    /* Tear down the existing listener + accept task (full deinit). */
+    tcp_stream_deinit();
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    /* Re-create on the same port. */
+    return tcp_stream_init_listen(port);
+}
+
 void tcp_stream_close_client(void)
 {
     /* Close ONLY the active client connection. Keep the listening socket
@@ -228,8 +389,20 @@ void tcp_stream_close_client(void)
      *
      * Used by stop_streaming(): the transport layer is "stopped" in the
      * sense that no more audio is sent, but the listening socket stays
-     * open so the server can reconnect immediately on the next CONFIGURE. */
-    if (s_client_sock >= 0)
+     * open so the server can reconnect immediately on the next CONFIGURE.
+     *
+     * FIX (Bug #2): close under the mutex so tcp_stream_send can't race. */
+    if (s_client_mutex && xSemaphoreTake(s_client_mutex, pdMS_TO_TICKS(200)) == pdTRUE)
+    {
+        if (s_client_sock >= 0)
+        {
+            shutdown(s_client_sock, SHUT_RDWR);
+            close(s_client_sock);
+            s_client_sock = -1;
+        }
+        xSemaphoreGive(s_client_mutex);
+    }
+    else if (s_client_sock >= 0)
     {
         shutdown(s_client_sock, SHUT_RDWR);
         close(s_client_sock);
@@ -240,7 +413,23 @@ void tcp_stream_close_client(void)
 
 bool tcp_stream_is_ready(void)
 {
-    return s_client_sock >= 0;
+    /* FIX (M6): take the mutex for acquire/release semantics, mirroring
+     * udp_stream_is_ready. On Xtensa the int read is atomic so there's no
+     * torn read, but without a memory barrier the tx task may briefly
+     * observe a stale value (e.g. see "ready" after accept already set
+     * it to -1, or vice versa). */
+    bool r = false;
+    if (s_client_mutex && xSemaphoreTake(s_client_mutex, pdMS_TO_TICKS(50)) == pdTRUE)
+    {
+        r = (s_client_sock >= 0);
+        xSemaphoreGive(s_client_mutex);
+    }
+    else
+    {
+        /* Best-effort fallback if mutex is contended. */
+        r = (s_client_sock >= 0);
+    }
+    return r;
 }
 
 /* Static frame buffer — single-threaded (only tcp_send_task calls this),
@@ -249,10 +438,33 @@ static uint8_t s_frame_buf[2 + 1416];
 
 esp_err_t tcp_stream_send(const uint8_t *data, size_t len)
 {
-    if (!data || !len || s_client_sock < 0)
+    if (!data || !len)
         return ESP_ERR_INVALID_ARG;
     if (len > 1416)
         return ESP_ERR_INVALID_ARG;
+
+    /* FIX (Bug #2): snapshot the client fd under the mutex. The accept
+     * task may swap s_client_sock to a new fd at any moment (new client
+     * connected); we must NOT send on a fd that's about to be closed by
+     * accept. By copying to a local under the mutex, we get a stable fd
+     * for the duration of this send(). If accept() replaces it meanwhile,
+     * our local still points to the old fd — which accept() already
+     * shutdown()+close()d, so send() will fail fast with EPIPE/ENOTCONN
+     * (handled below) instead of corrupting the new client's stream. */
+    int sock;
+    if (s_client_mutex && xSemaphoreTake(s_client_mutex, pdMS_TO_TICKS(50)) == pdTRUE)
+    {
+        sock = s_client_sock;
+        xSemaphoreGive(s_client_mutex);
+    }
+    else
+    {
+        /* Mutex timeout — extremely rare (accept/send never hold it long).
+         * Drop the frame rather than risk an unsynchronized send. */
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (sock < 0)
+        return ESP_ERR_INVALID_STATE; /* FIX (T6): state, not arg, error */
 
     /* Build the FULL frame: [u16 length BE][data].
      * Send via BLOCKING send (SO_SNDTIMEO=2s). Blocking avoids the
@@ -267,22 +479,68 @@ esp_err_t tcp_stream_send(const uint8_t *data, size_t len)
     size_t sent = 0;
     while (sent < frame_len)
     {
-        int w = send(s_client_sock, s_frame_buf + sent, frame_len - sent, 0);
+        int w = send(sock, s_frame_buf + sent, frame_len - sent, 0);
         if (w < 0)
         {
-            /* EAGAIN on a blocking socket with SO_SNDTIMEO = timeout expired. */
-            ESP_LOGW(TAG, "send() failed: errno=%d (sent=%u/%u) — closing client",
+            /* EAGAIN on a blocking socket with SO_SNDTIMEO = timeout expired.
+             * EPIPE/ENOTCONN (128) = the accept task already replaced this
+             * fd and closed it under us, or peer closed.
+             *
+             * Only close s_client_sock if it STILL equals our snapshot (sock).
+             * If accept() already replaced s_client_sock with a new fd and
+             * closed the old one, we must NOT close sock again — the fd
+             * number may have been reused by lwIP for a different socket,
+             * and close(sock) would close THAT socket → memory leak/corruption.
+             * This was the root cause of the 30KB heap drop: each failed
+             * send did a double-close, leaking PCBs and pbufs in lwIP. */
+            ESP_LOGW(TAG, "send() failed: errno=%d (sent=%u/%u) -- closing client",
                      errno, (unsigned)sent, (unsigned)frame_len);
-            close(s_client_sock);
-            s_client_sock = -1;
+            if (s_client_mutex && xSemaphoreTake(s_client_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+            {
+                if (s_client_sock == sock)
+                {
+                    /* Our snapshot still matches - close it. */
+                    close(s_client_sock);
+                    s_client_sock = -1;
+                }
+                /* If s_client_sock != sock, accept() already closed the old
+                 * fd and installed a new one. Do NOT close sock - it's
+                 * already closed, and the fd number may be reused. */
+                xSemaphoreGive(s_client_mutex);
+            }
+            else
+            {
+                /* FIX (M8): mutex take timed out. s_client_sock still
+                 * points to the broken fd; without this, the next
+                 * tcp_stream_send will snapshot the same broken fd, send()
+                 * will fail again, and we'll loop forever dropping audio.
+                 * Force-clear s_client_sock without close() - the accept
+                 * task will replace it. */
+                ESP_LOGW(TAG, "send fail: client_mutex timeout - force-clearing s_client_sock");
+                if (s_client_sock == sock)
+                    s_client_sock = -1;
+            }
             return ESP_FAIL;
         }
         if (w == 0)
         {
-            /* Connection closed by peer. */
-            ESP_LOGW(TAG, "send() returned 0 — connection closed by peer");
-            close(s_client_sock);
-            s_client_sock = -1;
+            /* Connection closed by peer. Same logic as above. */
+            ESP_LOGW(TAG, "send() returned 0 -- connection closed by peer");
+            if (s_client_mutex && xSemaphoreTake(s_client_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+            {
+                if (s_client_sock == sock)
+                {
+                    close(s_client_sock);
+                    s_client_sock = -1;
+                }
+                xSemaphoreGive(s_client_mutex);
+            }
+            else
+            {
+                /* FIX (M8): same as above - force-clear to avoid looping. */
+                if (s_client_sock == sock)
+                    s_client_sock = -1;
+            }
             return ESP_FAIL;
         }
         sent += (size_t)w;

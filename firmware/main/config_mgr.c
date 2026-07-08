@@ -60,17 +60,35 @@ static esp_err_t load_from_nvs(device_config_t *cfg)
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
     if (err != ESP_OK)
     {
+        /* FIX (L31): log the specific error code so the user can distinguish
+         * "namespace absent" (ESP_ERR_NVS_NOT_FOUND, normal on first boot)
+         * from "NVS corrupt" (ESP_ERR_NVS_NOT_INITIALIZED, requires flash
+         * erase). Without this, both look the same to the caller. */
+        ESP_LOGW(TAG, "load_from_nvs: nvs_open failed: %s "
+                 "(NOT_FOUND=first boot, NOT_INITIALIZED=NVS corrupt)",
+                 esp_err_to_name(err));
         return err;
     }
 
     size_t len;
+    esp_err_t e;
 
+    /* FIX (C7): check each nvs_get_str return. If a key is missing (e.g.
+     * after a firmware upgrade that added a new string field, or NVS
+     * corruption), fall back to the corresponding compile-time default
+     * instead of leaving the field as an empty string. */
     len = sizeof(cfg->wifi_ssid);
-    nvs_get_str(h, "ssid", cfg->wifi_ssid, &len);
+    e = nvs_get_str(h, "ssid", cfg->wifi_ssid, &len);
+    if (e != ESP_OK || !cfg->wifi_ssid[0])
+        strncpy(cfg->wifi_ssid, WIFI_SSID_DEFAULT, sizeof(cfg->wifi_ssid) - 1);
     len = sizeof(cfg->wifi_password);
-    nvs_get_str(h, "pass", cfg->wifi_password, &len);
+    e = nvs_get_str(h, "pass", cfg->wifi_password, &len);
+    if (e != ESP_OK)
+        strncpy(cfg->wifi_password, WIFI_PASSWORD_DEFAULT, sizeof(cfg->wifi_password) - 1);
     len = sizeof(cfg->hostname);
-    nvs_get_str(h, "host", cfg->hostname, &len);
+    e = nvs_get_str(h, "host", cfg->hostname, &len);
+    if (e != ESP_OK || !cfg->hostname[0])
+        strncpy(cfg->hostname, WIFI_HOSTNAME_DEFAULT, sizeof(cfg->hostname) - 1);
 
     nvs_get_u8(h, "txpwr", &cfg->tx_power);
     nvs_get_u16(h, "svcport", &cfg->svc_port);
@@ -100,27 +118,36 @@ static esp_err_t save_to_nvs(const device_config_t *cfg)
         return err;
     }
 
-    nvs_set_str(h, "ssid", cfg->wifi_ssid);
-    nvs_set_str(h, "pass", cfg->wifi_password);
-    nvs_set_str(h, "host", cfg->hostname);
-    nvs_set_u8(h, "txpwr", cfg->tx_power);
-    nvs_set_u16(h, "svcport", cfg->svc_port);
-    nvs_set_u32(h, "rate", cfg->sample_rate);
-    nvs_set_u8(h, "bits", cfg->bits_per_sample);
-    nvs_set_u8(h, "fmt", cfg->comm_format);
-    nvs_set_u8(h, "ch", cfg->channel_format);
-    nvs_set_u8(h, "gain", cfg->gain);
-    nvs_set_u8(h, "agc", cfg->agc_mode);
-    nvs_set_u8(h, "codec", cfg->codec_mode);
-    nvs_set_u8(h, "wch", cfg->wifi_channel);
-    nvs_set_u8(h, "xport", cfg->transport_mode);
-    nvs_set_u8(h, "tmsd", cfg->i2s_timing_sd_delay);
-    nvs_set_u8(h, "tmws", cfg->i2s_timing_ws_delay);
-    nvs_set_u8(h, "tmbck", cfg->i2s_timing_bck_delay);
+    /* FIX (M19): check each nvs_set_* return. If the namespace is full,
+     * individual sets fail silently; without this check the commit then
+     * succeeds and the user thinks the value was saved but it wasn't. */
+    esp_err_t e;
+    if ((e = nvs_set_str(h, "ssid", cfg->wifi_ssid)) != ESP_OK)        goto save_fail;
+    if ((e = nvs_set_str(h, "pass", cfg->wifi_password)) != ESP_OK)    goto save_fail;
+    if ((e = nvs_set_str(h, "host", cfg->hostname)) != ESP_OK)         goto save_fail;
+    if ((e = nvs_set_u8(h, "txpwr", cfg->tx_power)) != ESP_OK)         goto save_fail;
+    if ((e = nvs_set_u16(h, "svcport", cfg->svc_port)) != ESP_OK)      goto save_fail;
+    if ((e = nvs_set_u32(h, "rate", cfg->sample_rate)) != ESP_OK)      goto save_fail;
+    if ((e = nvs_set_u8(h, "bits", cfg->bits_per_sample)) != ESP_OK)   goto save_fail;
+    if ((e = nvs_set_u8(h, "fmt", cfg->comm_format)) != ESP_OK)        goto save_fail;
+    if ((e = nvs_set_u8(h, "ch", cfg->channel_format)) != ESP_OK)      goto save_fail;
+    if ((e = nvs_set_u8(h, "gain", cfg->gain)) != ESP_OK)              goto save_fail;
+    if ((e = nvs_set_u8(h, "agc", cfg->agc_mode)) != ESP_OK)           goto save_fail;
+    if ((e = nvs_set_u8(h, "codec", cfg->codec_mode)) != ESP_OK)       goto save_fail;
+    if ((e = nvs_set_u8(h, "wch", cfg->wifi_channel)) != ESP_OK)       goto save_fail;
+    if ((e = nvs_set_u8(h, "xport", cfg->transport_mode)) != ESP_OK)   goto save_fail;
+    if ((e = nvs_set_u8(h, "tmsd", cfg->i2s_timing_sd_delay)) != ESP_OK)  goto save_fail;
+    if ((e = nvs_set_u8(h, "tmws", cfg->i2s_timing_ws_delay)) != ESP_OK)  goto save_fail;
+    if ((e = nvs_set_u8(h, "tmbck", cfg->i2s_timing_bck_delay)) != ESP_OK) goto save_fail;
 
     err = nvs_commit(h);
     nvs_close(h);
     return err;
+
+save_fail:
+    ESP_LOGE(TAG, "save_to_nvs: nvs_set_* failed: %s", esp_err_to_name(e));
+    nvs_close(h);
+    return e;
 }
 
 /* ---- Public API ---- */
@@ -243,20 +270,46 @@ esp_err_t config_set_wifi(const char *ssid, const char *password)
     {
         return ESP_ERR_INVALID_ARG;
     }
+    /* FIX (L30): reject whitespace-only SSID. 802.11 allows it but it's
+     * almost certainly a user typo. */
+    bool ssid_has_nonws = false;
+    for (const char *p = ssid; *p; p++)
+        if (*p != ' ' && *p != '\t') { ssid_has_nonws = true; break; }
+    if (!ssid_has_nonws)
+        return ESP_ERR_INVALID_ARG;
     if (strlen(ssid) >= sizeof(s_config.wifi_ssid) ||
         strlen(password) >= sizeof(s_config.wifi_password))
     {
         return ESP_ERR_INVALID_SIZE;
     }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
+    /* FIX (M21): capture previous values so we can roll back the in-memory
+     * state if save_to_nvs fails. Without this, runtime != persisted state
+     * after a save failure: AT+xxx? shows the new value, but on reboot the
+     * old value is loaded -> user confusion. */
+    char old_ssid[sizeof(s_config.wifi_ssid)];
+    char old_pass[sizeof(s_config.wifi_password)];
+    memcpy(old_ssid, s_config.wifi_ssid, sizeof(old_ssid));
+    memcpy(old_pass, s_config.wifi_password, sizeof(old_pass));
+
     strncpy(s_config.wifi_ssid, ssid, sizeof(s_config.wifi_ssid) - 1);
     s_config.wifi_ssid[sizeof(s_config.wifi_ssid) - 1] = '\0';
     strncpy(s_config.wifi_password, password, sizeof(s_config.wifi_password) - 1);
     s_config.wifi_password[sizeof(s_config.wifi_password) - 1] = '\0';
     esp_err_t err = save_locked();
+    if (err != ESP_OK)
+    {
+        /* Roll back in-memory state to match NVS. */
+        memcpy(s_config.wifi_ssid, old_ssid, sizeof(s_config.wifi_ssid));
+        memcpy(s_config.wifi_password, old_pass, sizeof(s_config.wifi_password));
+    }
     xSemaphoreGive(s_mutex);
     if (err == ESP_OK)
         ESP_LOGI(TAG, "Config saved to NVS");
+    else
+        ESP_LOGE(TAG, "Config save failed, in-memory state rolled back: %s", esp_err_to_name(err));
+    /* FIX (L29): wipe the captured plaintext password. */
+    memset(old_pass, 0, sizeof(old_pass));
     return err;
 }
 

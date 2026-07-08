@@ -6,11 +6,26 @@
 #include <stdbool.h>
 
 /*
- * WiFi STA mode with exponential backoff reconnection.
+ * WiFi STA mode with disconnect recovery.
  *
- * On disconnect, retries with doubling delay from
- * WIFI_RECONNECT_BACKOFF_MIN_MS to WIFI_RECONNECT_BACKOFF_MAX_MS.
- * Reset to MIN on successful connection or SSID change.
+ * On disconnect, a dedicated background task (wifi_reconnect_task) performs
+ * the reconnection — all esp_wifi_connect/disconnect/stop/start calls run in
+ * that task's context, never from timer callbacks or event handlers (which
+ * would deadlock the timer/WiFi tasks; see esp-idf issue #3458).
+ *
+ * Disconnect reasons are categorized:
+ *   - temporary (BEACON_TIMEOUT, NO_AP_FOUND, ...): exponential backoff
+ *     from WIFI_RECONNECT_BACKOFF_MIN_MS to WIFI_RECONNECT_BACKOFF_MAX_MS,
+ *     reset to MIN on successful GOT_IP or SSID change.
+ *   - auth failure (AUTH_FAIL, 4WAY_HANDSHAKE_TIMEOUT, ...): long delay.
+ *   - connection failure (CONNECTION_FAIL, ASSOC_FAIL) or too many consecutive
+ *     failures: full esp_wifi_stop()+start()+connect() to reset driver state.
+ *   - intentional (ASSOC_LEAVE/AUTH_LEAVE): no reconnect (would loop).
+ *
+ * An IP-watchdog timer fires if DHCP doesn't deliver an IP within
+ * IP_WATCHDOG_TIMEOUT_MS after STA_CONNECTED; its callback only sets an
+ * event bit (non-blocking), and the reconnect task performs the recovery
+ * (disconnect + lwIP DHCP reset + reconnect).
  */
 
 esp_err_t wifi_sta_init(const char *ssid, const char *password,

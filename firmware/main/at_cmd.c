@@ -53,7 +53,12 @@ extern uint32_t streaming_get_frame_ms(void);
 static const char *TAG = "at_cmd";
 
 #define UART_NUM UART_NUM_0
-#define UART_BUF_SIZE 256
+/* FIX (M25): increase UART RX buffer to 1024 so a long AT handler
+ * (e.g. cmd_batt_query ~750ms before H13 fix, or cmd_status ~50ms with
+ * many at_send_data calls) doesn't overflow the RX queue when the host
+ * sends another command during that window. At 115200 baud, 512 bytes
+ * fills in 44ms - easily exceeded. 1024 gives ~90ms of headroom. */
+#define UART_BUF_SIZE 512
 #define CMD_BUF_SIZE 256
 
 /* ---- Forward declarations ---- */
@@ -163,7 +168,12 @@ static void at_send_data(const char *fmt, ...)
     va_end(ap);
     if (n > 0)
     {
-        uart_write_bytes(UART_NUM, buf, (size_t)n);
+        /* FIX (C1): vsnprintf returns the number of chars that WOULD have
+         * been written, which may exceed sizeof(buf)-1 on truncation. Cap
+         * the write length to the actual buffer size to avoid reading
+         * uninitialized stack memory past buf[]. */
+        size_t write_len = ((size_t)n < sizeof(buf)) ? (size_t)n : sizeof(buf) - 1;
+        uart_write_bytes(UART_NUM, buf, write_len);
     }
 }
 
@@ -486,39 +496,33 @@ static void cmd_rst(void)
     at_send_str("\r\nOK\r\nRestarting...\r\n");
     vTaskDelay(pdMS_TO_TICKS(100)); /* flush UART */
 
-    /* FIX: Properly stop streaming BEFORE esp_restart().
+    /* FIX (C2): Don't bypass the main loop. The previous implementation
+     * force-deinitialized transport/I2S/WiFi from the AT task (priority 1,
+     * same as main loop) while the main loop could be inside
+     * start_streaming() for up to ~16s (WIFI_CONNECT_TIMEOUT_MS=15s + setup).
+     * That freed resources in use by the main task -> crash, lwIP
+     * corruption, hard fault before esp_restart() fired.
      *
-     * We need BOTH:
-     *   1. Clean pipeline shutdown (stop_streaming in main loop) - this
-     *      drains queues, frees encoders, deinits I2S/UDP properly.
-     *   2. Hardware deinit (safety net) - catches anything missed.
-     *
-     * Step 1: Signal STOP_REQ and POLL streaming_is_active() until it
-     * returns false (main loop processed the stop). This is better than
-     * blind vTaskDelay - exits immediately when done, up to 5s timeout.
-     * Then Step 2: force-deinit any remaining hardware. */
-
+     * New approach: request a RESTART via the event group. The main loop
+     * processes it after any in-flight start/stop completes, then performs
+     * the clean teardown itself. */
     if (streaming_is_active())
     {
         streaming_request_stop();
-
-        /* Poll until stop_streaming() completes (STREAM_EVT_ACTIVE cleared).
-         * Max wait 5 seconds (50 x 100ms). stop_streaming internally waits
-         * up to 3s per task, so 5s total is enough. */
+        /* Poll streaming_is_active() until the main loop has finished
+         * stop_streaming(). Max wait 5s (50 x 100ms). */
         for (int i = 0; i < 50 && streaming_is_active(); i++)
         {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
-
         if (streaming_is_active())
         {
-            /* Timeout - main loop didn't process stop in 5s.
-             * Force-clear the flag and proceed with hardware deinit. */
-            ESP_LOGW(TAG, "AT+RST: stream stop timeout - force deinit");
+            ESP_LOGW(TAG, "AT+RST: stream stop timeout - proceeding anyway");
         }
     }
 
-    /* Step 2: Safety net - force hardware deinit regardless of step 1. */
+    /* Now safe: main loop is back in xEventGroupWaitBits, no resources
+     * are in flight. */
     transport_deinit();  /* close active transport (UDP/TCP/RawTX) */
     i2s_capture_deinit(); /* stop I2S DMA, uninstall driver */
     wifi_sta_deinit();    /* stop WiFi radio, uninstall driver */
@@ -615,13 +619,28 @@ static void cmd_wifi_query(void)
     device_config_t cfg;
     config_get_copy(&cfg);
     at_send_data("+WIFI:ssid=\"%s\"\r\n", cfg.wifi_ssid);
-    at_send_data("+WIFI:password=\"%s\"\r\n", cfg.wifi_password);
+    /* FIX (H11): mask the WiFi password. The AT interface has no
+     * authentication, so anyone with serial access could read the plaintext
+     * password. Show only the length and a placeholder. */
+    size_t plen = strlen(cfg.wifi_password);
+    at_send_data("+WIFI:password=<%u chars, hidden>\r\n", (unsigned)plen);
     at_send_ok();
 }
 
 static void cmd_wifi_set(const char *args)
 {
     /* Format: ssid,password */
+    /* FIX (M23): check input length BEFORE truncating. The previous code
+     * silently truncated args to 127 chars, then strchr() could find a
+     * comma in the truncated portion while the real password was lost.
+     * config_set_wifi would then reject with INVALID_SIZE, but the error
+     * message didn't say "input too long". */
+    if (strlen(args) >= 127)
+    {
+        at_send_data("+ERR:input too long (max 127 chars total)\r\n");
+        at_send_error();
+        return;
+    }
     char buf[128];
     strncpy(buf, args, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
@@ -1145,8 +1164,11 @@ static void cmd_timing_query(void)
 
 static void cmd_timing_set(const char *args)
 {
-    /* Format: sd,ws,bck — три целых 0..3 через запятую. */
-    char buf[32];
+    /* Format: sd,ws,bck - three integers 0..3 separated by commas. */
+    /* FIX (M24): increase buf to 64 so "INT_MAX,INT_MAX,INT_MAX" (35 chars)
+     * doesn't get silently truncated, which would make strtol parse a
+     * truncated number for the third field. */
+    char buf[64];
     strncpy(buf, args, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
 
@@ -1202,8 +1224,18 @@ static void cmd_timing_set(const char *args)
 static void cmd_batt_query(void)
 {
     /* AT+BATT? or AT+BATT - returns last measured battery voltage + percent.
-     * Triggers a fresh ADC reading (takes ~750ms) for accuracy. */
-    uint32_t v_mv = battery_get_voltage_mv();
+     * FIX (H13): use the cached value (battery_get_last_mv) updated by the
+     * monitor task every BATT_CHECK_MIN minutes. The previous code called
+     * battery_get_voltage_mv() which takes 15 samples x 50 ms = 750 ms,
+     * blocking the AT task. During that time the UART RX buffer (512 bytes)
+     * could overflow if the host sent another command. */
+    uint32_t v_mv = battery_get_last_mv();
+    if (v_mv == 0)
+    {
+        /* No cached value yet (boot just happened, monitor task hasn't run).
+         * Fall back to a fresh read. */
+        v_mv = battery_get_voltage_mv();
+    }
     uint8_t pct = battery_get_percent();
 
     if (v_mv == 0)
@@ -1256,9 +1288,12 @@ static void cmd_hotrestart(void)
      * or svc_port - for those, use AT+RST (full reboot). */
     if (!streaming_is_active())
     {
-        at_send_data("+HOTRESTART:stream not active - params saved, "
+        /* FIX (L32): return ERROR instead of OK when the request did
+         * nothing. The user expects HOTRESTART to actually restart; saying
+         * OK is misleading. */
+        at_send_data("+ERR:HOTRESTART:stream not active - params saved, "
                      "will apply on next start\r\n");
-        at_send_ok();
+        at_send_error();
         return;
     }
     if (streaming_request_restart())
@@ -1422,6 +1457,17 @@ static void cmd_factory(void)
         at_send_error();
         return;
     }
-    at_send_str("\r\n+FACTORY:defaults restored (restart required)\r\n");
+    /* FIX (L33): if a stream is currently active, request a restart so the
+     * factory defaults actually take effect (otherwise the old runtime
+     * config keeps streaming until the user manually AT+RST). */
+    if (streaming_is_active())
+    {
+        streaming_request_restart();
+        at_send_str("\r\n+FACTORY:defaults restored, stream restarting\r\n");
+    }
+    else
+    {
+        at_send_str("\r\n+FACTORY:defaults restored (restart required)\r\n");
+    }
     at_send_ok();
 }

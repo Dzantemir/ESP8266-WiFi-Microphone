@@ -37,6 +37,14 @@ static uint16_t s_wifi_seq = 0;
 
 static bool s_ready = false;
 
+/* Static frame buffer — single-threaded (only stream_task_fn calls
+ * rawtx_stream_send via transport_send), so no mutex needed. Same approach
+ * as tcp_stream.c. Avoids per-packet malloc/free which fragments the heap
+ * at 66+ allocs/sec (15ms frames) — each alloc churns the ESP8266's small
+ * heap and risks fragmentation over long streaming sessions.
+ * Max frame = 24 (wifi hdr) + 1400 (payload) = 1424 bytes. */
+static uint8_t s_frame_buf[WIFI_HDR_LEN + 1400];
+
 esp_err_t rawtx_stream_init(void)
 {
     if (s_ready)
@@ -117,16 +125,21 @@ esp_err_t rawtx_stream_send(const uint8_t *data, size_t len)
 
     /* Raw 802.11 TX: prepend MAC header and send via esp_wifi_80211_tx.
      * Buffer: [wifi_hdr 24B][data len bytes]
-     * Allocate on heap - task stack cannot hold 1424B buffer. */
+     * Uses static s_frame_buf (no per-packet malloc - see comment above). */
+    /* FIX (L11): reject oversized payloads instead of silently truncating.
+     * Silent truncation drops the tail of the audio packet - the receiver
+     * gets a short ADPCM frame and may decode garbage for the missing
+     * nibbles. main.c's MTU guard should prevent this, but a bug there
+     * would be masked here. */
     if (len > 1400)
-        len = 1400;
+    {
+        ESP_LOGW("rawtx", "payload %u > 1400, rejecting", (unsigned)len);
+        return ESP_ERR_INVALID_SIZE;
+    }
 
     size_t total_len = WIFI_HDR_LEN + len;
-    uint8_t *buf = malloc(total_len);
-    if (!buf)
-        return ESP_ERR_NO_MEM;
 
-    memcpy(buf, s_wifi_hdr, WIFI_HDR_LEN);
+    memcpy(s_frame_buf, s_wifi_hdr, WIFI_HDR_LEN);
 
     /* Update Sequence Control (bytes 22-23) for this packet.
      * Layout (little-endian): 12-bit seq num + 4-bit frag num.
@@ -134,18 +147,18 @@ esp_err_t rawtx_stream_send(const uint8_t *data, size_t len)
      *   byte 23 = seq_hi = (seq >> 4) & 0xFF
      * seq wraps at 4096 (12-bit). We never fragment, so frag stays 0. */
     uint16_t seq = s_wifi_seq++;
-    buf[22] = (uint8_t)(seq & 0x0F) << 4;   /* frag=0 | seq_lo */
-    buf[23] = (uint8_t)((seq >> 4) & 0xFF); /* seq_hi */
+    s_frame_buf[22] = (uint8_t)(seq & 0x0F) << 4;   /* frag=0 | seq_lo */
+    s_frame_buf[23] = (uint8_t)((seq >> 4) & 0xFF); /* seq_hi */
 
-    memcpy(buf + WIFI_HDR_LEN, data, len);
+    memcpy(s_frame_buf + WIFI_HDR_LEN, data, len);
 
-    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, buf, total_len, false);
-
-    free(buf);
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, s_frame_buf, total_len, false);
 
     if (err != ESP_OK)
     {
-        return ESP_FAIL;
+        /* FIX (L12): return the actual error so the caller can log it
+         * (e.g. ESP_ERR_WIFI_IF meaning "WiFi not started"). */
+        return err;
     }
     return ESP_OK;
 }
