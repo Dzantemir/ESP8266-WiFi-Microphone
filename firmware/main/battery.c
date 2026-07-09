@@ -36,13 +36,15 @@ static volatile uint32_t s_last_mv = 0;
 /* FIX (M26): the ESP8266 ADC driver is NOT reentrant. battery_get_voltage_mv
  * was previously callable from the AT task (cmd_batt_query) while the
  * monitor task was inside adc_read(), producing garbage readings or driver
- * corruption. Serialize all adc_read() calls with this mutex. */
+ * corruption. Serialize all adc_read() calls with this mutex.
+ *
+ * FIX (AUDIT-C2): the previous lazy-init in ensure_adc_mutex() had a race -
+ * two concurrent callers (AT task + monitor task) could both observe NULL,
+ * both create a mutex, and use different handles -> no mutual exclusion.
+ * The mutex is now created once in battery_init() before any caller can
+ * touch it. battery_get_voltage_mv() logs+returns the cached value if
+ * battery_init() was not called. */
 static SemaphoreHandle_t s_adc_mutex = NULL;
-static void ensure_adc_mutex(void)
-{
-    if (!s_adc_mutex)
-        s_adc_mutex = xSemaphoreCreateMutex();
-}
 
 esp_err_t battery_init(void)
 {
@@ -56,6 +58,14 @@ esp_err_t battery_init(void)
         ESP_LOGE(TAG, "ADC init failed: %s", esp_err_to_name(err));
         return err;
     }
+
+    s_adc_mutex = xSemaphoreCreateMutex();
+    if (!s_adc_mutex)
+    {
+        ESP_LOGE(TAG, "Failed to create ADC mutex");
+        return ESP_ERR_NO_MEM;
+    }
+
     ESP_LOGI(TAG, "Battery monitoring enabled (divider ratio=%u, critical=%u mV)",
              (unsigned)BATT_DIVIDER_RATIO, (unsigned)BATT_CRITICAL_MV);
     return ESP_OK;
@@ -65,11 +75,11 @@ uint32_t battery_get_voltage_mv(void)
 {
     /* FIX (M26): serialize ADC access so the AT task and monitor task can't
      * both call adc_read() at the same time. */
-    ensure_adc_mutex();
     if (!s_adc_mutex ||
         xSemaphoreTake(s_adc_mutex, pdMS_TO_TICKS(2000)) != pdTRUE)
     {
-        ESP_LOGW(TAG, "battery_get_voltage_mv: ADC mutex timeout");
+        ESP_LOGW(TAG, "battery_get_voltage_mv: ADC mutex unavailable "
+                      "(battery_init not called or mutex timeout)");
         return s_last_mv; /* return last cached value */
     }
 

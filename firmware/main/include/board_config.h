@@ -722,6 +722,16 @@ uint32_t i2s_capture_compute_frame_ms(uint32_t sample_rate, int channels,
 #if (BATT_START_MV <= BATT_CRITICAL_MV)
 #error "BATT_START_MV must be > BATT_CRITICAL_MV (boot deep-sleep threshold inverted)"
 #endif
+/* FIX (AUDIT-H19): battery_get_percent() in battery.c computes
+ * (4200U - BATT_CRITICAL_MV) as the denominator for linear interpolation.
+ * If BATT_CRITICAL_MV >= 4200, the unsigned subtraction underflows to
+ * ~4.29 billion and battery_get_percent() always returns 0 even with a
+ * full battery. Fail the build instead. 4200 mV is the standard Li-Ion
+ * full-charge voltage; if a different chemistry is used, update both
+ * this guard and battery_get_percent(). */
+#if (BATT_CRITICAL_MV >= 4200)
+#error "BATT_CRITICAL_MV must be < 4200 (full Li-Ion mV) - battery_get_percent() would underflow"
+#endif
 #endif
 
 

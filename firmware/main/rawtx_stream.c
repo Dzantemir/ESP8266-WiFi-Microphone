@@ -9,6 +9,10 @@
 /* ---- System / SDK includes ---- */
 #include <string.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"  /* FIX (AUDIT-HIGH): vTaskDelay() used at line ~53 is declared
+                             * in task.h, not FreeRTOS.h. Currently works only
+                             * via transitive inclusion from esp_wifi.h ->
+                             * esp_event.h -> task.h - fragile build dependency. */
 #include "esp_wifi.h"
 #include "esp_log.h"
 
@@ -35,7 +39,15 @@ static uint8_t s_wifi_hdr[WIFI_HDR_LEN];
  * Incremented per transmitted MSDU to allow receiver dedup. */
 static uint16_t s_wifi_seq = 0;
 
-static bool s_ready = false;
+/* FIX (AUDIT-LOW): s_ready is read by stream_task_fn (via transport_is_ready)
+ * from a different task than the one that writes it (rawtx_stream_init/deinit
+ * called from main loop). Mark volatile for the same reason as s_running in
+ * tcp_stream.c. */
+static volatile bool s_ready = false;
+
+/* FIX (AUDIT-MEDIUM): single source of truth for the payload size cap.
+ * Was a magic 1400 duplicated in s_frame_buf declaration and the len check. */
+#define RAWTX_MAX_PAYLOAD 1400
 
 /* Static frame buffer — single-threaded (only stream_task_fn calls
  * rawtx_stream_send via transport_send), so no mutex needed. Same approach
@@ -43,7 +55,7 @@ static bool s_ready = false;
  * at 66+ allocs/sec (15ms frames) — each alloc churns the ESP8266's small
  * heap and risks fragmentation over long streaming sessions.
  * Max frame = 24 (wifi hdr) + 1400 (payload) = 1424 bytes. */
-static uint8_t s_frame_buf[WIFI_HDR_LEN + 1400];
+static uint8_t s_frame_buf[WIFI_HDR_LEN + RAWTX_MAX_PAYLOAD];
 
 esp_err_t rawtx_stream_init(void)
 {
@@ -80,7 +92,13 @@ esp_err_t rawtx_stream_init(void)
     /* addr1 (bytes 4-9): Receiver Address = Broadcast */
     memset(&s_wifi_hdr[4], 0xFF, 6);
 
-    /* addr2 (bytes 10-15): Transmitter Address = our MAC */
+    /* addr2 (bytes 10-15): Transmitter Address = our MAC
+     *
+     * FIX (AUDIT-H4): do NOT fall back to a hardcoded MAC. If multiple
+     * devices ever hit this path, they all transmit with the same SA ->
+     * receivers cannot distinguish them, 802.11 dedup by (SA, seq)
+     * collides, and on-air interference results. Fail init instead so
+     * the operator notices. */
     uint8_t mac[6];
     if (esp_wifi_get_mac(WIFI_IF_STA, mac) == ESP_OK)
     {
@@ -88,9 +106,8 @@ esp_err_t rawtx_stream_init(void)
     }
     else
     {
-        ESP_LOGW(TAG, "Failed to get MAC, using default");
-        uint8_t def_mac[6] = {0x9C, 0x9C, 0x1F, 0x8D, 0xAA, 0xC5};
-        memcpy(&s_wifi_hdr[10], def_mac, 6);
+        ESP_LOGE(TAG, "Failed to get MAC - cannot init raw TX (unique SA required)");
+        return ESP_ERR_INVALID_STATE;
     }
 
     /* addr3 (bytes 16-21): BSSID = Broadcast.
@@ -131,9 +148,10 @@ esp_err_t rawtx_stream_send(const uint8_t *data, size_t len)
      * gets a short ADPCM frame and may decode garbage for the missing
      * nibbles. main.c's MTU guard should prevent this, but a bug there
      * would be masked here. */
-    if (len > 1400)
+    if (len > RAWTX_MAX_PAYLOAD)
     {
-        ESP_LOGW("rawtx", "payload %u > 1400, rejecting", (unsigned)len);
+        ESP_LOGW(TAG, "payload %u > %u, rejecting",
+                 (unsigned)len, (unsigned)RAWTX_MAX_PAYLOAD);
         return ESP_ERR_INVALID_SIZE;
     }
 
@@ -146,7 +164,11 @@ esp_err_t rawtx_stream_send(const uint8_t *data, size_t len)
      *   byte 22 = (frag << 0) | (seq_lo << 4)  - frag=0, seq_lo = seq & 0xF
      *   byte 23 = seq_hi = (seq >> 4) & 0xFF
      * seq wraps at 4096 (12-bit). We never fragment, so frag stays 0. */
-    uint16_t seq = s_wifi_seq++;
+    /* FIX (AUDIT-LOW): explicit 12-bit wrap to match the on-air field
+     * width (was uint16_t growing to 65535 then masked - worked but
+     * was misleading about the wrap point). */
+    uint16_t seq = s_wifi_seq;
+    s_wifi_seq = (uint16_t)((s_wifi_seq + 1) & 0x0FFF);
     s_frame_buf[22] = (uint8_t)(seq & 0x0F) << 4;   /* frag=0 | seq_lo */
     s_frame_buf[23] = (uint8_t)((seq >> 4) & 0xFF); /* seq_hi */
 

@@ -21,6 +21,7 @@
  */
 
 /* ---- System / SDK includes ---- */
+#include <string.h>   /* FIX (AUDIT-C3): memcpy used in 16-bit swap/sign-extend loop */
 #include "freertos/FreeRTOS.h"
 #include "driver/i2s.h"
 #include "esp_log.h"
@@ -368,6 +369,15 @@ esp_err_t i2s_capture_init(uint32_t sample_rate, int bits, int comm_format,
 
 void i2s_capture_apply_timing(int sd_delay, int ws_delay, int bck_delay)
 {
+    /* FIX (AUDIT-H20): bail out if i2s_capture_init() has not been called
+     * (or deinit() was just called). Writing to I2S0.timing.* before
+     * i2s_driver_install() is undefined (peripheral clock may be off);
+     * the value is silently lost on the next init. */
+    if (!s_initialized)
+    {
+        ESP_LOGW(TAG, "i2s_capture_apply_timing ignored - not initialized");
+        return;
+    }
     /* TRM §10.2.1.6: каждый поле 2 бита (0..3). Маскируем на всякий случай. */
     I2S0.timing.rx_sd_in_delay  = sd_delay  & 0x3;
     I2S0.timing.rx_ws_in_delay  = ws_delay  & 0x3;
@@ -385,7 +395,7 @@ esp_err_t i2s_capture_deinit(void)
     esp_err_t err = i2s_driver_uninstall(I2S_PORT);
     if (err != ESP_OK)
     {
-        ESP_LOGW("i2s_capture", "i2s_driver_uninstall: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "i2s_driver_uninstall: %s", esp_err_to_name(err));
         return err;
     }
     s_initialized = false;
@@ -480,7 +490,54 @@ static void apply_agc(int32_t *buf, int n)
 }
 
 /* ---- Fixed gain implementation ----
- * Applied when AGC is off and s_gain > 0. s_gain=0 means bypass. */
+ * Applied when AGC is off and s_gain > 0. s_gain=0 means bypass.
+ *
+ * FIX (AUDIT-GAIN-CONSISTENCY): the previous FIX (M1) bypassed fixed
+ * gain entirely in 16-bit mode, claiming 'applying gain=32 saturates any
+ * sample |val|>=1023, clipping speech/music'. While technically true,
+ * this created an unexpected loudness jump when switching AT+BITS=16
+ * <-> AT+BITS=24 with ADPCM: 24-bit mode applied +30 dB, 16-bit mode
+ * applied 0 dB. Now fixed gain is applied in BOTH modes with proper
+ * clamping.
+ *
+ * WHY 24-bit PCM sounds louder than 16-bit PCM at the same gain:
+ *
+ * The signal path differs by codec, not just bit depth:
+ *
+ *   ADPCM (16 or 24-bit capture):
+ *     capture -> apply_fixed_gain -> dither_buffer_24_to_16 OR
+ *     dither_buffer_passthrough -> ADPCM encode (always 16-bit domain)
+ *     Both bit depths end up in 16-bit domain after dither, so gain=N
+ *     produces roughly the same loudness. The dither normalizes the
+ *     levels (24-bit samples get >>8 with TPDF noise shaping).
+ *
+ *   PCM 24-bit:
+ *     capture -> apply_fixed_gain -> memcpy int32 DIRECTLY (no dither!)
+ *     -> emit 3 bytes/sample -> server plays as 24-bit WaveOut
+ *     The full 24-bit dynamic range is preserved. gain=32 can lift a
+ *     -30 dBFS signal to 0 dBFS (full 24-bit scale = ±8388607) without
+ *     clipping. Server reproduces this at FULL 24-bit amplitude -> very
+ *     loud.
+ *
+ *   PCM 16-bit:
+ *     capture -> apply_fixed_gain -> emit 2 bytes/sample -> server
+ *     plays as 16-bit WaveOut. gain=32 clips anything >= 1024 (-30 dBFS)
+ *     to ±32767 -> heavily distorted AND loud, but with less dynamic
+ *     range than 24-bit.
+ *
+ * Net effect: at the same gain setting, 24-bit PCM is louder AND cleaner
+ * because the 24-bit headroom lets gain work without distortion. 16-bit
+ * PCM at the same gain is loud but clipped.
+ *
+ * Recommendation for consistent loudness across bit depths / codecs:
+ *   - Use AGC (AT+AGC=3 or higher). AGC targets -18 dBFS in BOTH 16-bit
+ *     (1<<12 = 4096) and 24-bit (1<<20 = 1048576) domains, so loudness
+ *     is automatically matched.
+ *   - For fixed gain: 24-bit PCM use gain=32 (typical); 16-bit PCM use
+ *     gain=4-8 (higher causes heavy clipping). ADPCM either is fine
+ *     (dither normalizes).
+ *   - 24-bit PCM at gain=32 will ALWAYS sound louder than 16-bit PCM at
+ *     any gain, because 24-bit preserves 256x more dynamic range. */
 static void apply_fixed_gain(int32_t *buf, int n)
 {
     if (s_gain == 0)
@@ -529,32 +586,69 @@ esp_err_t i2s_capture_read(int32_t *buf, int buf_len, int *samples_read)
          * Both halves carry real samples (in ONLY_LEFT mode both slots
          * capture the left channel; in RIGHT_LEFT stereo they carry L/R).
          * Mono: swap pairs (little-endian). Stereo: already interleaved.
-         * Then sign-extend int16 -> int32. */
-        int16_t *s = (int16_t *)buf;
+         * Then sign-extend int16 -> int32.
+         *
+         * FIX (AUDIT-C3): the previous code aliased int32_t[] through
+         * int16_t* which is a strict-aliasing violation (UB at -O2 with
+         * -fstrict-aliasing). Use memcpy + uint32_t scratch instead.
+         *
+         * FIX (AUDIT-H21): the previous swap loop iterated while
+         * i+1<n; for odd n the last sample was not swapped but was
+         * still sign-extended (from the wrong DMA half). Round n down
+         * to even for the swap; for odd trailing sample, copy the hi16
+         * of the last DMA word into the lo16 slot before sign-extend. */
         if (s_channels == 1)
         {
-            for (int i = 0; i + 1 < n; i += 2)
+            int n_swap = n & ~1;
+            for (int i = 0; i + 1 < n_swap; i += 2)
             {
-                int16_t t = s[i];
-                s[i] = s[i + 1];
-                s[i + 1] = t;
+                /* Read both 16-bit halves of buf[i/2] via memcpy. */
+                uint32_t dw;
+                memcpy(&dw, &buf[i / 2], sizeof(uint32_t));
+                int16_t lo = (int16_t)(dw & 0xFFFFu);
+                int16_t hi = (int16_t)((dw >> 16) & 0xFFFFu);
+                /* Write back swapped. */
+                uint32_t ndw = ((uint32_t)(uint16_t)hi) |
+                               ((uint32_t)(uint16_t)lo << 16);
+                memcpy(&buf[i / 2], &ndw, sizeof(uint32_t));
+            }
+            /* For odd n, the last DMA word's hi16 holds the last real
+             * sample; lo16 is stale. Move hi16 -> lo16 so the sign-
+             * extend loop below picks the right half. */
+            if (n & 1)
+            {
+                uint32_t dw;
+                memcpy(&dw, &buf[(n - 1) / 2], sizeof(uint32_t));
+                int16_t hi = (int16_t)((dw >> 16) & 0xFFFFu);
+                dw = (dw & 0xFFFF0000u) | (uint32_t)(uint16_t)hi;
+                memcpy(&buf[(n - 1) / 2], &dw, sizeof(uint32_t));
             }
         }
+        /* Sign-extend int16 -> int32, walking from the end so we don't
+         * clobber DMA words we still need to read. Use memcpy to read
+         * the lo16 of each 32-bit slot without aliasing. */
         for (int i = n - 1; i >= 0; i--)
-            buf[i] = (int32_t)s[i];
+        {
+            uint32_t dw;
+            memcpy(&dw, &buf[i / 2], sizeof(uint32_t));
+            int16_t v = (i & 1) ? (int16_t)((dw >> 16) & 0xFFFFu)
+                                : (int16_t)(dw & 0xFFFFu);
+            buf[i] = (int32_t)v;
+        }
 
         /* Apply AGC (if enabled) or fixed gain (if gain > 0).
-         * FIX (M1): skip fixed gain in 16-bit mode. board_config.h documents
-         * gain as "Applied to 24-bit sample before TPDF dither, only in
-         * 24-bit mode". In 16-bit mode the samples are already at correct
-         * level; applying gain=32 saturates any sample |val|>=1023 (~-30
-         * dBFS), clipping speech/music. AGC is fine in both modes because
-         * it targets a level, not a fixed multiplier. */
+         * FIX (AUDIT-GAIN-CONSISTENCY): previously fixed gain was bypassed
+         * in 16-bit mode (see old FIX M1 comment). Now it's applied in both
+         * modes with proper clamping — see apply_fixed_gain() comment for
+         * why 24-bit still ends up louder (more headroom survives gain). */
         if (s_agc_mode != AGC_MODE_OFF)
         {
             apply_agc(buf, n);
         }
-        /* else: 16-bit + AGC off = bypass. No fixed gain. */
+        else
+        {
+            apply_fixed_gain(buf, n);
+        }
         *samples_read = n;
     }
     else

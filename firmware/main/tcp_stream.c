@@ -21,6 +21,12 @@
 #include "tcp_stream.h"
 #include "svc_port.h" /* FIX (H1): for svc_port_get_server_ip() */
 
+
+
+#ifndef IPTOS_DSCP_EF
+#define IPTOS_DSCP_EF 0xB8
+#endif
+
 static const char *TAG = "tcp_stream";
 
 /* Listening socket (accept). */
@@ -31,7 +37,11 @@ static int s_client_sock = -1;
 static uint16_t s_listen_port = 0;
 /* Accept task handle. */
 static TaskHandle_t s_accept_task = NULL;
-static bool s_running = false;
+/* FIX (AUDIT-MEDIUM): s_running is read by the accept task in a loop and
+ * written by tcp_stream_deinit() from another task. Mark volatile so
+ * the compiler doesn't hoist the read out of the while(s_running) loop
+ * (FreeRTOS convention for cross-task flag variables). */
+static volatile bool s_running = false;
 
 /* FIX (Bug #2): mutex guarding s_client_sock. Previously the accept task
  * (tcp_accept_task_fn) and the send path (tcp_stream_send) both read/wrote
@@ -96,7 +106,6 @@ static void tcp_accept_task_fn(void *arg)
          *   Does NOT depend on WiFi QoS; it's a standard socket option.
          * - IP_TOS: Expedited Forwarding (voice priority in IP header).
          *   Routers with QoS may prioritize this traffic class.
-         * - SO_SNDBUF 4 KB: send buffer for burst absorption.
          * - SO_SNDTIMEO: blocking send timeout (TCP_SEND_TIMEOUT_MS from
          *   menuconfig, default 2000 ms). On timeout -> close + reconnect.
          * - SO_KEEPALIVE (M7/T4): half-open detection during silence.
@@ -108,17 +117,13 @@ static void tcp_accept_task_fn(void *arg)
         if (setsockopt(new_sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) != 0)
             ESP_LOGW(TAG, "TCP_NODELAY setsockopt failed: errno=%d", errno);
 
-#ifndef IPTOS_DSCP_EF
-#define IPTOS_DSCP_EF 0xB8
-#endif
         int tos = IPTOS_DSCP_EF;
         if (setsockopt(new_sock, IPPROTO_IP, IP_TOS, &tos, sizeof(tos)) != 0)
             ESP_LOGW(TAG, "IP_TOS setsockopt failed: errno=%d", errno);
 
-        // int sndbuf = 4096;
-        // if (setsockopt(new_sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) != 0)
-        //     ESP_LOGW(TAG, "SO_SNDBUF setsockopt failed: errno=%d", errno);
-
+        // FIX (AUDIT-LOW): SO_SNDBUF block removed - was commented out but
+        // the comment at line ~99 still referenced "SO_SNDBUF 4 KB" as if
+        // active. Default lwIP send buffer is fine for audio frame sizes.
         struct timeval sndto = {.tv_sec = TCP_SEND_TIMEOUT_MS / 1000,
                                 .tv_usec = (TCP_SEND_TIMEOUT_MS % 1000) * 1000};
         if (setsockopt(new_sock, SOL_SOCKET, SO_SNDTIMEO, &sndto, sizeof(sndto)) != 0)
@@ -147,10 +152,27 @@ static void tcp_accept_task_fn(void *arg)
          * New order: under mutex, shutdown+close old FIRST (so any in-flight
          * send() on old fails fast with EPIPE/ENOTCONN, which the send path
          * handles), THEN publish new_sock. The send path always re-reads
-         * s_client_sock under the mutex, so it never races. */
+         * s_client_sock under the mutex, so it never races.
+         *
+         * FIX (AUDIT-H1): re-check s_running under the mutex BEFORE
+         * installing the new client. If tcp_stream_deinit() ran between
+         * accept() returning and us reaching this point, s_running is now
+         * false and we must NOT install a new client (deinit already
+         * closed everything and nulled s_accept_task). Without this
+         * check, the new client socket leaks + accept task handle is
+         * already NULL, leaving no way to track the zombie task. */
         int old;
         if (s_client_mutex && xSemaphoreTake(s_client_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
         {
+            if (!s_running)
+            {
+                /* deinit won the race — refuse the new client and exit. */
+                xSemaphoreGive(s_client_mutex);
+                ESP_LOGW(TAG, "accept: s_running cleared during accept, refusing new client");
+                shutdown(new_sock, SHUT_RDWR);
+                close(new_sock);
+                break;
+            }
             old = s_client_sock;
             if (old >= 0)
             {
@@ -433,15 +455,24 @@ bool tcp_stream_is_ready(void)
 }
 
 /* Static frame buffer — single-threaded (only tcp_send_task calls this),
- * so no mutex needed. Max frame = 2 (len prefix) + 1416 (header + payload). */
-static uint8_t s_frame_buf[2 + 1416];
+ * so no mutex needed. Max frame = 2 (len prefix) + TCP_MAX_PAYLOAD (header + payload).
+ *
+ * FIX (AUDIT-MEDIUM): single source of truth for the TCP payload cap. Was
+ * a literal 1416 duplicated in s_frame_buf declaration and the len check
+ * in tcp_stream_send; if one changes without the other, memcpy overflows. */
+#define TCP_MAX_PAYLOAD 1416
+static uint8_t s_frame_buf[2 + TCP_MAX_PAYLOAD];
 
 esp_err_t tcp_stream_send(const uint8_t *data, size_t len)
 {
     if (!data || !len)
         return ESP_ERR_INVALID_ARG;
-    if (len > 1416)
-        return ESP_ERR_INVALID_ARG;
+    /* FIX (AUDIT-MEDIUM): use the named constant; was a magic 1416.
+     * FIX (AUDIT-MEDIUM): return ESP_ERR_INVALID_SIZE (not INVALID_ARG) -
+     * the argument is valid, only its size exceeds the limit. Matches
+     * rawtx_stream.c and udp_stream.c semantics. */
+    if (len > TCP_MAX_PAYLOAD)
+        return ESP_ERR_INVALID_SIZE;
 
     /* FIX (Bug #2): snapshot the client fd under the mutex. The accept
      * task may swap s_client_sock to a new fd at any moment (new client
@@ -492,14 +523,24 @@ esp_err_t tcp_stream_send(const uint8_t *data, size_t len)
              * number may have been reused by lwIP for a different socket,
              * and close(sock) would close THAT socket → memory leak/corruption.
              * This was the root cause of the 30KB heap drop: each failed
-             * send did a double-close, leaking PCBs and pbufs in lwIP. */
-            ESP_LOGW(TAG, "send() failed: errno=%d (sent=%u/%u) -- closing client",
-                     errno, (unsigned)sent, (unsigned)frame_len);
+             * send did a double-close, leaking PCBs and pbufs in lwIP.
+             *
+             * FIX (AUDIT-LOW): save errno immediately - ESP_LOGW and
+             * mutex operations may clobber it before we log.
+             * FIX (AUDIT-HIGH): increment s_drop_count (was dead counter).
+             * FIX (AUDIT-MEDIUM): shutdown() before close() for symmetric
+             * cleanup with all other close paths in this file. */
+            int saved_errno = errno;
+            s_drop_count++;
+            ESP_LOGW(TAG, "send() failed: errno=%d (sent=%u/%u, drops=%u) -- closing client",
+                     saved_errno, (unsigned)sent, (unsigned)frame_len,
+                     (unsigned)s_drop_count);
             if (s_client_mutex && xSemaphoreTake(s_client_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
             {
                 if (s_client_sock == sock)
                 {
                     /* Our snapshot still matches - close it. */
+                    shutdown(s_client_sock, SHUT_RDWR);
                     close(s_client_sock);
                     s_client_sock = -1;
                 }
@@ -525,11 +566,14 @@ esp_err_t tcp_stream_send(const uint8_t *data, size_t len)
         if (w == 0)
         {
             /* Connection closed by peer. Same logic as above. */
-            ESP_LOGW(TAG, "send() returned 0 -- connection closed by peer");
+            s_drop_count++;
+            ESP_LOGW(TAG, "send() returned 0 -- connection closed by peer (drops=%u)",
+                     (unsigned)s_drop_count);
             if (s_client_mutex && xSemaphoreTake(s_client_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
             {
                 if (s_client_sock == sock)
                 {
+                    shutdown(s_client_sock, SHUT_RDWR);
                     close(s_client_sock);
                     s_client_sock = -1;
                 }

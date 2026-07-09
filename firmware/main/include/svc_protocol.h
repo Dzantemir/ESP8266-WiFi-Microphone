@@ -88,6 +88,11 @@ typedef struct __attribute__((packed)) svc_info_payload {
     uint32_t packets_sent;  /* since stream start */
     uint32_t free_heap;     /* current free heap */
     int8_t   wifi_rssi;     /* dBm */
+    /* NOTE (AUDIT-LOW): firmware[8] only holds 7 chars + NUL. FIRMWARE_VERSION
+     * is currently "v2.2" (fits), but bumping to e.g. "v10.5" or "v2.10"
+     * would silently truncate via strncpy. Bump INFO_PAYLOAD_SZ too if you
+     * enlarge this field (it's a wire-protocol change - old receivers will
+     * reject the larger INFO packet). */
     char     firmware[8];   /* FIRMWARE_VERSION */
     uint8_t  bits_per_sample; /* 16 or 24 (from NVS config) */
     uint8_t  transport_mode;  /* v2.1: 0=UDP, 1=TCP, 2=Raw 802.11 TX */

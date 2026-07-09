@@ -36,6 +36,10 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
+/* FIX (AUDIT-MEDIUM): explicit include - the file uses tcpip_adapter_ip_info_t
+ * and tcpip_adapter_get_ip_info() directly. Was relying on transitive
+ * inclusion from esp_wifi.h, which is fragile across SDK upgrades. */
+#include "tcpip_adapter.h"
 
 /* ---- Project includes ---- */
 #include "board_config.h"
@@ -235,6 +239,13 @@ static void at_process_line(const char *line, int len)
         line++;
         len--;
     }
+
+    /* FIX (AUDIT-LOW): re-check len after the strip. A whitespace-only line
+     * (e.g. "AT \r") would otherwise fall through to strncasecmp and return
+     * ERROR, violating ITU-T V.250 which says AT commands with only
+     * whitespace should be silently ignored. */
+    if (len == 0)
+        return;
 
     if (strcasecmp(line, "AT") == 0)
     {
@@ -503,9 +514,15 @@ static void cmd_rst(void)
      * That freed resources in use by the main task -> crash, lwIP
      * corruption, hard fault before esp_restart() fired.
      *
-     * New approach: request a RESTART via the event group. The main loop
-     * processes it after any in-flight start/stop completes, then performs
-     * the clean teardown itself. */
+     * FIX (AUDIT-H8): even with the 5s wait above, if the main loop is still
+     * inside start_streaming() when the wait times out, calling
+     * transport_deinit/i2s_capture_deinit/wifi_sta_deinit from THIS task
+     * re-introduces exactly the C2 crash. The safe path is to just call
+     * esp_restart() - the SDK will tear down everything cleanly as part of
+     * the reboot, and the main loop never sees its resources disappear
+     * mid-operation. We still call streaming_request_stop() first to give
+     * the pipeline a chance to wind down gracefully (less chance of
+     * orphaned lwIP mutexes across the reboot). */
     if (streaming_is_active())
     {
         streaming_request_stop();
@@ -517,16 +534,13 @@ static void cmd_rst(void)
         }
         if (streaming_is_active())
         {
-            ESP_LOGW(TAG, "AT+RST: stream stop timeout - proceeding anyway");
+            ESP_LOGW(TAG, "AT+RST: stream still active after 5s - rebooting anyway "
+                          "(SDK will tear down hardware)");
         }
     }
 
-    /* Now safe: main loop is back in xEventGroupWaitBits, no resources
-     * are in flight. */
-    transport_deinit();  /* close active transport (UDP/TCP/RawTX) */
-    i2s_capture_deinit(); /* stop I2S DMA, uninstall driver */
-    wifi_sta_deinit();    /* stop WiFi radio, uninstall driver */
-
+    /* Reboot. The SDK tears down WiFi/I2S/transport as part of reboot,
+     * which is safe even if the main loop is mid-start_streaming(). */
     vTaskDelay(pdMS_TO_TICKS(100)); /* let hardware settle */
     esp_restart();
 }
@@ -565,7 +579,7 @@ static void cmd_help(void)
     at_send_str("+HELP:AT+RATE?       - show sample rate\r\n");
     at_send_str("+HELP:AT+RATE=n      - set rate 8000/11025/16000/22050/32000/44100/48000\r\n");
     at_send_str("+HELP:AT+GAIN?       - show digital gain (0-64)\r\n");
-    at_send_str("+HELP:AT+GAIN=n      - set gain 0-64 (0=bypass, 32=+30dB, auto-save, hotrestart)\r\n");
+    at_send_str("+HELP:AT+GAIN=n      - set gain 0-64 (0=bypass, 32=+30dB, 16bit:use 4-8)\r\n");
     at_send_str("+HELP:AT+AGC?        - show AGC mode (0-8 presets)\r\n");
     at_send_str("+HELP:AT+AGC=0..8    - set AGC preset (0=off 1=studio 2=podcast 3=balanced 4=fast 5=noisy 6=music 7=limiter 8=surv)\r\n");
     at_send_str("+HELP:AT+CODEC?      - show codec (0=ADPCM, 1=PCM)\r\n");
@@ -573,7 +587,7 @@ static void cmd_help(void)
     at_send_str("+HELP:AT+WCH?        - show wifi channel (1-13)\r\n");
     at_send_str("+HELP:AT+WCH=n       - set wifi channel 1-13 (auto-save, raw TX only)\r\n");
     at_send_str("+HELP:AT+XPORT?      - show transport (0=UDP 1=TCP 2=RawTX)\r\n");
-    at_send_str("+HELP:AT+XPORT=0|1|2 - set transport (auto-save, hotrestart)\r\n");
+    at_send_str("+HELP:AT+XPORT=0|1|2 - set transport (HOTRESTART/RST to apply)\r\n");
     at_send_str("+HELP:AT+TIMING?     - show I2S RX input delays (sd,ws,bck)\r\n");
     at_send_str("+HELP:AT+TIMING=s,w,b - set I2S RX delays 0-3 each (auto-save, hotrestart)\r\n");
 #if BATTERY_ENABLED
@@ -661,6 +675,22 @@ static void cmd_wifi_set(const char *args)
         at_send_data("+ERR:ssid and password required\r\n");
         at_send_error();
         return;
+    }
+
+    /* FIX (AUDIT-MEDIUM): validate WPA2 password length per IEEE 802.11i
+     * (8-63 chars). Without this, a 1-7 char password is accepted, saved
+     * to NVS, and the device silently fails at WiFi association with no
+     * clear error. The old credentials are already overwritten, so the
+     * device is bricked WiFi-wise until a valid password is set. */
+    {
+        size_t plen = strlen(pwd);
+        if (plen < 8 || plen > 63)
+        {
+            at_send_data("+ERR:password must be 8-63 chars (got %u)\r\n",
+                         (unsigned)plen);
+            at_send_error();
+            return;
+        }
     }
 
     esp_err_t err = config_set_wifi(ssid, pwd);
@@ -1136,6 +1166,22 @@ static void cmd_xport_set(const char *args)
         return;
     }
 
+    /* FIX (AUDIT-XPORT-CRASH): capture the CURRENTLY ACTIVE transport
+     * BEFORE overwriting NVS. The message we print depends on whether the
+     * transition crosses the WiFi-mode boundary (AP-associated vs. raw-radio):
+     *   - UDP <-> TCP (both AP-associated): applied via AT+HOTRESTART or AT+RST.
+     *     Server stop+start does NOT apply it (stream continues on old transport).
+     *   - Any transition involving RAWTX (in either direction): AT+RST is
+     *     required, because the WiFi driver must be reinit in a different
+     *     mode and on-the-fly deinit crashes on ESP8266 RTOS SDK v3.4.
+     * 'active' is what the device is actually running right now (set at
+     * boot or last successful start_streaming). If the user did XPORT but
+     * not HOTRESTART yet, 'active' still reflects the old mode — that's
+     * what we want for the message. */
+    uint8_t active = stream_mode_current_transport();
+    bool crosses_wifi_boundary = (active == TRANSPORT_MODE_RAWTX) ||
+                                 (val == TRANSPORT_MODE_RAWTX);
+
     esp_err_t err = config_set_transport_mode((uint8_t)val);
     if (err != ESP_OK)
     {
@@ -1144,7 +1190,26 @@ static void cmd_xport_set(const char *args)
         return;
     }
 
-    at_send_data("+XPORT:set to %ld (saved, use AT+HOTRESTART to apply)\r\n", val);
+    /* FIX (AUDIT-XPORT-CRASH): no on-the-fly WiFi mode switching.
+     * - UDP(0) / TCP(1): both use the same AP-associated WiFi mode. The
+     *   change is applied ONLY by AT+HOTRESTART (user explicit) or AT+RST.
+     *   Server stop+start does NOT apply it - the stream continues on the
+     *   old transport until the user explicitly requests the change.
+     * - RAWTX(2): uses a fundamentally different WiFi mode (raw radio, no
+     *   AP, fixed channel + 11B protocol + 11M rate). Switching to OR FROM
+     *   RAWTX requires a full WiFi driver reinit, which on ESP8266 RTOS
+     *   SDK v3.4 has a race condition that crashes. The user must do
+     *   AT+RST (full reboot) to apply. */
+    if (crosses_wifi_boundary)
+    {
+        at_send_data("+XPORT:set to %ld (saved, use AT+RST to apply)\r\n", val);
+    }
+    else
+    {
+        /* UDP <-> TCP: applied via AT+HOTRESTART or AT+RST. Server stop+start
+         * does NOT apply it. */
+        at_send_data("+XPORT:set to %ld (saved, use AT+HOTRESTART or AT+RST to apply)\r\n", val);
+    }
     at_send_ok();
 }
 
@@ -1275,17 +1340,28 @@ static void cmd_hotrestart(void)
      *
      * Stops the current stream and starts a new one with the current NVS
      * config. This lets audio parameter changes (AT+RATE, AT+BITS, AT+FMT,
-     * AT+CH, AT+GAIN, AT+AGC, AT+CODEC) take effect immediately without a
-     * full ~1s reboot.
+     * AT+CH, AT+GAIN, AT+AGC, AT+CODEC, AT+WCH) take effect immediately
+     * without a full ~1s reboot.
+     *
+     * AT+XPORT behavior:
+     *   - UDP <-> TCP (XPORT=0/1): applied on the fly by HOTRESTART (both
+     *     share the same AP-associated WiFi path, only sockets are swapped).
+     *   - Any transition involving RAWTX (XPORT=2): NOT applied by HOTRESTART.
+     *     start_streaming() keeps the OLD transport and logs a warning.
+     *     AT+HOTRESTART still applies all OTHER settings (audio, WiFi ch).
+     *     To actually switch to/from RAWTX, the user must do AT+RST.
+     *
+     * IMPORTANT: server-initiated stop+start (CMD_STOP + CONFIGURE) does NOT
+     * apply a pending AT+XPORT change. Only AT+HOTRESTART (explicit user
+     * action) or AT+RST (reboot) may apply it. This prevents the server
+     * from triggering an unwanted transport switch when it does its routine
+     * stop+start (e.g. after a TCP send error).
      *
      * ONLY works when the stream is currently active. If the stream is
      * already stopped (e.g., after CMD_STOP from server), this command
      * does nothing - the saved params will apply naturally on the next
      * stream start. This prevents HOTRESTART from overriding an
-     * intentional stop.
-     *
-     * Does NOT reload NVS-only boot params like WiFi SSID, transport_mode,
-     * or svc_port - for those, use AT+RST (full reboot). */
+     * intentional stop. */
     if (!streaming_is_active())
     {
         /* FIX (L32): return ERROR instead of OK when the request did

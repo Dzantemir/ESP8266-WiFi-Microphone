@@ -30,6 +30,7 @@
 #include "svc_port.h"
 #include "svc_protocol.h"
 #include "config_mgr.h"
+#include "stream_mode.h"   /* FIX (AUDIT-XPORT-AUTOAPPLY): stream_mode_current_transport() */
 #include "lwip/def.h" /* ntohs() */
 
 extern uint32_t streaming_get_frame_ms(void);
@@ -136,10 +137,23 @@ esp_err_t svc_port_init(uint16_t port, void *stream_evt_grp)
         return ESP_ERR_NO_MEM;
     }
 
-    /* Get MAC address. */
-    esp_wifi_get_mac(ESP_IF_WIFI_STA, s_mac);
-    ESP_LOGI(TAG, "MAC: %02X:%02X:%02X:%02X:%02X:%02X",
-             s_mac[0], s_mac[1], s_mac[2], s_mac[3], s_mac[4], s_mac[5]);
+    /* Get MAC address.
+     * FIX (AUDIT-LOW): check the return - if WiFi is not yet initialized
+     * when svc_port_init runs, s_mac stays all-zeros and INFO packets
+     * report MAC 00:00:00:00:00:00, which receivers may reject or log
+     * as malformed. */
+    esp_err_t mac_err = esp_wifi_get_mac(ESP_IF_WIFI_STA, s_mac);
+    if (mac_err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "esp_wifi_get_mac failed: %s - INFO will report 00:...",
+                 esp_err_to_name(mac_err));
+        memset(s_mac, 0, sizeof(s_mac));
+    }
+    else
+    {
+        ESP_LOGI(TAG, "MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+                 s_mac[0], s_mac[1], s_mac[2], s_mac[3], s_mac[4], s_mac[5]);
+    }
 
     update_broadcast_addr();
 
@@ -208,7 +222,21 @@ esp_err_t svc_port_init(uint16_t port, void *stream_evt_grp)
 
 bool svc_port_is_running(void)
 {
-    return s_state != SVC_STOPPED;
+    /* FIX (AUDIT-H6): read s_state under the mutex for acquire/release
+     * semantics. svc_task_fn reads s_state under the mutex; an unsynchronized
+     * read here could observe a stale value during a state transition. */
+    bool running = false;
+    if (s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE)
+    {
+        running = (s_state != SVC_STOPPED);
+        xSemaphoreGive(s_mutex);
+    }
+    else
+    {
+        /* Best-effort fallback if mutex is contended (e.g. deinit holds it). */
+        running = (s_state != SVC_STOPPED);
+    }
+    return running;
 }
 
 /* FIX (H7): full teardown of the service port. Used when switching to a
@@ -348,6 +376,12 @@ void svc_port_notify_streaming_started(void)
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_state = SVC_STREAMING;
     s_last_discover_ticks = now_ticks();
+    /* FIX (AUDIT-MEDIUM): clear any stale error code from a previous stream
+     * (e.g. SVC_ERR_WATCHDOG from a watchdog timeout). Without this, INFO
+     * packets would report ERROR indefinitely after a single watchdog
+     * event - the receiver may refuse to reconfigure a device reporting
+     * ERROR. A fresh stream start means the device is healthy again. */
+    s_error_code = SVC_ERR_NONE;
     xSemaphoreGive(s_mutex);
     ESP_LOGI(TAG, "Streaming started - DISCOVER watchdog active (%d s timeout), "
                   "periodic INFO every %d s",
@@ -568,7 +602,19 @@ static void send_to(const uint8_t *data, size_t len,
                           (struct sockaddr *)&addr, sizeof(addr));
     if (sent < 0)
     {
-        if (errno == 118 /* ENETUNREACH/EHOSTUNREACH */)
+        /* FIX (AUDIT-MEDIUM): compare against symbolic errno names instead
+         * of the magic number 118. The comment was ambiguous - on ESP8266
+         * RTOS SDK v3.4 both ENETUNREACH and EHOSTUNREACH can fire during
+         * WiFi (re)association, and the numeric value comes from newlib/lwip
+         * which can differ from Linux. Provide fallback to 118 in case the
+         * toolchain's errno.h doesn't define them (older SDKs). */
+#ifndef ENETUNREACH
+#define ENETUNREACH 118
+#endif
+#ifndef EHOSTUNREACH
+#define EHOSTUNREACH 118
+#endif
+        if (errno == ENETUNREACH || errno == EHOSTUNREACH)
         {
             if (!s_no_route_logged)
             {
@@ -598,7 +644,14 @@ static void build_info_payload(svc_info_payload_t *info)
     info->sample_rate = cfg.sample_rate;
     info->frame_ms = streaming_get_frame_ms();
     info->bits_per_sample = cfg.bits_per_sample;
-    info->transport_mode = cfg.transport_mode;
+    /* FIX (AUDIT-XPORT-AUTOAPPLY): report the ACTIVE transport, not the NVS
+     * value. AT+XPORT saves to NVS but does NOT switch immediately - the
+     * stream continues on the old transport until AT+HOTRESTART or AT+RST.
+     * If we reported cfg.transport_mode (NVS), the server would see the new
+     * transport while the stream is still on the old one, and could try to
+     * auto-switch (causing interruptions). By reporting the ACTIVE transport,
+     * the server always sees what's actually running. */
+    info->transport_mode = stream_mode_current_transport();
 
     /* FIX (L22): capture s_state into a local inside the mutex and use the
      * local after release. The previous code re-read s_state without the
@@ -632,7 +685,12 @@ static void build_info_payload(svc_info_payload_t *info)
     }
     info->wifi_rssi = rssi;
 
+    /* FIX (AUDIT-LOW): explicit NUL-terminate (matches the hostname pattern
+     * 3 lines below). Currently safe due to the memset(info, 0, sizeof(*info))
+     * earlier in this function, but if that memset is ever removed the
+     * strncpy could leave the field unterminated. */
     strncpy(info->firmware, FIRMWARE_VERSION, sizeof(info->firmware) - 1);
+    info->firmware[sizeof(info->firmware) - 1] = '\0';
 
     /* v2.2: hostname for display in receiver UI (NUL-terminated, max 32 chars). */
     strncpy(info->hostname, cfg.hostname, sizeof(info->hostname) - 1);
@@ -719,7 +777,17 @@ static void handle_discover(const svc_header_t *hdr,
 
     if (streaming)
     {
-        /* Heartbeat - no response, just reset watchdog. */
+        /* Heartbeat - no response, just reset watchdog.
+         *
+         * FIX (AUDIT-XPORT-AUTOAPPLY): do NOT send INFO when streaming.
+         * The INFO payload contains the current transport_mode. If the user
+         * did AT+XPORT=1 (saved to NVS but not applied), the INFO would
+         * report transport_mode=1 (TCP) even though the stream is still
+         * running on UDP. The server's (now-removed) AUTOTRANSPORT logic
+         * would see the change and auto-restart the stream, interrupting
+         * it. By not sending INFO during streaming, the server only learns
+         * about transport changes when the user explicitly stops and
+         * restarts the stream. */
         return;
     }
 
@@ -802,27 +870,60 @@ static void handle_configure(const svc_header_t *hdr, const uint8_t *payload,
          * timeout (50 ms) in a loop, calling recvfrom() between polls so
          * the service channel keeps working. Total wait still bounded by
          * SVC_RECONFIGURE_STOP_TIMEOUT_MS. */
-        xEventGroupSetBits(s_stream_evt_grp, STREAM_EVT_STOP_REQ);
+        /* FIX (AUDIT-MEDIUM): clear s_stop_done_sem BEFORE setting STOP_REQ.
+         * The previous order (STOP_REQ then clear) had a lost-wakeup race:
+         * if the main loop processed STOP_REQ and called
+         * svc_port_notify_stop_complete (which gives the sem) between the
+         * two lines, the signal was consumed and lost, then handle_configure
+         * waited the full SVC_RECONFIGURE_STOP_TIMEOUT_MS for a signal that
+         * already fired - adding 2s of latency to every reconfigure. */
         xSemaphoreTake(s_stop_done_sem, 0); /* clear stale signal */
+        xEventGroupSetBits(s_stream_evt_grp, STREAM_EVT_STOP_REQ);
 
         TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(SVC_RECONFIGURE_STOP_TIMEOUT_MS);
         bool stopped = false;
         while (xTaskGetTickCount() < deadline)
         {
             /* Service the recvfrom loop between polls: drain any pending
-             * commands so they aren't lost during the stop wait. */
+             * commands so they aren't lost during the stop wait.
+             *
+             * FIX (AUDIT-H5): snapshot s_sock under the mutex before
+             * recvfrom, same pattern as in svc_task_fn. */
+            int drain_sock;
+            if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE)
+            {
+                drain_sock = s_sock;
+                xSemaphoreGive(s_mutex);
+            }
+            else
+            {
+                drain_sock = s_sock; /* best-effort */
+            }
             uint8_t drain_buf[SVC_RECV_BUF_SIZE];
             struct sockaddr_in drain_addr;
             socklen_t drain_len = sizeof(drain_addr);
-            ssize_t rlen = recvfrom(s_sock, drain_buf, sizeof(drain_buf),
+            ssize_t rlen = recvfrom(drain_sock, drain_buf, sizeof(drain_buf),
                                     MSG_DONTWAIT,
                                     (struct sockaddr *)&drain_addr, &drain_len);
             if (rlen > 0)
             {
                 /* Best-effort: process the drained command. We can't call
                  * handle_configure/handle_stop recursively, but we can
-                 * update the watchdog timestamp for DISCOVER heartbeats. */
-                s_last_discover_ticks = now_ticks();
+                 * update the watchdog timestamp for DISCOVER heartbeats.
+                 *
+                 * FIX (AUDIT-H7): write s_last_discover_ticks under the
+                 * mutex - svc_task_fn reads it under the mutex at line ~1002,
+                 * a torn 32-bit tick value (or stale interleaved read)
+                 * corrupts the watchdog calculation. */
+                if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE)
+                {
+                    s_last_discover_ticks = now_ticks();
+                    xSemaphoreGive(s_mutex);
+                }
+                else
+                {
+                    s_last_discover_ticks = now_ticks();
+                }
             }
             if (xSemaphoreTake(s_stop_done_sem, pdMS_TO_TICKS(50)) == pdTRUE)
             {
@@ -926,13 +1027,30 @@ static void svc_task_fn(void *arg)
         if (st == SVC_STOPPED)
             break;
 
-        /* Receive (non-blocking-ish - short timeout for periodic tasks). */
+        /* Receive (non-blocking-ish - short timeout for periodic tasks).
+         *
+         * FIX (AUDIT-H5): snapshot s_sock under the mutex before recvfrom.
+         * svc_port_reinit_socket() (called from the WiFi reconnect task)
+         * closes+replaces s_sock under the mutex. Without this snapshot,
+         * a WiFi reconnect during recvfrom would race on the closed fd
+         * (EBADF) or on a recycled fd number (reading from a different
+         * socket). Matches the pattern already used in send_to(). */
+        int sock_snapshot;
+        if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE)
+        {
+            sock_snapshot = s_sock;
+            xSemaphoreGive(s_mutex);
+        }
+        else
+        {
+            sock_snapshot = s_sock; /* best-effort */
+        }
         struct sockaddr_in src;
         socklen_t slen = sizeof(src);
         /* FIX (L24): use sizeof(recv_buf) - the buffer is never used as a
          * C string (no strncpy/strlen on it), so the -1 was unexplained
          * and wasted 1 byte of RX capacity. */
-        ssize_t len = recvfrom(s_sock, recv_buf, sizeof(recv_buf), 0,
+        ssize_t len = recvfrom(sock_snapshot, recv_buf, sizeof(recv_buf), 0,
                                (struct sockaddr *)&src, &slen);
 
         if (len >= SVC_HEADER_SIZE)
@@ -955,14 +1073,18 @@ static void svc_task_fn(void *arg)
                  * below already prevents reading past the buffer, but an
                  * absurdly large payload_len (e.g. 60000) with a short
                  * packet is a clear sign of a malformed/malicious packet.
-                 * Reject early with a clear log. */
-                if (hdr.payload_len > sizeof(recv_buf) - SVC_HEADER_SIZE)
+                 * Reject early with a clear log.
+                 *
+                 * FIX (AUDIT-MEDIUM): cast payload_len to size_t to avoid
+                 * sign-compare warning (uint16_t promotes to int, then is
+                 * compared with size_t). */
+                if ((size_t)hdr.payload_len > sizeof(recv_buf) - SVC_HEADER_SIZE)
                 {
                     ESP_LOGW(TAG, "RX payload_len %u > buf capacity %u - rejected",
                              (unsigned)hdr.payload_len,
                              (unsigned)(sizeof(recv_buf) - SVC_HEADER_SIZE));
                 }
-                else if (hdr.payload_len <= avail)
+                else if ((size_t)hdr.payload_len <= avail)
                 {
                     if (hdr.cmd == SVC_CMD_DISCOVER)
                         handle_discover(&hdr, &ip, port);
@@ -1044,6 +1166,17 @@ static void svc_task_fn(void *arg)
                     s = s_seq_counter++;
                     xSemaphoreGive(s_mutex);
                     send_info(s, &bcast, s_port);
+                    /* FIX (DIAG-ANNOUNCE): log every Nth announce so we can
+                     * verify the announce path is alive after stop_streaming.
+                     * Without this, announce is silent and we can't tell if
+                     * ESP is sending or not. Log every 5th (~5-25 sec apart). */
+                    static uint32_t announce_log_counter = 0;
+                    if ((++announce_log_counter % 5) == 1)
+                    {
+                        ESP_LOGI(TAG, "announce #%u -> " IPSTR ":%u (state=IDLE)",
+                                 (unsigned)announce_log_counter,
+                                 IP2STR(&bcast), (unsigned)s_port);
+                    }
                 }
             }
         }

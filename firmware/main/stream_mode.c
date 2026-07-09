@@ -150,18 +150,26 @@ static esp_err_t rawtx_wifi_wait_ready(const device_config_t *cfg)
 
 static esp_err_t rawtx_get_stream_dest(uint32_t *host, uint16_t *port)
 {
-    /* Raw TX broadcasts to FF:FF:FF:FF:FF:FF - no destination to resolve. */
+    /* Raw TX broadcasts to FF:FF:FF:FF:FF:FF - no destination to resolve.
+     * FIX (AUDIT-MEDIUM): zero the outputs so callers reading them see
+     * a defined value instead of stale stack. The contract is 'only valid
+     * for UDP/TCP mode' but returning OK with uninit outputs is fragile. */
+    if (host) *host = 0;
+    if (port) *port = 0;
     return ESP_OK;
 }
 
 static void rawtx_set_channels(uint8_t channels)
 {
     /* No service port in raw TX mode. */
+    (void)channels;
 }
 
 static esp_err_t rawtx_svc_port_init(EventGroupHandle_t evt_grp, uint16_t port)
 {
     /* No service port in raw TX mode. */
+    (void)evt_grp;
+    (void)port;
     return ESP_OK;
 }
 

@@ -47,21 +47,45 @@ static bool s_ready = false;
  * deinit — all access points check for NULL before taking. */
 static SemaphoreHandle_t s_state_mutex = NULL;
 
-/* Create the mutex on first use. Idempotent. */
-static void ensure_mutex(void)
+/* Create the mutex on first use. Idempotent.
+ * FIX (AUDIT-HIGH): returns bool so callers can detect allocation failure
+ * (previously silent fallthrough -> udp_stream_init proceeded with
+ * s_state_mutex=NULL, all subsequent state changes unsynchronized). */
+static bool ensure_mutex(void)
 {
     if (!s_state_mutex)
+    {
         s_state_mutex = xSemaphoreCreateMutex();
+        if (!s_state_mutex)
+        {
+            ESP_LOGE(TAG, "ensure_mutex: xSemaphoreCreateMutex failed");
+            return false;
+        }
+    }
+    return true;
 }
+
+/* FIX (AUDIT-MEDIUM): UDP payload upper bound. With MTU 1500 - 20 IP - 8 UDP
+ * = 1472 bytes max unfragmented. We cap at 1400 to leave headroom for
+ * WiFi encap (WPA/CCMP adds 8-16 bytes, 802.11 header 30+ bytes) and match
+ * the RAWTX cap. Larger payloads trigger IP fragmentation -> loss of any
+ * fragment loses the whole datagram (amplifies packet loss on congested WiFi). */
+#define UDP_MAX_PAYLOAD 1400
 
 esp_err_t udp_stream_init(uint32_t host_ip, uint16_t host_port)
 {
-    ensure_mutex();
+    /* FIX (AUDIT-HIGH): propagate mutex-alloc failure instead of silently
+     * continuing without synchronization. */
+    if (!ensure_mutex())
+    {
+        ESP_LOGE(TAG, "init: mutex alloc failed");
+        return ESP_ERR_NO_MEM;
+    }
 
     /* Take mutex for the whole init. If s_ready is already true, caller
      * should have called udp_stream_deinit() first — but be defensive:
      * close any existing socket under the mutex before re-creating. */
-    if (s_state_mutex && xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(200)) != pdTRUE)
+    if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(200)) != pdTRUE)
     {
         ESP_LOGE(TAG, "init: state_mutex timeout");
         return ESP_ERR_TIMEOUT;
@@ -174,6 +198,13 @@ esp_err_t udp_stream_send(const uint8_t *data, size_t len)
 {
     if (!data || !len)
         return ESP_ERR_INVALID_ARG;
+    /* FIX (AUDIT-MEDIUM): reject oversized payloads to avoid IP fragmentation. */
+    if (len > UDP_MAX_PAYLOAD)
+    {
+        ESP_LOGW(TAG, "send: payload %u > %u, rejecting",
+                 (unsigned)len, (unsigned)UDP_MAX_PAYLOAD);
+        return ESP_ERR_INVALID_SIZE;
+    }
 
     /* FIX (Bug #2 UDP): snapshot sock + dest under the mutex. deinit() may
      * close s_sock at any moment (stop_streaming / transport switch); we
@@ -207,7 +238,13 @@ esp_err_t udp_stream_send(const uint8_t *data, size_t len)
         /* Common errors:
          *   EBADF (9)   — deinit closed the fd under us; benign.
          *   ENOMEM (12) — lwIP out of buffers (WiFi congested); drop frame.
-         *   EHOSTUNREACH (118) — WiFi still associating; drop frame. */
+         *   EHOSTUNREACH (118) — WiFi still associating; drop frame.
+         *
+         * FIX (AUDIT-LOW): log the errno so congestion vs. deinit-race vs.
+         * no-association can be distinguished during debugging. */
+        int saved_errno = errno;
+        ESP_LOGW(TAG, "sendto failed: errno=%d len=%u", saved_errno, (unsigned)len);
+        (void)saved_errno;
         return ESP_FAIL;
     }
     return ESP_OK;

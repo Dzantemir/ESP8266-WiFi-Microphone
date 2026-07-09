@@ -220,6 +220,15 @@ esp_err_t config_mgr_init(void)
     {
         s_config.wifi_channel = 1;
     }
+    /* FIX (AUDIT-H18): svc_port=0 lets the OS pick a random ephemeral port
+     * on bind() -> the receiver can't discover the device on the expected
+     * port. Fall back to the configured default if NVS value is missing or
+     * corrupted (e.g. first boot after a firmware upgrade that added the
+     * field, or NVS corruption). */
+    if (s_config.svc_port == 0)
+    {
+        s_config.svc_port = SVC_PORT_DEFAULT;
+    }
     if (s_config.transport_mode > TRANSPORT_MODE_RAWTX)
     {
         s_config.transport_mode = TRANSPORT_MODE_DEFAULT;
@@ -254,6 +263,14 @@ void config_get_copy(device_config_t *cfg)
             set_defaults(cfg);
         return;
     }
+    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
+     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
+    if (!s_mutex)
+    {
+        ESP_LOGE(TAG, "config mutex not initialized");
+        set_defaults(cfg);
+        return;
+    }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     *cfg = s_config;
     xSemaphoreGive(s_mutex);
@@ -281,6 +298,13 @@ esp_err_t config_set_wifi(const char *ssid, const char *password)
         strlen(password) >= sizeof(s_config.wifi_password))
     {
         return ESP_ERR_INVALID_SIZE;
+    }
+    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
+     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
+    if (!s_mutex)
+    {
+        ESP_LOGE(TAG, "config mutex not initialized");
+        return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     /* FIX (M21): capture previous values so we can roll back the in-memory
@@ -335,6 +359,13 @@ esp_err_t config_set_hostname(const char *hostname)
             return ESP_ERR_INVALID_ARG;
         }
     }
+    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
+     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
+    if (!s_mutex)
+    {
+        ESP_LOGE(TAG, "config mutex not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     strncpy(s_config.hostname, hostname, sizeof(s_config.hostname) - 1);
     s_config.hostname[sizeof(s_config.hostname) - 1] = '\0';
@@ -351,6 +382,13 @@ esp_err_t config_set_tx_power(uint8_t tx_power)
     {
         return ESP_ERR_INVALID_ARG;
     }
+    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
+     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
+    if (!s_mutex)
+    {
+        ESP_LOGE(TAG, "config mutex not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_config.tx_power = tx_power;
     esp_err_t err = save_locked();
@@ -365,6 +403,13 @@ esp_err_t config_set_svc_port(uint16_t port)
     if (port == 0)
     {
         return ESP_ERR_INVALID_ARG;
+    }
+    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
+     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
+    if (!s_mutex)
+    {
+        ESP_LOGE(TAG, "config mutex not initialized");
+        return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_config.svc_port = port;
@@ -381,6 +426,13 @@ esp_err_t config_set_sample_rate(uint32_t rate)
     {
         return ESP_ERR_INVALID_ARG;
     }
+    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
+     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
+    if (!s_mutex)
+    {
+        ESP_LOGE(TAG, "config mutex not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_config.sample_rate = rate;
     esp_err_t err = save_locked();
@@ -395,6 +447,13 @@ esp_err_t config_set_bits_per_sample(uint8_t bits)
     if (bits != 16 && bits != 24)
     {
         return ESP_ERR_INVALID_ARG;
+    }
+    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
+     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
+    if (!s_mutex)
+    {
+        ESP_LOGE(TAG, "config mutex not initialized");
+        return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_config.bits_per_sample = bits;
@@ -411,6 +470,13 @@ esp_err_t config_set_comm_format(uint8_t fmt)
     {
         return ESP_ERR_INVALID_ARG;
     }
+    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
+     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
+    if (!s_mutex)
+    {
+        ESP_LOGE(TAG, "config mutex not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_config.comm_format = fmt;
     esp_err_t err = save_locked();
@@ -425,6 +491,13 @@ esp_err_t config_set_channel_format(uint8_t fmt)
     if (fmt != I2S_CHFMT_LEFT && fmt != I2S_CHFMT_RIGHT && fmt != I2S_CHFMT_STEREO)
     {
         return ESP_ERR_INVALID_ARG;
+    }
+    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
+     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
+    if (!s_mutex)
+    {
+        ESP_LOGE(TAG, "config mutex not initialized");
+        return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_config.channel_format = fmt;
@@ -441,6 +514,13 @@ esp_err_t config_set_gain(uint8_t gain)
     {
         return ESP_ERR_INVALID_ARG;
     }
+    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
+     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
+    if (!s_mutex)
+    {
+        ESP_LOGE(TAG, "config mutex not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_config.gain = gain;
     esp_err_t err = save_locked();
@@ -455,6 +535,13 @@ esp_err_t config_set_agc_mode(uint8_t mode)
     if (mode >= AGC_MODE_COUNT)
     {
         return ESP_ERR_INVALID_ARG;
+    }
+    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
+     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
+    if (!s_mutex)
+    {
+        ESP_LOGE(TAG, "config mutex not initialized");
+        return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_config.agc_mode = mode;
@@ -471,6 +558,13 @@ esp_err_t config_set_codec_mode(uint8_t mode)
     {
         return ESP_ERR_INVALID_ARG;
     }
+    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
+     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
+    if (!s_mutex)
+    {
+        ESP_LOGE(TAG, "config mutex not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_config.codec_mode = mode;
     esp_err_t err = save_locked();
@@ -486,6 +580,13 @@ esp_err_t config_set_wifi_channel(uint8_t ch)
     {
         return ESP_ERR_INVALID_ARG;
     }
+    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
+     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
+    if (!s_mutex)
+    {
+        ESP_LOGE(TAG, "config mutex not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_config.wifi_channel = ch;
     esp_err_t err = save_locked();
@@ -500,6 +601,13 @@ esp_err_t config_set_transport_mode(uint8_t mode)
     if (mode > TRANSPORT_MODE_RAWTX)
     {
         return ESP_ERR_INVALID_ARG;
+    }
+    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
+     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
+    if (!s_mutex)
+    {
+        ESP_LOGE(TAG, "config mutex not initialized");
+        return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_config.transport_mode = mode;
@@ -518,6 +626,13 @@ esp_err_t config_set_i2s_timing(uint8_t sd_delay, uint8_t ws_delay, uint8_t bck_
     {
         return ESP_ERR_INVALID_ARG;
     }
+    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
+     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
+    if (!s_mutex)
+    {
+        ESP_LOGE(TAG, "config mutex not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_config.i2s_timing_sd_delay  = sd_delay;
     s_config.i2s_timing_ws_delay  = ws_delay;
@@ -532,6 +647,13 @@ esp_err_t config_set_i2s_timing(uint8_t sd_delay, uint8_t ws_delay, uint8_t bck_
 
 esp_err_t config_factory_reset(void)
 {
+    /* FIX (AUDIT-H17): bail out if config_mgr_init() failed to create the
+     * mutex (or wasn't called yet). xSemaphoreTake(NULL, ...) crashes. */
+    if (!s_mutex)
+    {
+        ESP_LOGE(TAG, "config mutex not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     set_defaults(&s_config);
     esp_err_t err = save_locked();

@@ -107,6 +107,27 @@ static SemaphoreHandle_t s_task_done_sems[TASK_IDX_COUNT] = {NULL};
 static EventGroupHandle_t s_stream_evt_grp = NULL;
 static bool s_wifi_initialized = false;
 
+/* FIX (AUDIT-XPORT-AUTOAPPLY): pending transport change flag.
+ *
+ * User's desired behavior:
+ *   1. Stream running on UDP. User does AT+XPORT=1 (TCP).
+ *      -> Save to NVS, but stream CONTINUES on UDP. No immediate switch.
+ *   2. User does AT+HOTRESTART -> apply the pending TCP transport (on the fly
+ *      for UDP<->TCP, refused with warning for RAWTX).
+ *      OR user does AT+RST (reboot) -> apply on next boot.
+ *   3. Server-initiated stop+start (CMD_STOP + CONFIGURE) does NOT apply the
+ *      pending transport change. The stream restarts with the OLD transport.
+ *      This prevents the server from triggering an unwanted transport switch
+ *      when it does its routine stop+start (e.g. after a TCP send error).
+ *
+ * Implementation: s_pending_transport_apply is set to true ONLY by
+ * streaming_request_restart() (which AT+HOTRESTART calls). start_streaming()
+ * checks it: if a transport change is detected in NVS but the flag is false,
+ * the change is REFUSED (old transport stays). After applying or refusing,
+ * the flag is cleared. On AT+RST (reboot), the flag is naturally reset (BSS)
+ * and the new transport is loaded from NVS at boot. */
+static bool s_pending_transport_apply = false;
+
 /* Pool sizes - computed at start_streaming from free heap & frame_ms. */
 static int s_pcm_pool_size = 4;
 static int s_adpcm_pool_size = 6;
@@ -151,6 +172,12 @@ bool streaming_request_restart(void)
      * HOTRESTART from overriding an intentional stop. */
     if (!streaming_is_active())
         return false;
+    /* FIX (AUDIT-XPORT-AUTOAPPLY): mark that this restart is user-initiated
+     * (via AT+HOTRESTART). start_streaming() will check this flag to decide
+     * whether to apply a pending transport_mode change from NVS. Only an
+     * explicit user HOTRESTART may apply it - server-initiated stop+start
+     * must NOT change the transport. */
+    s_pending_transport_apply = true;
     /* FIX (H5): set BOTH bits in a single xEventGroupSetBits call. The
      * previous two-call sequence had a check-then-set race: between
      * is_active() and the bit sets, the main loop could process a prior
@@ -659,30 +686,97 @@ static esp_err_t start_streaming(void)
 
     /* Re-select transport mode from config. This is CRITICAL for AT+HOTRESTART:
      * AT+XPORT changes cfg.transport_mode in NVS, but s_active_ops was set
-     * once at boot. Without this call, switching UDP<->TCP<->RAWTX via
-     * AT+XPORT + HOTRESTART has no effect — the old transport stays active.
+     * once at boot. Without this call, switching UDP<->TCP via AT+XPORT +
+     * HOTRESTART has no effect — the old transport stays active.
      *
-     * If the transport changed, deinit the old one first (e.g. close TCP
-     * listening socket before switching to UDP). */
+     * FIX (AUDIT-XPORT-AUTOAPPLY): AT+XPORT saves the new transport to NVS
+     * but does NOT apply it immediately. The stream continues with the OLD
+     * transport. The transport change is applied ONLY when:
+     *   - AT+HOTRESTART is explicitly requested by the user (sets
+     *     s_pending_transport_apply = true), OR
+     *   - AT+RST reboots the device (NVS is loaded fresh at boot).
+     * Server-initiated stop+start (CMD_STOP + CONFIGURE) does NOT apply the
+     * pending transport change - the stream restarts with the OLD transport.
+     * This prevents the server from triggering an unwanted transport switch
+     * when it does its routine stop+start (e.g. after a TCP send error).
+     *
+     * FIX (AUDIT-XPORT-CRASH): RAWTX(2) transitions require AT+RST.
+     * - UDP(0) <-> TCP(1) is supported on the fly (via HOTRESTART only):
+     *   both share the same AP-associated WiFi path.
+     * - Any transition involving RAWTX(2) CANNOT be applied on the fly
+     *   (WiFi driver reinit crashes on ESP8266 RTOS SDK v3.4). We KEEP the
+     *   old transport and continue. AT+HOTRESTART still applies all other
+     *   settings (audio, WiFi ch). The user must do AT+RST to switch
+     *   to/from RAWTX.
+     *
+     * IMPORTANT: stream_mode_init() immediately overwrites s_active_ops and
+     * s_active_transport. So we capture the OLD transport BEFORE calling it. */
+    uint8_t old_transport = stream_mode_current_transport();
     const stream_mode_ops_t *old_ops = stream_mode_ops();
-    stream_mode_init(&cfg);
-    const stream_mode_ops_t *ops = stream_mode_ops();
-    if (ops != old_ops)
+    const stream_mode_ops_t *ops = old_ops;   /* default: no change */
+    bool transport_changed_in_nvs = (cfg.transport_mode != old_transport);
+
+    if (transport_changed_in_nvs && !s_pending_transport_apply)
     {
-        ESP_LOGI(TAG, "Transport changed -- deinitializing old transport (%s)",
+        /* Server-initiated stop+start (NOT a user HOTRESTART). Refuse the
+         * transport change - keep the old transport. The user must explicitly
+         * do AT+HOTRESTART or AT+RST to apply the change. Do NOT call
+         * stream_mode_init() with the new cfg - it would overwrite
+         * s_active_ops. Just log and continue with old_ops. */
+        ESP_LOGW(TAG, "Transport changed in NVS (%s -> %s) but no "
+                      "HOTRESTART requested - keeping old transport (%s). "
+                      "Use AT+HOTRESTART or AT+RST to apply.",
+                 old_ops->name,
+                 (cfg.transport_mode == TRANSPORT_MODE_UDP) ? "UDP" :
+                 (cfg.transport_mode == TRANSPORT_MODE_TCP) ? "TCP" :
+                 "Raw 802.11 TX",
                  old_ops->name);
-        old_ops->deinit();
-        /* FIX (H7): if switching FROM a svc_port-using transport (UDP/TCP)
-         * TO one that doesn't (RAWTX), tear down svc_port. Without this
-         * the old svc_port task + UDP listener live forever, leaking
-         * memory + socket, and rogue EASSP discovery packets keep going
-         * out in RAWTX mode. */
-        if (old_ops->uses_svc_port && !ops->uses_svc_port)
+        /* Override cfg.transport_mode to the OLD value so the rest of
+         * start_streaming (logging, packet header) uses the old transport.
+         * s_active_ops stays as old_ops (we never called stream_mode_init). */
+        cfg.transport_mode = old_transport;
+        /* ops == old_ops (no change). Stream starts with OLD transport. */
+    }
+    else if (transport_changed_in_nvs)
+    {
+        /* HOTRESTART was explicitly requested. Apply the transport change. */
+        stream_mode_init(&cfg);
+        ops = stream_mode_ops();
+
+        if (old_ops->needs_wifi_association != ops->needs_wifi_association)
         {
-            ESP_LOGI(TAG, "Switching to non-svc_port transport - deinit svc_port");
-            svc_port_deinit();
+            /* FIX (AUDIT-XPORT-CRASH): RAWTX transitions cannot be applied on
+             * the fly (WiFi driver reinit crashes on ESP8266 RTOS SDK v3.4).
+             * Don't fail the whole start_streaming - revert to the old
+             * transport so AT+HOTRESTART still applies audio settings. The
+             * user must do AT+RST to switch to/from RAWTX. */
+            ESP_LOGW(TAG, "Transport change %s -> %s requires AT+RST "
+                          "(WiFi mode differs). Keeping old transport (%s) "
+                          "for this stream. Other settings (audio, WiFi ch) "
+                          "are still applied.",
+                     old_ops->name, ops->name, old_ops->name);
+            /* Revert stream_mode to the old transport. */
+            cfg.transport_mode = old_transport;
+            stream_mode_init(&cfg);
+            ops = stream_mode_ops();   /* ops == old_ops again */
+        }
+        else
+        {
+            /* UDP <-> TCP transition via HOTRESTART - safe to apply on the fly. */
+            ESP_LOGI(TAG, "Transport changed -- deinitializing old transport (%s)",
+                     old_ops->name);
+            old_ops->deinit();
+            if (old_ops->uses_svc_port && !ops->uses_svc_port)
+            {
+                ESP_LOGI(TAG, "Switching to non-svc_port transport - deinit svc_port");
+                svc_port_deinit();
+            }
         }
     }
+    /* Clear the pending flag - the change has been applied, refused, or
+     * there was no change. Either way, the next start_streaming requires
+     * a fresh HOTRESTART to apply a transport change. */
+    s_pending_transport_apply = false;
 
     /* Resolve stream destination (UDP: from server CONFIGURE; RAWTX: none). */
     uint32_t stream_host = 0;

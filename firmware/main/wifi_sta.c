@@ -225,6 +225,91 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
             svc_port_reset_watchdog();
             break;
 
+        case WIFI_EVENT_STA_AUTHMODE_CHANGE:
+        {
+            /* AP changed the authentication mode AFTER we associated.
+             * Common legitimate causes:
+             *   - Router firmware upgrade changed security policy (e.g.
+             *     WPA2-PSK -> WPA3-SAE transition mode).
+             *   - Mesh / WDS re-parenting to an AP with different auth.
+             *   - Admin temporarily opened the network for setup.
+             *
+             * Hostile causes (downgrade attack):
+             *   - Rogue AP forces a switch from WPA2 to OPEN/WEP to capture
+             *     subsequent traffic in cleartext.
+             *   - Evil-twin AP with weaker auth than the legitimate one.
+             *
+             * Policy:
+             *   - Log every transition (INFO level for safe upgrades,
+             *     WARN for downgrades).
+             *   - For OPEN/WEP downgrades: the audio stream is now going out
+             *     unencrypted on the radio -> stop it immediately and force
+             *     a disconnect so we re-evaluate against the configured AP.
+             *     The next STA_DISCONNECTED will go through the normal
+             *     backoff reconnect path. We do NOT silently accept a
+             *     cleartext downgrade.
+             *   - For WPA-family transitions (WPA2->WPA3, WPA->WPA2, etc.):
+             *     the link is still encrypted -> keep the stream running,
+             *     just log the change. The CONFIGURE in NVS still says
+             *     WPA2-PSK; if the AP no longer accepts it, the next
+             *     disconnect will trigger reconnect anyway.
+             *
+             * Structural note: ESP8266 RTOS SDK v3.4 may fire this event
+             * with NULL data on older SDKs - guard with a NULL check so we
+             * don't dereference invalid memory. */
+            wifi_event_sta_authmode_change_t *auth = data;
+            if (!auth)
+            {
+                ESP_LOGW(TAG, "STA_AUTHMODE_CHANGE: event data NULL (old SDK?) - ignoring");
+                break;
+            }
+
+            ESP_LOGI(TAG, "STA_AUTHMODE_CHANGE: %d -> %d",
+                     (int)auth->old_mode, (int)auth->new_mode);
+
+            /* Downgrade detection: OPEN (0) and WEP (1) are unencrypted.
+             * Switching TO either of those from an encrypted mode is a
+             * security-relevant downgrade - we refuse to stream cleartext. */
+            bool old_encrypted = (auth->old_mode != WIFI_AUTH_OPEN &&
+                                  auth->old_mode != WIFI_AUTH_WEP);
+            bool new_encrypted = (auth->new_mode != WIFI_AUTH_OPEN &&
+                                  auth->new_mode != WIFI_AUTH_WEP);
+
+            if (old_encrypted && !new_encrypted)
+            {
+                ESP_LOGW(TAG, "  DOWNGRADE to unencrypted auth mode %d - "
+                              "stopping stream + forcing reconnect",
+                         (int)auth->new_mode);
+                /* Stop the audio stream first - audio packets would otherwise
+                 * go out unencrypted until the disconnect propagates. */
+                if (streaming_is_active())
+                    streaming_request_stop();
+                /* Clear CONNECTED/GOT_IP so the rest of the system sees us
+                 * as not-connected while we re-establish. */
+                xEventGroupClearBits(s_wifi_evt, WIFI_EVT_CONNECTED | WIFI_EVT_GOT_IP);
+                /* Mark as intentional so the resulting STA_DISCONNECTED
+                 * does NOT trigger an immediate reconnect on top of ours
+                 * (two concurrent esp_wifi_connect() calls corrupt the
+                 * driver). The reconnect task's backoff will kick in on
+                 * the next organic disconnect. */
+                s_intentional_disconnect = true;
+                esp_wifi_disconnect();
+            }
+            else if (auth->old_mode != auth->new_mode)
+            {
+                /* Encrypted->encrypted transition (e.g. WPA2->WPA3) or
+                 * OPEN->OPEN-ish edge case. Log it but otherwise no-op:
+                 * the link is still up, the IP is still valid, the stream
+                 * can continue. If the new mode is incompatible with our
+                 * configured credentials, the next beacon/probe will trigger
+                 * a normal STA_DISCONNECTED and we'll backoff-reconnect. */
+                ESP_LOGI(TAG, "  encrypted->encrypted transition - stream continues");
+            }
+            /* old == new is a no-op (some SDK versions fire the event
+             * spuriously). Nothing to do. */
+            break;
+        }
+
         default:
             break;
         }
@@ -824,8 +909,7 @@ esp_err_t wifi_sta_deinit(void)
     esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler);
     esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler);
     esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_LOST_IP, wifi_event_handler);
-    esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_STA_START,
-                                 wifi_raw_event_handler);
+    esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_STA_START,wifi_raw_event_handler);
 
     /* FIX (C3/M18): give any in-flight event handler a brief grace period to
      * finish before we tear down the event group / mutex it may touch.
