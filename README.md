@@ -106,7 +106,9 @@ Switchable at runtime via `AT+XPORT=0|1|2` + `AT+HOTRESTART`
 - No reboot needed for audio parameter changes
 
 </td>
-<td width="50%" valign="top">
+</tr>
+<tr>
+<td width="100%" valign="top" colspan="2">
 
 ### 💻 Windows Receiver (EASSP Server)
 - **Multi-device**: Stream from up to 16 ESP8266s simultaneously
