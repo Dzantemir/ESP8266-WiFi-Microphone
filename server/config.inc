@@ -98,14 +98,13 @@
 %WM_APP_LOG       = %WM_USER + 600
 
 ' ---- Jitter Buffer / PLC / Adaptive ----
-%JITTER_INITIAL   = 6     ' FIX (BUG#R3-2): was 5. One extra frame of prebuffer
-                                  ' absorbs startup WiFi jitter that causes underrun-clicks
-                                  ' in the first 1-3 seconds. Steady-state latency +1 frame
-                                  ' (~20ms) is inaudible.
-%JITTER_MIN       = 5     ' FIX (log-fix-B): was 3. Log shows buffer oscillating
-                                  ' 6->5->7->6->5->4 with frequent underruns at 3-4.
-                                  ' 5 gives enough headroom for WiFi jitter on this setup.
-%JITTER_MAX       = 8     ' Maximum prebuffer (adaptive, frames)
+%JITTER_INITIAL   = 10    ' FIX (CLICKS-A1): was 6. ~200ms prebuffer absorbs WiFi cold-start
+                                  ' jitter (DNS, DHCP, ESP I2S DMA warmup) that caused underrun-
+                                  ' clicks in the first 1-3 seconds. With burst-submit (A2) the
+                                  ' prebuffer actually accumulates now, so 10 frames = 200ms is
+                                  ' real buffer depth, not just a counter.
+%JITTER_MIN       = 6     ' FIX (CLICKS-A1): was 5. Raised to match new JITTER_INITIAL floor.
+%JITTER_MAX       = 12    ' FIX (CLICKS-A1): was 8. Raised to allow adaptive growth for bad WiFi.
 %JITTER_ADAPT_MS  = 10000 ' Adaptive adjustment interval (ms)
 %JITTER_UNDERRUN_THRESHOLD = 2  ' Underruns in interval to trigger increase
 

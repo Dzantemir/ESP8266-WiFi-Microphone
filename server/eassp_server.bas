@@ -2042,6 +2042,12 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
                 predictor2 = 0
                 stepIndex2 = 0
                 lastSeq = 0
+                ' FIX (SLEEP-WAKE-OOO-BUG): reset pktRecv here too — see
+                ' the sleep/wake reopen path above for full explanation.
+                ' Without this, any reconnect after seqNum > 32768 (~11 min
+                ' of streaming) would classify every post-reconnect packet
+                ' as out-of-order and discard it.
+                pktRecv = 0
                 ITERATE DO
             END IF
             ' recvBuf now = [16-byte header][payload], same as UDP path.
@@ -2424,23 +2430,32 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
         LOCAL freeBufIdx AS LONG
         freeBufIdx = -1
         FOR wIdx2 = 0 TO %NUM_WAVE_BUFS - 1
-            IF (whdrs(wIdx2).dwFlags AND %WHDR_INQUEUE) = 0 THEN
+            ' FIX (BURST-A2-BUG): also skip buffers marked dwUser=1.
+            ' During prebuffer, burst-submit marks buffers as ready (dwUser=1)
+            ' but does NOT call waveOutWrite (so WHDR_INQUEUE is NOT set).
+            ' Without this check, the scan would reuse the same buffer on
+            ' every iteration, overwriting all previous frames. The burst
+            ' would then submit 1 buffer 10× instead of 10 unique buffers.
+            ' Symptom: 5 bursts/sec, 0 bufs in queue, underrun loop →
+            ' AudioThread CPU saturation → TCP backpressure → ESP heap crash.
+            IF (whdrs(wIdx2).dwFlags AND %WHDR_INQUEUE) = 0 AND whdrs(wIdx2).dwUser = 0 THEN
                 freeBufIdx = wIdx2
                 EXIT FOR
             END IF
         NEXT wIdx2
         IF freeBufIdx < 0 THEN
-            ' All buffers in queue = underrun. Drop this packet, count it.
-            INCR underrunCount
+            ' FIX (CLICKS-A3): All 16 buffers INQUEUE = OVERFLOW (network
+            ' faster than sound card), NOT underrun. The old code incremented
+            ' underrunCount and forced re-prebuffer, which:
+            '   1. Falsely inflated underrun stats → adaptive buffer grew
+            '      unnecessarily, increasing latency.
+            '   2. Discarded the current queue mid-playback → click.
+            ' Now: just drop this one packet. The WaveOut queue is full,
+            ' so playback continues smoothly. No re-prebuffer, no underrun
+            ' count. The dropped frame is concealed by PLC on the next packet.
             IF underrunCount <= 3 OR (underrunCount MOD 100) = 0 THEN
                 AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
-                       ": underrun (all bufs INQUEUE) - pkt dropped, underruns=" & _
-                       TRIM$(STR$(underrunCount))
-            END IF
-            ' Re-prebuffer to rebuild the queue
-            IF jitterPrebuffering = 0 THEN
-                jitterPrebuffering = 1
-                jitterFilled = 0
+                       ": overflow (all bufs INQUEUE) - pkt dropped"
             END IF
             ITERATE DO
         END IF
@@ -2473,7 +2488,8 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
             LOCAL plcBufIdx AS LONG
             plcBufIdx = -1
             FOR wIdx2 = 0 TO %NUM_WAVE_BUFS - 1
-                IF wIdx2 <> wIdx AND (whdrs(wIdx2).dwFlags AND %WHDR_INQUEUE) = 0 THEN
+                ' FIX (BURST-A2-BUG): also skip dwUser=1 buffers (prebuffered).
+                IF wIdx2 <> wIdx AND (whdrs(wIdx2).dwFlags AND %WHDR_INQUEUE) = 0 AND whdrs(wIdx2).dwUser = 0 THEN
                     plcBufIdx = wIdx2
                     EXIT FOR
                 END IF
@@ -2804,20 +2820,40 @@ pcm_ready:
         END IF
 
         ' ---- Jitter Buffer: prebuffer before starting playback ----
+        ' FIX (CLICKS-A2): burst-submit. Previously waveOutWrite was called
+        ' immediately on each prebuffered frame, so WaveOut started draining
+        ' from the FIRST write. By the time jitterFilled >= target, the queue
+        ' was already at target-1 or less, and normal WiFi jitter in the first
+        ' 1-3 seconds easily emptied it → silence → click when audio resumed.
+        '
+        ' Now: decode into the buffer (already done above), mark it ready
+        ' (dwUser=1), but DON'T call waveOutWrite yet. When jitterFilled
+        ' reaches target, burst-submit ALL ready buffers at once. WaveOut
+        ' sees a full queue (target frames) from the very first moment →
+        ' no underrun during the critical startup window.
         IF jitterPrebuffering AND pcmLen > 0 THEN
             INCR jitterFilled
-            ' During prebuffer, still submit to WaveOut (buffers queue up)
-            IF waveOut <> 0 AND (whdrs(wIdx).dwFlags AND %WHDR_INQUEUE) = 0 THEN
-                whdrs(wIdx).dwBufferLength = pcmLen
-                whdrs(wIdx).dwBytesRecorded = pcmLen
-                waveOutWrite waveOut, whdrs(wIdx), SIZEOF(WAVEHDR)
-                wIdx = (wIdx + 1) MOD %NUM_WAVE_BUFS
-            END IF
+            ' Mark this buffer as decoded-ready (don't submit to WaveOut yet)
+            whdrs(wIdx).dwBufferLength  = pcmLen
+            whdrs(wIdx).dwBytesRecorded = pcmLen
+            whdrs(wIdx).dwUser          = 1   ' 1 = ready, waiting for burst
             IF jitterFilled >= jitterTarget THEN
+                ' BURST: push all ready buffers to WaveOut at once.
+                ' This gives WaveOut the full target-depth queue before it
+                ' can drain even one buffer.
+                IF waveOut <> 0 THEN
+                    LOCAL burstI AS LONG
+                    FOR burstI = 0 TO %NUM_WAVE_BUFS - 1
+                        IF whdrs(burstI).dwUser = 1 THEN
+                            whdrs(burstI).dwUser = 0
+                            waveOutWrite waveOut, whdrs(burstI), SIZEOF(WAVEHDR)
+                        END IF
+                    NEXT burstI
+                END IF
                 jitterPrebuffering = 0
                 AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
                        ": jitter buffer filled (" & TRIM$(STR$(jitterFilled)) & _
-                       " frames) - playback started"
+                       " frames) - burst playback started"
             END IF
             ITERATE DO
         END IF
@@ -2827,10 +2863,10 @@ pcm_ready:
         ' underrunCount is now correctly incremented when WaveOut queue is
         ' empty (0 INQUEUE). If underruns happen, increase prebuffer; if
         ' stable, slowly decrease to reduce latency.
-        ' FIX (BUG#R3-2): do NOT decrease jitterTarget in the first 5 seconds
-        ' after stream start. Early WiFi jitter is normal (DNS, DHCP renewal,
-        ' ESP I2S DMA warmup) and a too-small prebuffer during this window
-        ' causes underrun-clicks. The decrease guard is one-shot per stream.
+        ' FIX (CLICKS-A4): do NOT decrease jitterTarget in the first 10 seconds
+        ' after stream start (was 5s). Early WiFi jitter is normal (DNS, DHCP
+        ' renewal, ESP I2S DMA warmup) and a too-small prebuffer during this
+        ' window causes underrun-clicks. 10s covers the full cold-start window.
         IF (GetTickCount() - lastAdaptTick) >= %JITTER_ADAPT_MS THEN
             LOCAL msSinceStart AS DWORD
             msSinceStart = GetTickCount() - g_Devs(idx).dwStreamStart
@@ -2840,7 +2876,7 @@ pcm_ready:
             ' was followed by underruns. Requiring 2 windows confirms the
             ' buffer is genuinely too large, not just in a lucky gap.
             IF underrunCount = 0 AND jitterTarget > %JITTER_MIN AND _
-               msSinceStart > 5000 THEN
+               msSinceStart > 10000 THEN  ' FIX (CLICKS-A4): was 5000. Early WiFi jitter is normal for ~10s
                 INCR zeroUnderrunIntervals
                 IF zeroUnderrunIntervals >= 2 THEN
                     DECR jitterTarget
@@ -2991,6 +3027,40 @@ pcm_ready:
                 predictor2 = 0
                 stepIndex2 = 0
                 lastSeq = 0
+                ' FIX (SLEEP-WAKE-OOO-BUG): reset pktRecv so the first
+                ' post-reopen packet is NOT misclassified as out-of-order.
+                '
+                ' ROOT CAUSE of "stream doesn't recover after PC sleep
+                ' (10-15 min)":
+                '   After sleep/wake reopen, lastSeq is reset to 0 (above),
+                '   but pktRecv was NOT reset. So pktRecv > 0 (from before
+                '   sleep), and the seq-comparison runs:
+                '     seqDiff = (seqNum - 0 - 1) AND &HFFFF&
+                '   The ESP keeps incrementing seqNum during sleep. After
+                '   ~11 min at 50 pkt/s, seqNum > 32768. So:
+                '     seqDiff > 32768  ->  oooPkt = 1
+                '   The packet is DISCARDED as out-of-order (ITERATE DO
+                '   before lastSeq is updated). lastSeq stays 0 -> EVERY
+                '   subsequent packet is also discarded. The audio thread
+                '   reads packets (updating dwLastPktTick, so HB stall
+                '   detection doesn't fire) but never plays them. The ESP's
+                '   send() eventually fails with errno=11 (EAGAIN) and the
+                '   stream never recovers.
+                '
+                '   Threshold: 32768 packets / 50 pkt/s = 655s = 10.9 min.
+                '   This matches the user report "10-15 minutes".
+                '
+                ' FIX: reset pktRecv = 0 so the IF pktRecv > 0 guard at
+                ' the seq comparison is FALSE on the first post-reopen
+                ' packet. The packet is processed normally: lastSeq is set
+                ' to its seqNum, and subsequent packets have seqDiff = 0.
+                pktRecv = 0
+                EnterCriticalSection g_csDev
+                g_Devs(idx).dwPktRecv = 0
+                g_Devs(idx).dwPktOOO  = 0
+                g_Devs(idx).dwPktLost = 0
+                g_Devs(idx).wLastSeq  = 0
+                LeaveCriticalSection g_csDev
                 ' Reopen WaveOut inline (NOT goto reopen_waveout — that path
                 ' does a full startup skip + state reset which would discard
                 ' all incoming packets for 1 second. We just need to reopen
@@ -4526,9 +4596,47 @@ CALLBACK FUNCTION MainDlgProc()
                     END IF
                 NEXT ps_rc
             ELSEIF CB.WPARAM = 18 OR CB.WPARAM = 7 THEN  ' PBT_APMRESUMEAUTOMATIC / PBT_APMRESUMESUSPEND
-                AddLog "[PWR] System resumed from sleep - flagging WaveOut + TCP reopen"
+                ' FIX (SLEEP-DEFENSE-B1): On resume, immediately send CONFIGURE
+                ' to all active streaming devices AND force the stall-detection
+                ' window to expire. This handles the case where the ESP went IDLE
+                ' during long sleep (>15 min without DISCOVER → ESP watchdog fires
+                ' → only CONFIGURE can restart the stream).
+                '
+                ' Also: GetTickCount may not advance during sleep on some systems.
+                ' After wake, elapsed = now - dwLastPktTick could be small (a few
+                ' seconds) even though the real wall-clock gap was 15 minutes.
+                ' By setting dwLastPktTick = now - STREAM_STALL_MS - 1, we force
+                ' the HeartbeatThread's stall detection to fire on its next
+                ' iteration → it resends CONFIGURE as a backup.
+                AddLog "[PWR] System resumed from sleep - force CONFIGURE + reopen all streams"
                 KillTimer CB.HNDL, %IDT_DEVCHANGE
                 SetTimer CB.HNDL, %IDT_DEVCHANGE, %DEVCHANGE_DEBOUNCE_MS, %NULL
+                ' Collect targets under CS, send OUTSIDE CS (UDP SEND can block)
+                DIM rIP(0 TO %MAX_DEVICES-1) AS LOCAL DWORD
+                DIM rPort(0 TO %MAX_DEVICES-1) AS LOCAL DWORD
+                DIM rAPort(0 TO %MAX_DEVICES-1) AS LOCAL DWORD
+                LOCAL rCnt AS LONG, ri AS LONG
+                rCnt = 0
+                EnterCriticalSection g_csDev
+                FOR ri = 0 TO %MAX_DEVICES - 1
+                    IF g_Devs(ri).dwActive AND g_Devs(ri).dwHBActive THEN
+                        rIP(rCnt)    = g_Devs(ri).dwIP
+                        rPort(rCnt)  = g_Devs(ri).dwPort
+                        rAPort(rCnt) = g_Devs(ri).dwAudioPort
+                        ' Force stall-detection window to expire on next HB tick
+                        g_Devs(ri).dwLastPktTick = GetTickCount() - %STREAM_STALL_MS - 1
+                        ' Flag reopen (TCP reconnect + WaveOut reopen)
+                        g_Devs(ri).bReopenWaveOut = 1
+                        INCR rCnt
+                    END IF
+                NEXT ri
+                LeaveCriticalSection g_csDev
+                ' Send CONFIGURE twice (wake WiFi is noisy, first may be lost)
+                FOR ri = 0 TO rCnt - 1
+                    SendConfigure rIP(ri), rPort(ri), rAPort(ri)
+                    SLEEP 50
+                    SendConfigure rIP(ri), rPort(ri), rAPort(ri)
+                NEXT ri
             END IF
             FUNCTION = 1
             EXIT FUNCTION
