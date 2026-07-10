@@ -55,11 +55,18 @@ extern void rom_i2c_writeReg_Mask(uint8_t block, uint8_t host_id, uint8_t reg_ad
 #define I2S_MEMW() __asm__ __volatile__("memw" ::: "memory")
 
 #define I2S_CHECK(a, str, ret_val)                                    \
-    if (!(a))                                                         \
-    {                                                                 \
-        ESP_LOGE(I2S_TAG, "%s(%d): %s", __FUNCTION__, __LINE__, str); \
-        return (ret_val);                                             \
-    }
+    do {                                                              \
+        if (!(a))                                                     \
+        {                                                             \
+            ESP_LOGE(I2S_TAG, "%s(%d): %s", __FUNCTION__, __LINE__, str); \
+            return (ret_val);                                         \
+        }                                                             \
+    } while (0)
+
+/* FIX VER-3: cast to unsigned so a negative `i2s_num` (e.g. -1) cannot
+ * pass the `< I2S_NUM_MAX` check. Without this, `i2s_port_t(-1)` would
+ * index `p_i2s_obj[-1]` / `I2S[-1]` — out-of-bounds access. */
+#define I2S_PORT_VALID(n) ((unsigned)(n) < (unsigned)I2S_NUM_MAX)
 
 #define dma_intr_enable() _xt_isr_unmask(1 << ETS_SLC_INUM)
 #define dma_intr_disable() _xt_isr_mask(1 << ETS_SLC_INUM)
@@ -109,16 +116,28 @@ typedef struct
     int dma_buf_len;         /*!< DMA buffer length, length of each buffer (may be clamped to 4092)*/
     int dma_buf_len_orig;    /*!< FIX N2: original dma_buf_len from config, not clamped — used so we can grow back when bytes/ch shrink */
 
-    i2s_dma_t *rx;                    /*!< DMA Tx buffer*/
-    i2s_dma_t *tx;                    /*!< DMA Rx buffer*/
+    /* FIX VER-J: comments were swapped. `rx` is the I2S-RX (input) path
+     * which uses the SLC TX link; `tx` is the I2S-TX (output) path which
+     * uses the SLC RX link. Names follow the I2S direction, not the SLC
+     * direction. */
+    i2s_dma_t *rx;                    /*!< I2S RX (input)  — uses SLC TX link */
+    i2s_dma_t *tx;                    /*!< I2S TX (output) — uses SLC RX link */
     int channel_num;                  /*!< Number of channels*/
     int bytes_per_sample;             /*!< Bytes per sample*/
     int bits_per_sample;              /*!< Bits per sample*/
     i2s_mode_t mode;                  /*!< I2S Working mode*/
     uint32_t sample_rate;             /*!< I2S sample rate */
     bool tx_desc_auto_clear;          /*!< I2S auto clear tx descriptor on underflow */
+    volatile bool closing;            /*!< FIX VER-UAF: set to true by i2s_driver_uninstall so concurrent
+                                         * i2s_write/i2s_read can abort early instead of using freed memory. */
     i2s_channel_fmt_t channel_format; /*!< Stored channel_format for proper tx/rx_chan_mod restoration */
-    slc_struct_t *dma;
+    /* FIX VER-VOL: pointer to MMIO registers must be `volatile`-qualified.
+     * The SDK declares `SLC0` as `volatile slc_struct_t`; the old code
+     * stripped that qualifier via `(slc_struct_t *)&SLC0`, letting the
+     * compiler cache / coalesce / elide MMIO accesses — a real hazard
+     * at -O2/-Os. I2S_MEMW() is only a compiler barrier, it does NOT
+     * turn a non-volatile access into a volatile one. */
+    volatile slc_struct_t *dma;
 } i2s_obj_t;
 
 static i2s_obj_t *p_i2s_obj[I2S_NUM_MAX] = {0};
@@ -129,7 +148,7 @@ static esp_err_t i2s_destroy_dma_queue(i2s_port_t i2s_num, i2s_dma_t *dma);
 
 static esp_err_t i2s_reset_fifo(i2s_port_t i2s_num)
 {
-    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
+    I2S_CHECK(I2S_PORT_VALID(i2s_num), "i2s_num error", ESP_ERR_INVALID_ARG);
     I2S_ENTER_CRITICAL();
     I2S[i2s_num]->conf.rx_fifo_reset = 1;
     I2S[i2s_num]->conf.rx_fifo_reset = 0;
@@ -146,7 +165,7 @@ static esp_err_t i2s_reset_fifo(i2s_port_t i2s_num)
 
 static esp_err_t i2s_enable_rx_intr(i2s_port_t i2s_num)
 {
-    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
+    I2S_CHECK(I2S_PORT_VALID(i2s_num), "i2s_num error", ESP_ERR_INVALID_ARG);
     I2S_CHECK(p_i2s_obj[i2s_num], "i2s not installed yet", ESP_FAIL);
     I2S_ENTER_CRITICAL();
     p_i2s_obj[i2s_num]->dma->int_ena.tx_suc_eof = 1;
@@ -157,7 +176,7 @@ static esp_err_t i2s_enable_rx_intr(i2s_port_t i2s_num)
 
 static esp_err_t i2s_disable_rx_intr(i2s_port_t i2s_num)
 {
-    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
+    I2S_CHECK(I2S_PORT_VALID(i2s_num), "i2s_num error", ESP_ERR_INVALID_ARG);
     I2S_CHECK(p_i2s_obj[i2s_num], "i2s not installed yet", ESP_FAIL);
     I2S_ENTER_CRITICAL();
     p_i2s_obj[i2s_num]->dma->int_ena.tx_suc_eof = 0;
@@ -168,7 +187,7 @@ static esp_err_t i2s_disable_rx_intr(i2s_port_t i2s_num)
 
 static esp_err_t i2s_disable_tx_intr(i2s_port_t i2s_num)
 {
-    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
+    I2S_CHECK(I2S_PORT_VALID(i2s_num), "i2s_num error", ESP_ERR_INVALID_ARG);
     I2S_CHECK(p_i2s_obj[i2s_num], "i2s not installed yet", ESP_FAIL);
     I2S_ENTER_CRITICAL();
     p_i2s_obj[i2s_num]->dma->int_ena.rx_eof = 0;
@@ -179,7 +198,7 @@ static esp_err_t i2s_disable_tx_intr(i2s_port_t i2s_num)
 
 static esp_err_t i2s_enable_tx_intr(i2s_port_t i2s_num)
 {
-    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
+    I2S_CHECK(I2S_PORT_VALID(i2s_num), "i2s_num error", ESP_ERR_INVALID_ARG);
     I2S_CHECK(p_i2s_obj[i2s_num], "i2s not installed yet", ESP_FAIL);
     I2S_ENTER_CRITICAL();
     p_i2s_obj[i2s_num]->dma->int_ena.rx_eof = 1;
@@ -191,8 +210,25 @@ static esp_err_t i2s_enable_tx_intr(i2s_port_t i2s_num)
 static void IRAM_ATTR i2s_intr_handler_default(void *arg)
 {
     i2s_obj_t *p_i2s = (i2s_obj_t *)arg;
-    slc_struct_t *dma_reg = p_i2s->dma;
-    i2s_event_t i2s_event;
+    /* FIX VER-VOL: dma_reg must be volatile-qualified to match the field type
+     * (volatile slc_struct_t *). Without this, the compiler may cache
+     * int_st / int_clr / eof_des_addr reads across the function, breaking
+     * the snapshot-then-clear protocol. */
+    volatile slc_struct_t *dma_reg = p_i2s->dma;
+    /* FIX VER-ISR: the event queue stores `i2s_event_t` (typically 8 bytes:
+     * enum + size_t), but DMA queues store `char *` (4 bytes on ESP8266).
+     * The old code used a single `void *discarded_buf` (4 bytes) for both,
+     * causing `xQueueReceiveFromISR` to write 8 bytes into a 4-byte variable
+     * when draining the event queue — stack smash inside ISR.
+     *
+     * Fix: use separate variables. `discarded_buf` is for DMA queues (item
+     * size == sizeof(void*)), `discarded_event` is for the event queue
+     * (item size == sizeof(i2s_event_t)).
+     *
+     * Also zero-init `i2s_event` so the `size` field is not stack garbage
+     * when only `.type` is assigned (FIX VER-EVT). */
+    i2s_event_t i2s_event = {0};
+    i2s_event_t discarded_event = {0};
     void *discarded_buf = NULL;
 
     portBASE_TYPE high_priority_task_awoken = 0;
@@ -235,10 +271,13 @@ static void IRAM_ATTR i2s_intr_handler_default(void *arg)
         if (p_i2s->i2s_queue)
         {
             i2s_event.type = I2S_EVENT_DMA_ERROR;
+            i2s_event.size = 0; /* FIX VER-EVT: explicit init, no stack garbage. */
 
             if (xQueueIsQueueFullFromISR(p_i2s->i2s_queue))
             {
-                xQueueReceiveFromISR(p_i2s->i2s_queue, &discarded_buf, &high_priority_task_awoken);
+                /* FIX VER-ISR: receive into `discarded_event` (i2s_event_t),
+                 * NOT into `discarded_buf` (void*) — sizes differ. */
+                (void)xQueueReceiveFromISR(p_i2s->i2s_queue, &discarded_event, &high_priority_task_awoken);
             }
 
             xQueueSendFromISR(p_i2s->i2s_queue, (void *)&i2s_event, &high_priority_task_awoken);
@@ -276,11 +315,13 @@ static void IRAM_ATTR i2s_intr_handler_default(void *arg)
         if (p_i2s->i2s_queue)
         {
             i2s_event.type = I2S_EVENT_TX_DONE;
+            i2s_event.size = (size_t)p_i2s->tx->buf_size; /* FIX VER-EVT */
 
             if (xQueueIsQueueFullFromISR(p_i2s->i2s_queue))
             {
                 // FIX D2: same defensive check for the event queue receive.
-                (void)xQueueReceiveFromISR(p_i2s->i2s_queue, &discarded_buf, &high_priority_task_awoken);
+                // FIX VER-ISR: receive into discarded_event (i2s_event_t).
+                (void)xQueueReceiveFromISR(p_i2s->i2s_queue, &discarded_event, &high_priority_task_awoken);
             }
 
             xQueueSendFromISR(p_i2s->i2s_queue, (void *)&i2s_event, &high_priority_task_awoken);
@@ -304,12 +345,14 @@ static void IRAM_ATTR i2s_intr_handler_default(void *arg)
         if (p_i2s->i2s_queue)
         {
             i2s_event.type = I2S_EVENT_RX_DONE;
+            i2s_event.size = (size_t)p_i2s->rx->buf_size; /* FIX VER-EVT */
 
             // FIX #27: redundant `p_i2s->i2s_queue &&` removed — we already are inside the if.
             if (xQueueIsQueueFullFromISR(p_i2s->i2s_queue))
             {
                 // FIX D2: defensive check.
-                (void)xQueueReceiveFromISR(p_i2s->i2s_queue, &discarded_buf, &high_priority_task_awoken);
+                // FIX VER-ISR: receive into discarded_event (i2s_event_t).
+                (void)xQueueReceiveFromISR(p_i2s->i2s_queue, &discarded_event, &high_priority_task_awoken);
             }
 
             xQueueSendFromISR(p_i2s->i2s_queue, (void *)&i2s_event, &high_priority_task_awoken);
@@ -355,14 +398,15 @@ static void IRAM_ATTR i2s_intr_handler_default(void *arg)
 // Caveat: a small race window still exists between reading int_st and reading
 // rx_eof_des_addr (same caveat as fix U1). On ESP8266 the SLC hardware does
 // not provide atomic multi-register reads, so this is the best we can do.
-static void i2s_drain_pending_descriptors(i2s_port_t i2s_num)
+static void i2s_drain_pending_descriptors(i2s_port_t i2s_num, BaseType_t *hptw)
 {
     i2s_obj_t *obj = p_i2s_obj[i2s_num];
     if (obj == NULL)
     {
         return;
     }
-    slc_struct_t *dma_reg = obj->dma;
+    /* FIX VER-VOL: same volatile qualification as in the ISR. */
+    volatile slc_struct_t *dma_reg = obj->dma;
 
     // Process pending TX (app -> I2S): descriptor with rx_eof set
     if ((obj->mode & I2S_MODE_TX) && obj->tx && dma_reg->int_st.rx_eof)
@@ -377,10 +421,10 @@ static void i2s_drain_pending_descriptors(i2s_port_t i2s_num)
                 // FIX D2: defensive check — see i2s_intr_handler_default for
                 // the reasoning. discarded_buf stays NULL if receive fails.
                 void *discarded_buf = NULL;
-                (void)xQueueReceiveFromISR(queue, &discarded_buf, NULL);
+                (void)xQueueReceiveFromISR(queue, &discarded_buf, hptw);
             }
             // Enqueue the descriptor's buf_ptr so i2s_write can pick it up.
-            xQueueSendFromISR(queue, &finish_desc->buf_ptr, NULL);
+            (void)xQueueSendFromISR(queue, &finish_desc->buf_ptr, hptw);
         }
     }
 
@@ -398,9 +442,9 @@ static void i2s_drain_pending_descriptors(i2s_port_t i2s_num)
             {
                 // FIX D2: defensive check.
                 void *discarded_buf = NULL;
-                (void)xQueueReceiveFromISR(queue, &discarded_buf, NULL);
+                (void)xQueueReceiveFromISR(queue, &discarded_buf, hptw);
             }
-            xQueueSendFromISR(queue, &finish_desc->buf_ptr, NULL);
+            (void)xQueueSendFromISR(queue, &finish_desc->buf_ptr, hptw);
         }
     }
 }
@@ -493,7 +537,12 @@ static i2s_dma_t *i2s_create_dma_queue(i2s_port_t i2s_num, int dma_buf_count, in
         ESP_LOGD(I2S_TAG, "Addr[%d] = %d", bux_idx, (int)dma->buf[bux_idx]);
     }
 
-    dma->desc = (lldesc_t **)heap_caps_malloc(sizeof(lldesc_t *) * dma_buf_count, MALLOC_CAP_8BIT);
+    /* FIX VER-OOM: use zalloc, not malloc. If a later per-descriptor allocation
+     * fails mid-loop, i2s_destroy_dma_queue walks the whole array and checks
+     * `if (dma->desc[bux_idx])` — with malloc, the unallocated slots contain
+     * garbage and the check passes, leading to heap_caps_free(garbage) →
+     * heap corruption. zalloc guarantees unallocated slots are NULL. */
+    dma->desc = (lldesc_t **)heap_caps_zalloc(sizeof(lldesc_t *) * dma_buf_count, MALLOC_CAP_8BIT);
 
     if (dma->desc == NULL)
     {
@@ -549,7 +598,7 @@ static i2s_dma_t *i2s_create_dma_queue(i2s_port_t i2s_num, int dma_buf_count, in
 
 esp_err_t i2s_start(i2s_port_t i2s_num)
 {
-    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
+    I2S_CHECK(I2S_PORT_VALID(i2s_num), "i2s_num error", ESP_ERR_INVALID_ARG);
     I2S_CHECK(p_i2s_obj[i2s_num], "i2s not installed yet", ESP_FAIL);
     // start DMA link
     I2S_ENTER_CRITICAL();
@@ -597,7 +646,7 @@ esp_err_t i2s_start(i2s_port_t i2s_num)
 
 esp_err_t i2s_stop(i2s_port_t i2s_num)
 {
-    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
+    I2S_CHECK(I2S_PORT_VALID(i2s_num), "i2s_num error", ESP_ERR_INVALID_ARG);
     I2S_CHECK(p_i2s_obj[i2s_num], "i2s not installed yet", ESP_FAIL);
     I2S_ENTER_CRITICAL();
     dma_intr_disable();
@@ -625,17 +674,30 @@ esp_err_t i2s_stop(i2s_port_t i2s_num)
     // i2s_write(portMAX_DELAY) / i2s_read(portMAX_DELAY) stuck forever.
     // i2s_drain_pending_descriptors enqueues the buf_ptrs in task context
     // using the FromISR queue API (safe inside a critical section).
-    i2s_drain_pending_descriptors(i2s_num);
+    //
+    // FIX VER-YLD: pass a real `hptw` instead of NULL. With NULL, a task
+    // blocked in i2s_write/i2s_read that gets woken by the enqueued buf_ptr
+    // is not flagged for context switch — it only runs on the next tick
+    // (up to 10ms latency). With a real flag we can call taskYIELD() after
+    // exiting the critical section to switch immediately.
+    BaseType_t hptw = pdFALSE;
+    i2s_drain_pending_descriptors(i2s_num, &hptw);
 
     p_i2s_obj[i2s_num]->dma->int_clr.val = p_i2s_obj[i2s_num]->dma->int_st.val; // clear pending interrupt
     I2S_MEMW();
     I2S_EXIT_CRITICAL();
+    if (hptw == pdTRUE)
+    {
+        /* FIX VER-YLD: yield so a woken i2s_write/i2s_read task runs
+         * immediately instead of waiting for the next tick. */
+        taskYIELD();
+    }
     return ESP_OK;
 }
 
 esp_err_t i2s_set_pin(i2s_port_t i2s_num, const i2s_pin_config_t *pin)
 {
-    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
+    I2S_CHECK(I2S_PORT_VALID(i2s_num), "i2s_num error", ESP_ERR_INVALID_ARG);
     I2S_CHECK(pin, "param null", ESP_ERR_INVALID_ARG);
 
     // FIX #15: fields of i2s_pin_config_t are `int` (kept as `int` to support
@@ -680,7 +742,7 @@ esp_err_t i2s_set_pin(i2s_port_t i2s_num, const i2s_pin_config_t *pin)
 
 static esp_err_t i2s_set_rate(i2s_port_t i2s_num, uint32_t rate, int bits_per_sample)
 {
-    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
+    I2S_CHECK(I2S_PORT_VALID(i2s_num), "i2s_num error", ESP_ERR_INVALID_ARG);
     I2S_CHECK(p_i2s_obj[i2s_num], "i2s not installed yet", ESP_FAIL);
     // FIX #32: rate == 0 is invalid. Without this check, the divider search loop
     // will pick the largest divider pair (≈1.2 kHz) and silently set a wrong rate.
@@ -728,7 +790,7 @@ done:
 
 esp_err_t i2s_set_clk(i2s_port_t i2s_num, uint32_t rate, i2s_bits_per_sample_t bits, i2s_channel_t ch)
 {
-    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
+    I2S_CHECK(I2S_PORT_VALID(i2s_num), "i2s_num error", ESP_ERR_INVALID_ARG);
     I2S_CHECK(p_i2s_obj[i2s_num], "i2s not installed yet", ESP_FAIL);
     // FIX #21: validate channel count. Without this, ch=0 or ch=3 silently
     // collapses to mono via the `(ch == 2) ? 2 : 1` ternary below.
@@ -799,7 +861,14 @@ esp_err_t i2s_set_clk(i2s_port_t i2s_num, uint32_t rate, i2s_bits_per_sample_t b
     esp_err_t rate_err = i2s_set_rate(i2s_num, rate, bits);
     if (rate_err != ESP_OK)
     {
-        // Release any mutexes we took before returning.
+        /* FIX VER-RATE: i2s_stop() was called above; on rate-validation
+         * failure we must restart the peripheral so the caller does not see
+         * a silently stopped I2S just because they passed rate=0 or another
+         * invalid value. Dividers were not updated, so the old rate is
+         * preserved. */
+        ESP_LOGE(I2S_TAG, "i2s_set_rate failed (0x%x) — restarting I2S to preserve running state",
+                 (int)rate_err);
+        i2s_start(i2s_num);
         if (tx_mux_taken)
             xSemaphoreGive(tx_mux_taken);
         if (rx_mux_taken)
@@ -1150,7 +1219,7 @@ esp_err_t i2s_set_clk(i2s_port_t i2s_num, uint32_t rate, i2s_bits_per_sample_t b
 
 esp_err_t i2s_set_sample_rates(i2s_port_t i2s_num, uint32_t rate)
 {
-    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
+    I2S_CHECK(I2S_PORT_VALID(i2s_num), "i2s_num error", ESP_ERR_INVALID_ARG);
     // FIX #1: if driver was not installed yet, p_i2s_obj[i2s_num] is NULL and the
     // next I2S_CHECK would deref it. Other functions check this; this one didn't.
     I2S_CHECK(p_i2s_obj[i2s_num], "i2s not installed yet", ESP_FAIL);
@@ -1160,7 +1229,7 @@ esp_err_t i2s_set_sample_rates(i2s_port_t i2s_num, uint32_t rate)
 
 static esp_err_t i2s_param_config(i2s_port_t i2s_num, const i2s_config_t *i2s_config)
 {
-    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
+    I2S_CHECK(I2S_PORT_VALID(i2s_num), "i2s_num error", ESP_ERR_INVALID_ARG);
     I2S_CHECK(p_i2s_obj[i2s_num], "i2s not installed yet", ESP_FAIL);
     I2S_CHECK((i2s_config), "param null", ESP_ERR_INVALID_ARG);
 
@@ -1176,6 +1245,13 @@ static esp_err_t i2s_param_config(i2s_port_t i2s_num, const i2s_config_t *i2s_co
 
     // disable all i2s interrupt
     I2S[i2s_num]->int_ena.val = 0;
+
+    /* FIX VER-CSD: explicitly zero conf_single_data. ONLY_RIGHT / ONLY_LEFT
+     * channel modes fill the unused slot from this register; without an
+     * explicit init, a stale value from a previous configuration could be
+     * transmitted on the unused slot. */
+    I2S[i2s_num]->conf_single_data = 0;
+    I2S_MEMW();
 
     // reset dma
     p_i2s_obj[i2s_num]->dma->conf0.rx_rst = 1;
@@ -1319,27 +1395,26 @@ static esp_err_t i2s_param_config(i2s_port_t i2s_num, const i2s_config_t *i2s_co
 
 esp_err_t i2s_zero_dma_buffer(i2s_port_t i2s_num)
 {
-    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
+    I2S_CHECK(I2S_PORT_VALID(i2s_num), "i2s_num error", ESP_ERR_INVALID_ARG);
     I2S_CHECK(p_i2s_obj[i2s_num], "i2s not installed yet", ESP_FAIL);
 
-    // FIX #17: take rx->mux while memset'ing RX buffers, otherwise a parallel
-    //          i2s_read() can be reading these very buffers via curr_ptr.
-    if (p_i2s_obj[i2s_num]->rx && p_i2s_obj[i2s_num]->rx->buf != NULL && p_i2s_obj[i2s_num]->rx->buf_size != 0)
-    {
-        xSemaphoreTake(p_i2s_obj[i2s_num]->rx->mux, (portTickType)portMAX_DELAY);
-        for (int i = 0; i < p_i2s_obj[i2s_num]->dma_buf_count; i++)
-        {
-            memset(p_i2s_obj[i2s_num]->rx->buf[i], 0, p_i2s_obj[i2s_num]->rx->buf_size);
-        }
-        p_i2s_obj[i2s_num]->rx->rw_pos = 0;
-        p_i2s_obj[i2s_num]->rx->curr_ptr = NULL;
-        xSemaphoreGive(p_i2s_obj[i2s_num]->rx->mux);
-    }
-
+    /* FIX VER-DLK: lock order MUST be TX -> RX to match i2s_set_clk(). The
+     * old code acquired RX -> TX, which combined with i2s_set_clk's TX -> RX
+     * ordering created a classic AB-BA deadlock:
+     *   Task A (i2s_set_clk):     holds TX, waits for RX
+     *   Task B (i2s_zero_dma_buf): holds RX, waits for TX
+     *
+     * Also check xSemaphoreTake return — if the mux was destroyed by a
+     * concurrent uninstall, the take may fail and we must NOT proceed to
+     * memset (use-after-free). */
     if (p_i2s_obj[i2s_num]->tx && p_i2s_obj[i2s_num]->tx->buf != NULL && p_i2s_obj[i2s_num]->tx->buf_size != 0)
     {
-        // FIX #17: take tx->mux for the same reason.
-        xSemaphoreTake(p_i2s_obj[i2s_num]->tx->mux, (portTickType)portMAX_DELAY);
+        // FIX #17: take tx->mux so a parallel i2s_write() is excluded.
+        if (xSemaphoreTake(p_i2s_obj[i2s_num]->tx->mux, (portTickType)portMAX_DELAY) != pdTRUE)
+        {
+            ESP_LOGE(I2S_TAG, "i2s_zero_dma_buffer: failed to take tx mux");
+            return ESP_FAIL;
+        }
 
         // FIX R4: removed the dead `align_bytes` computation — it was a leftover
         // from the deleted i2s_write() alignment call (fixes #18/#19) and served
@@ -1351,6 +1426,23 @@ esp_err_t i2s_zero_dma_buffer(i2s_port_t i2s_num)
         p_i2s_obj[i2s_num]->tx->rw_pos = 0;
         p_i2s_obj[i2s_num]->tx->curr_ptr = NULL;
         xSemaphoreGive(p_i2s_obj[i2s_num]->tx->mux);
+    }
+
+    if (p_i2s_obj[i2s_num]->rx && p_i2s_obj[i2s_num]->rx->buf != NULL && p_i2s_obj[i2s_num]->rx->buf_size != 0)
+    {
+        // FIX #17: take rx->mux so a parallel i2s_read() is excluded.
+        if (xSemaphoreTake(p_i2s_obj[i2s_num]->rx->mux, (portTickType)portMAX_DELAY) != pdTRUE)
+        {
+            ESP_LOGE(I2S_TAG, "i2s_zero_dma_buffer: failed to take rx mux");
+            return ESP_FAIL;
+        }
+        for (int i = 0; i < p_i2s_obj[i2s_num]->dma_buf_count; i++)
+        {
+            memset(p_i2s_obj[i2s_num]->rx->buf[i], 0, p_i2s_obj[i2s_num]->rx->buf_size);
+        }
+        p_i2s_obj[i2s_num]->rx->rw_pos = 0;
+        p_i2s_obj[i2s_num]->rx->curr_ptr = NULL;
+        xSemaphoreGive(p_i2s_obj[i2s_num]->rx->mux);
     }
 
     return ESP_OK;
@@ -1365,10 +1457,14 @@ esp_err_t i2s_write(i2s_port_t i2s_num, const void *src, size_t size, size_t *by
     // FIX #22: bytes_written may be NULL; guard against the deref below.
     I2S_CHECK(bytes_written, "bytes_written is NULL", ESP_ERR_INVALID_ARG);
     *bytes_written = 0;
-    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
+    I2S_CHECK(I2S_PORT_VALID(i2s_num), "i2s_num error", ESP_ERR_INVALID_ARG);
     // FIX #2: p_i2s_obj[i2s_num] may be NULL if driver not installed yet.
     I2S_CHECK(p_i2s_obj[i2s_num], "i2s not installed yet", ESP_FAIL);
+    // FIX VER-UAF: abort if driver is being uninstalled.
+    I2S_CHECK(!p_i2s_obj[i2s_num]->closing, "i2s driver is closing", ESP_ERR_INVALID_STATE);
     I2S_CHECK((size < I2S_MAX_BUFFER_SIZE), "size is too large", ESP_ERR_INVALID_ARG);
+    // FIX VER-NULL: src must be non-NULL when size > 0 (memcpy(NULL, ...) crashes).
+    I2S_CHECK((src != NULL || size == 0), "src is NULL", ESP_ERR_INVALID_ARG);
     I2S_CHECK((p_i2s_obj[i2s_num]->tx), "tx NULL", ESP_ERR_INVALID_ARG);
     xSemaphoreTake(p_i2s_obj[i2s_num]->tx->mux, (portTickType)portMAX_DELAY);
 
@@ -1424,10 +1520,14 @@ esp_err_t i2s_read(i2s_port_t i2s_num, void *dest, size_t size, size_t *bytes_re
     I2S_CHECK(bytes_read, "bytes_read is NULL", ESP_ERR_INVALID_ARG);
     *bytes_read = 0;
     dest_byte = (char *)dest;
-    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
+    I2S_CHECK(I2S_PORT_VALID(i2s_num), "i2s_num error", ESP_ERR_INVALID_ARG);
     // FIX #3: p_i2s_obj[i2s_num] may be NULL if driver not installed yet.
     I2S_CHECK(p_i2s_obj[i2s_num], "i2s not installed yet", ESP_FAIL);
+    // FIX VER-UAF: abort if driver is being uninstalled.
+    I2S_CHECK(!p_i2s_obj[i2s_num]->closing, "i2s driver is closing", ESP_ERR_INVALID_STATE);
     I2S_CHECK((size < I2S_MAX_BUFFER_SIZE), "size is too large", ESP_ERR_INVALID_ARG);
+    // FIX VER-NULL: dest must be non-NULL when size > 0 (memcpy(dest, NULL, ...) crashes).
+    I2S_CHECK((dest != NULL || size == 0), "dest is NULL", ESP_ERR_INVALID_ARG);
     I2S_CHECK((p_i2s_obj[i2s_num]->rx), "rx NULL", ESP_ERR_INVALID_ARG);
     xSemaphoreTake(p_i2s_obj[i2s_num]->rx->mux, (portTickType)portMAX_DELAY);
 
@@ -1465,8 +1565,17 @@ esp_err_t i2s_read(i2s_port_t i2s_num, void *dest, size_t size, size_t *bytes_re
 
 esp_err_t i2s_driver_uninstall(i2s_port_t i2s_num)
 {
-    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
+    I2S_CHECK(I2S_PORT_VALID(i2s_num), "i2s_num error", ESP_ERR_INVALID_ARG);
     I2S_CHECK(p_i2s_obj[i2s_num], "already uninstalled", ESP_FAIL);
+
+    /* FIX VER-UAF: mark driver as closing so concurrent i2s_write/i2s_read
+     * abort early instead of using freed memory. The flag is checked at the
+     * entry of those functions. Note: this is a best-effort mitigation — a
+     * writer already blocked in xQueueReceive(portMAX_DELAY) holding the mux
+     * cannot be interrupted by a flag check. For full safety, callers must
+     * not invoke uninstall while another task is in i2s_read/i2s_write. */
+    p_i2s_obj[i2s_num]->closing = true;
+    I2S_MEMW(); /* ensure visible to other tasks */
 
     i2s_stop(i2s_num);
 
@@ -1492,6 +1601,28 @@ esp_err_t i2s_driver_uninstall(i2s_port_t i2s_num)
    rom_i2c_writeReg_Mask(0x67, 4, 4, 7, 7, 0);
    you can’t do this here, it can break other peripherals when uninstalling*/
 
+    /* FIX VER-UAF: take tx->mux and rx->mux with a finite timeout BEFORE
+     * destroying the DMA queues. i2s_stop() above called i2s_drain_pending_descriptors
+     * which enqueues any pending buf_ptrs, so a writer blocked in
+     * xQueueReceive(portMAX_DELAY) will wake up, finish its operation, and
+     * give the mux. If a writer is still stuck (e.g. hardware never produced
+     * EOF), we time out after 1s and proceed anyway — logging a warning.
+     * Without this take/give cycle, vQueueDelete on a queue with a blocked
+     * waiter is undefined behavior in FreeRTOS. */
+    SemaphoreHandle_t tx_mux = (p_i2s_obj[i2s_num]->tx) ? p_i2s_obj[i2s_num]->tx->mux : NULL;
+    SemaphoreHandle_t rx_mux = (p_i2s_obj[i2s_num]->rx) ? p_i2s_obj[i2s_num]->rx->mux : NULL;
+
+    if (tx_mux && xSemaphoreTake(tx_mux, pdMS_TO_TICKS(1000)) != pdTRUE)
+    {
+        ESP_LOGW(I2S_TAG, "i2s_driver_uninstall: tx mux not acquired within 1s — proceeding anyway (concurrent i2s_write may crash)");
+        tx_mux = NULL; /* don't give it back below */
+    }
+    if (rx_mux && xSemaphoreTake(rx_mux, pdMS_TO_TICKS(1000)) != pdTRUE)
+    {
+        ESP_LOGW(I2S_TAG, "i2s_driver_uninstall: rx mux not acquired within 1s — proceeding anyway (concurrent i2s_read may crash)");
+        rx_mux = NULL; /* don't give it back below */
+    }
+
     if (p_i2s_obj[i2s_num]->tx != NULL && p_i2s_obj[i2s_num]->mode & I2S_MODE_TX)
     {
         i2s_destroy_dma_queue(i2s_num, p_i2s_obj[i2s_num]->tx);
@@ -1503,6 +1634,12 @@ esp_err_t i2s_driver_uninstall(i2s_port_t i2s_num)
         i2s_destroy_dma_queue(i2s_num, p_i2s_obj[i2s_num]->rx);
         p_i2s_obj[i2s_num]->rx = NULL;
     }
+
+    /* After destroy, the mux handles we hold are no longer valid — but
+     * i2s_destroy_dma_queue already called vSemaphoreDelete on them, so
+     * we must NOT xSemaphoreGive them. Just clear locals. */
+    (void)tx_mux;
+    (void)rx_mux;
 
     if (p_i2s_obj[i2s_num]->i2s_queue)
     {
@@ -1519,10 +1656,18 @@ esp_err_t i2s_driver_uninstall(i2s_port_t i2s_num)
 esp_err_t i2s_driver_install(i2s_port_t i2s_num, const i2s_config_t *i2s_config, int queue_size, void *i2s_queue)
 {
     esp_err_t err;
-    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
+    I2S_CHECK(I2S_PORT_VALID(i2s_num), "i2s_num error", ESP_ERR_INVALID_ARG);
     I2S_CHECK((i2s_config != NULL), "I2S configuration must not NULL", ESP_ERR_INVALID_ARG);
     I2S_CHECK((i2s_config->dma_buf_count >= 2 && i2s_config->dma_buf_count <= 128), "I2S buffer count less than 128 and more than 2", ESP_ERR_INVALID_ARG);
     I2S_CHECK((i2s_config->dma_buf_len >= 8 && i2s_config->dma_buf_len <= 1024), "I2S buffer length at most 1024 and more than 8", ESP_ERR_INVALID_ARG);
+    /* FIX VER-VAL: validate channel_format — the conf_chan fields are 2-3 bits,
+     * so out-of-range values would be silently truncated into a reserved mode.
+     * Also reject negative sample_rate before it gets coerced to a huge
+     * uint32_t in i2s_set_clk. */
+    I2S_CHECK((i2s_config->channel_format >= I2S_CHANNEL_FMT_RIGHT_LEFT &&
+               i2s_config->channel_format <= I2S_CHANNEL_FMT_ONLY_LEFT),
+              "invalid channel_format", ESP_ERR_INVALID_ARG);
+    I2S_CHECK((i2s_config->sample_rate > 0), "sample_rate must be > 0", ESP_ERR_INVALID_ARG);
     // FIX #23: if user wants an event queue, queue_size must be positive.
     if (i2s_queue != NULL)
     {
@@ -1535,7 +1680,7 @@ esp_err_t i2s_driver_install(i2s_port_t i2s_num, const i2s_config_t *i2s_config,
         I2S_CHECK(p_i2s_obj[i2s_num], "Malloc I2S driver error", ESP_ERR_NO_MEM);
 
         p_i2s_obj[i2s_num]->i2s_num = i2s_num;
-        p_i2s_obj[i2s_num]->dma = (slc_struct_t *)&SLC0;
+        p_i2s_obj[i2s_num]->dma = &SLC0; /* FIX VER-VOL: no cast — keep volatile qualifier */
         p_i2s_obj[i2s_num]->dma_buf_count = i2s_config->dma_buf_count;
         p_i2s_obj[i2s_num]->dma_buf_len = i2s_config->dma_buf_len;
         // FIX N2: remember the user-requested dma_buf_len so that the 4092-byte
@@ -1630,5 +1775,8 @@ esp_err_t i2s_driver_install(i2s_port_t i2s_num, const i2s_config_t *i2s_config,
     }
 
     ESP_LOGW(I2S_TAG, "I2S driver already installed");
-    return ESP_OK;
+    /* FIX VER-INST: returning ESP_OK here is misleading — the new config is
+     * silently ignored, but the caller may believe their config took effect.
+     * Return ESP_ERR_INVALID_STATE so they can detect the no-op. */
+    return ESP_ERR_INVALID_STATE;
 }
