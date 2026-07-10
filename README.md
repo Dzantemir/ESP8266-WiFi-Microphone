@@ -724,7 +724,6 @@ esp8266-wifi-microphone/
 ├── LICENSE                        # MIT
 ├── social_preview.png             # GitHub social preview image
 ├── server.jpg                     # EASSP Server screenshot
-├── SOLUTION.md                    # Audio fix documentation (DMA alignment, drift)
 │
 ├── firmware/                      # ESP8266 firmware (ESP8266 RTOS SDK v3.4)
 │   ├── CMakeLists.txt
@@ -761,13 +760,6 @@ esp8266-wifi-microphone/
 │   ├── eassp_server.bas           # Main app (burst prebuffer, sleep/wake recovery, drift fix, per-device output)
 │   ├── config.inc                 # Constants (JITTER_INITIAL=10, JITTER_MIN=6, JITTER_MAX=12)
 │   └── types.inc                  # DeviceInfo (dwTransport, sHostname, dwWaveDevice)
-│
-├── patches/                       # Documentation of applied fixes
-│   ├── README.md                  # Patch guide
-│   ├── firmware_frame_ms_mod4.patch  # DMA alignment fix (applied in code)
-│   ├── receiver_patch.bas         # Clock drift fix (applied in code)
-│   ├── asrc_alternative.bas       # ASRC alternative (not applied)
-│   └── firmware_optional_status.patch  # Diagnostic (not applied)
 │
 └── docs/
     ├── wiring.md                  # Hardware wiring guide
