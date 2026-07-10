@@ -649,6 +649,147 @@ menu "ADPCM Streamer Configuration"
                 Too low → frequent disconnects on jitter.
                 Too high → pipeline stalls on connection drop.
 
+        config STREAMER_TCP_NODELAY_ENABLED
+            bool "Enable TCP_NODELAY (disable Nagle algorithm)"
+            default y
+            help
+                Sets TCP_NODELAY on client sockets to disable Nagle's algorithm.
+                With Nagle (default), TCP coalesces small writes into larger
+                segments, adding up to ~40ms latency. For low-latency audio
+                (20ms frames), this is critical — each frame must be sent
+                immediately, not batched.
+                Recommended: ON. Disable only for debugging or if the server
+                has issues with small packets.
+
+        config STREAMER_TCP_KEEPALIVE_ENABLED
+            bool "Enable TCP keepalive on client sockets"
+            default y
+            help
+                Sends periodic TCP keepalive probes to detect dead connections
+                (crashed server, WiFi drop without FIN). Without keepalive, a
+                dead peer stays ESTABLISHED forever if no send() is attempted.
+                Recommended: ON for streaming.
+
+        config STREAMER_TCP_KEEPIDLE
+            int "TCP keepalive idle (seconds before first probe)"
+            range 1 300
+            default 10
+            depends on STREAMER_TCP_KEEPALIVE_ENABLED
+            help
+                Seconds of idle time before the first keepalive probe is sent.
+                10s detects a dead server quickly (audio pipeline is silent
+                during AGC noise gate, so send() may not fire for a while).
+
+        config STREAMER_TCP_KEEPINTVL
+            int "TCP keepalive interval (seconds between probes)"
+            range 1 60
+            default 3
+            depends on STREAMER_TCP_KEEPALIVE_ENABLED
+            help
+                Seconds between consecutive keepalive probes after the first.
+
+        config STREAMER_TCP_KEEPCNT
+            int "TCP keepalive count (failed probes = dead)"
+            range 1 20
+            default 3
+            depends on STREAMER_TCP_KEEPALIVE_ENABLED
+            help
+                Number of consecutive failed keepalive probes before declaring
+                the connection dead. Total detection time ≈ keepidle + keepcnt*keepintvl.
+                Default: 10 + 3*3 = 19 seconds.
+
+        config STREAMER_TCP_LINGER_ENABLED
+            bool "Enable SO_LINGER=0 on client sockets (RST close, skip TIME_WAIT)"
+            default y
+            help
+                Forces RST close instead of FIN, skipping TIME_WAIT entirely.
+                Prevents heap exhaustion during rapid reconnect cycles (each
+                TIME_WAIT PCB holds ~8KB of pbuf memory on ESP8266 lwIP).
+                Appropriate for streaming audio — we don't care about in-flight
+                data when closing (the next connection restarts the stream
+                with fresh seq numbers).
+
+    endmenu
+
+    # ===================================================================
+    #  Supervisor Task (software watchdog)
+    # ===================================================================
+
+    menu "Supervisor Task (software watchdog)"
+
+        config STREAMER_SUPERVISOR_ENABLED
+            bool "Enable supervisor task (software watchdog)"
+            default y
+            help
+                A dedicated low-priority task that monitors system health and
+                calls esp_restart() if anything goes wrong. The ESP8266
+                hardware WDT is fed by the IDLE task and only fires when a
+                task hogs the CPU without yielding. The supervisor catches
+                "soft" deadlocks where tasks yield (vTaskDelay, xQueueReceive
+                with timeout, sendto with SO_SNDTIMEO) but no useful work
+                happens — e.g. sendto ENOMEM, deadlocked mutex, heap
+                exhaustion death spiral.
+                Recommended: ON. Disable only for debugging.
+
+        config STREAMER_TASK_STACK_SUPERVISOR
+            int "Supervisor task stack size (bytes)"
+            range 512 4096
+            default 2048
+            depends on STREAMER_SUPERVISOR_ENABLED
+
+        config STREAMER_TASK_PRIO_SUPERVISOR
+            int "Supervisor task priority"
+            range 1 4
+            default 1
+            depends on STREAMER_SUPERVISOR_ENABLED
+            help
+                MUST be low priority (1-2). The supervisor runs when the
+                system is idle — which is exactly when deadlocked tasks are
+                yielding. A high-priority supervisor would preempt useful work.
+
+        config STREAMER_SUPERVISOR_MIN_HEAP
+            int "Supervisor minimum free heap (bytes)"
+            range 4096 32768
+            default 15360
+            depends on STREAMER_SUPERVISOR_ENABLED
+            help
+                If free heap drops below this, the supervisor resets the ESP.
+                Normal operation: ~52KB free. After 1 TIME_WAIT leak: ~41KB.
+                After 2: ~30KB. 15KB is the minimum for pools + WiFi + lwIP.
+                Lower = more tolerant (but risk death spiral).
+                Higher = more aggressive (but false resets on peak usage).
+
+        config STREAMER_SUPERVISOR_STALL_TIMEOUT
+            int "Supervisor pipeline stall timeout (ms)"
+            range 5000 60000
+            default 15000
+            depends on STREAMER_SUPERVISOR_ENABLED
+            help
+                If streaming is active for this long and neither I2S nor TX
+                counters have advanced since the last check, the pipeline is
+                deadlocked → reset. 15s matches the server's DISCOVER watchdog.
+                Lower = faster recovery (but false resets during slow WiFi).
+                Higher = more tolerant (but longer outage before reset).
+
+        config STREAMER_SUPERVISOR_MIN_STACK
+            int "Supervisor minimum free stack (bytes)"
+            range 64 2048
+            default 256
+            depends on STREAMER_SUPERVISOR_ENABLED
+            help
+                If any pipeline task's stack high-water mark drops below this,
+                reset. 256 bytes is dangerously close to overflow.
+
+        config STREAMER_SUPERVISOR_CHECK_INTERVAL
+            int "Supervisor check interval (ms)"
+            range 500 10000
+            default 2000
+            depends on STREAMER_SUPERVISOR_ENABLED
+            help
+                How often the supervisor runs its checks. 2s gives fast
+                detection without CPU waste. Lower = faster detection (more
+                CPU). Higher = less CPU (slower detection).
+
     endmenu
 
 endmenu

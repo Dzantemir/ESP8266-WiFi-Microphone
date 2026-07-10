@@ -523,6 +523,105 @@ uint32_t i2s_capture_compute_frame_ms(uint32_t sample_rate, int channels,
 #define TASK_STACK_SVC      3584
 #endif
 
+/* ---- Supervisor task ---- */
+#ifdef CONFIG_STREAMER_TASK_STACK_SUPERVISOR
+#define TASK_STACK_SUPERVISOR  CONFIG_STREAMER_TASK_STACK_SUPERVISOR
+#else
+#define TASK_STACK_SUPERVISOR  2048
+#endif
+
+#ifdef CONFIG_STREAMER_TASK_PRIO_SUPERVISOR
+#define TASK_PRIO_SUPERVISOR   CONFIG_STREAMER_TASK_PRIO_SUPERVISOR
+#else
+#define TASK_PRIO_SUPERVISOR   1
+#endif
+
+#ifdef CONFIG_STREAMER_SUPERVISOR_MIN_HEAP
+#define SUPERVISOR_MIN_HEAP_BYTES   CONFIG_STREAMER_SUPERVISOR_MIN_HEAP
+#else
+#define SUPERVISOR_MIN_HEAP_BYTES   15360
+#endif
+
+#ifdef CONFIG_STREAMER_SUPERVISOR_STALL_TIMEOUT
+#define SUPERVISOR_STALL_TIMEOUT_MS CONFIG_STREAMER_SUPERVISOR_STALL_TIMEOUT
+#else
+#define SUPERVISOR_STALL_TIMEOUT_MS 15000
+#endif
+
+#ifdef CONFIG_STREAMER_SUPERVISOR_MIN_STACK
+#define SUPERVISOR_MIN_STACK_BYTES  CONFIG_STREAMER_SUPERVISOR_MIN_STACK
+#else
+#define SUPERVISOR_MIN_STACK_BYTES  256
+#endif
+
+#ifdef CONFIG_STREAMER_SUPERVISOR_CHECK_INTERVAL
+#define SUPERVISOR_CHECK_INTERVAL_MS CONFIG_STREAMER_SUPERVISOR_CHECK_INTERVAL
+#else
+#define SUPERVISOR_CHECK_INTERVAL_MS 2000
+#endif
+
+/* ---- TCP socket options ----
+ * NOTE: macro names use CFG_ prefix to avoid collisions with lwIP
+ * socket option constants (TCP_NODELAY, TCP_KEEPIDLE, TCP_KEEPINTVL,
+ * TCP_KEEPCNT are all defined in lwIP/sockets.h). */
+#ifdef CONFIG_STREAMER_TCP_NODELAY_ENABLED
+#define CFG_TCP_NODELAY_ENABLED    1
+#else
+#define CFG_TCP_NODELAY_ENABLED    0
+#endif
+
+/* ---- TCP keepalive ---- */
+#ifdef CONFIG_STREAMER_TCP_KEEPALIVE_ENABLED
+#define CFG_TCP_KEEPALIVE_ENABLED  1
+#else
+#define CFG_TCP_KEEPALIVE_ENABLED  0
+#endif
+
+#ifdef CONFIG_STREAMER_TCP_KEEPIDLE
+#define CFG_TCP_KEEPIDLE_SEC       CONFIG_STREAMER_TCP_KEEPIDLE
+#else
+#define CFG_TCP_KEEPIDLE_SEC       10
+#endif
+
+#ifdef CONFIG_STREAMER_TCP_KEEPINTVL
+#define CFG_TCP_KEEPINTVL_SEC      CONFIG_STREAMER_TCP_KEEPINTVL
+#else
+#define CFG_TCP_KEEPINTVL_SEC      3
+#endif
+
+#ifdef CONFIG_STREAMER_TCP_KEEPCNT
+#define CFG_TCP_KEEPCNT            CONFIG_STREAMER_TCP_KEEPCNT
+#else
+#define CFG_TCP_KEEPCNT            3
+#endif
+
+#ifdef CONFIG_STREAMER_TCP_LINGER_ENABLED
+#define CFG_TCP_LINGER_ENABLED     1
+#else
+#define CFG_TCP_LINGER_ENABLED     0
+#endif
+
+/* ---- Supervisor task ----
+ * Software watchdog that monitors heap, pipeline liveness, and stack
+ * health. Runs independently of the streaming pipeline. If any check
+ * fails, calls esp_restart() immediately. See supervisor_task_fn in
+ * main.c for details. */
+#ifdef CONFIG_STREAMER_TASK_STACK_SUPERVISOR
+#define TASK_STACK_SUPERVISOR  CONFIG_STREAMER_TASK_STACK_SUPERVISOR
+#else
+#define TASK_STACK_SUPERVISOR  2048
+#endif
+
+#ifdef CONFIG_STREAMER_TASK_PRIO_SUPERVISOR
+#define TASK_PRIO_SUPERVISOR   CONFIG_STREAMER_TASK_PRIO_SUPERVISOR
+#else
+#define TASK_PRIO_SUPERVISOR   1    /* low prio — runs when system is idle */
+#endif
+
+/* (Heap threshold, stall timeout, stack threshold, and check interval are
+ *  defined above via CONFIG_STREAMER_SUPERVISOR_* macros — see lines ~538-560.
+ *  Do NOT redefine them here.) */
+
 /* PCM/ADPCM pool sizes are computed at runtime in start_streaming() from
  * free heap and frame_ms - see main.c. No compile-time setting needed. */
 

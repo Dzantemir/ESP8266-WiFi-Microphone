@@ -102,6 +102,15 @@ static int s_bits_per_sample = 16; /* I2S bit depth (16 or 24) */
 static TaskHandle_t s_task_handles[TASK_IDX_COUNT] = {NULL};
 static SemaphoreHandle_t s_task_done_sems[TASK_IDX_COUNT] = {NULL};
 
+#ifdef CONFIG_STREAMER_SUPERVISOR_ENABLED
+/* ---- Supervisor liveness counters ----
+ * Incremented by I2S and TX tasks on each successful frame/send.
+ * Read by supervisor_task_fn to detect pipeline deadlocks. */
+static volatile uint32_t s_supervisor_i2s_count = 0;
+static volatile uint32_t s_supervisor_tx_count = 0;
+static volatile TickType_t s_supervisor_stream_start_tick = 0;
+#endif /* CONFIG_STREAMER_SUPERVISOR_ENABLED */
+
 /* ---- Stream control EventGroup ---- */
 
 static EventGroupHandle_t s_stream_evt_grp = NULL;
@@ -277,6 +286,9 @@ static void i2s_task_fn(void *arg)
         }
 
         ok_count++;
+#ifdef CONFIG_STREAMER_SUPERVISOR_ENABLED
+        s_supervisor_i2s_count++;
+#endif
         /* Log first successful read + every 1000 - shows pipeline is alive. */
         if (ok_count == 1)
         {
@@ -614,6 +626,9 @@ static void stream_task_fn(void *arg)
         if (transport_send(pkt, PKT_HDR_SIZE + adpcm->data_len) == ESP_OK)
         {
             sent++;
+#ifdef CONFIG_STREAMER_SUPERVISOR_ENABLED
+            s_supervisor_tx_count++;
+#endif
             /* FIX (FW#1): commit seq only on successful send. If send fails,
              * seq_counter stays the same -> next frame reuses this seq ->
              * server sees no gap -> no false PLC -> no click. */
@@ -1114,6 +1129,9 @@ static esp_err_t start_streaming(void)
 
     /* 9. Create pipeline tasks. */
     xEventGroupSetBits(s_stream_evt_grp, STREAM_EVT_ACTIVE);
+#ifdef CONFIG_STREAMER_SUPERVISOR_ENABLED
+    s_supervisor_stream_start_tick = xTaskGetTickCount();
+#endif
 
     /* Choose encoder task: adpcm_task_fn for ADPCM, pcm_task_fn for PCM. */
     TaskFunction_t enc_task_fn = (s_codec_mode == CODEC_MODE_PCM)
@@ -1290,6 +1308,136 @@ static void stop_streaming(void)
     ESP_LOGI(TAG, "Streaming stopped (%d/3 tasks exited cleanly)", clean_exits);
 }
 
+#ifdef CONFIG_STREAMER_SUPERVISOR_ENABLED
+/* ====================================================================
+ * Supervisor task — software watchdog
+ * ====================================================================
+ *
+ * Runs independently of the streaming pipeline. Checks every
+ * SUPERVISOR_CHECK_INTERVAL_MS:
+ *   1. Free heap >= SUPERVISOR_MIN_HEAP_BYTES
+ *   2. If streaming active for > SUPERVISOR_STALL_TIMEOUT_MS:
+ *      I2S or TX counter must have advanced since last check
+ *   3. All pipeline task stacks have > SUPERVISOR_MIN_STACK_BYTES free
+ *
+ * If any check fails, log the reason and call esp_restart().
+ *
+ * WHY: the ESP8266 hardware WDT is fed by the IDLE task, so it only
+ * fires when a task hogs the CPU without yielding. The deadlocks we've
+ * seen (sendto/send stuck with timeout, deadlocked mutex, heap
+ * exhaustion) all involve tasks that DO yield — IDLE runs, HW WDT gets
+ * fed, but no useful work happens. The supervisor catches these by
+ * checking application-level liveness (frame counters) and heap health.
+ *
+ * The supervisor has LOW priority (TASK_PRIO_SUPERVISOR=1), so it only
+ * runs when the system is idle — which is exactly when deadlocked tasks
+ * are yielding. */
+static void supervisor_task_fn(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "Supervisor task started (interval=%dms, min_heap=%u, stall=%dms)",
+             SUPERVISOR_CHECK_INTERVAL_MS,
+             (unsigned)SUPERVISOR_MIN_HEAP_BYTES,
+             SUPERVISOR_STALL_TIMEOUT_MS);
+
+    uint32_t last_i2s_count = 0;
+    uint32_t last_tx_count = 0;
+    TickType_t last_check_tick = xTaskGetTickCount();
+
+    while (1)
+    {
+        vTaskDelay(pdMS_TO_TICKS(SUPERVISOR_CHECK_INTERVAL_MS));
+
+        TickType_t now = xTaskGetTickCount();
+
+        /* ---- Check 1: Heap ---- */
+        uint32_t free_heap = esp_get_free_heap_size();
+        if (free_heap < SUPERVISOR_MIN_HEAP_BYTES)
+        {
+            ESP_LOGE(TAG, "SUPERVISOR: free heap %u < %u — REBOOT",
+                     (unsigned)free_heap, (unsigned)SUPERVISOR_MIN_HEAP_BYTES);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            esp_restart();
+        }
+
+        /* ---- Check 2: Pipeline liveness ---- */
+        if (streaming_is_active())
+        {
+            TickType_t stream_elapsed = now - s_supervisor_stream_start_tick;
+            TickType_t since_last = now - last_check_tick;
+
+            /* Only check after grace period has passed since stream start.
+             * During startup, counters may not move for legitimate reasons
+             * (I2S DMA fill, WiFi connect, etc.). */
+            if (stream_elapsed >= pdMS_TO_TICKS(SUPERVISOR_STALL_TIMEOUT_MS))
+            {
+                uint32_t cur_i2s = s_supervisor_i2s_count;
+                uint32_t cur_tx = s_supervisor_tx_count;
+
+                bool i2s_advanced = (cur_i2s != last_i2s_count);
+                bool tx_advanced = (cur_tx != last_tx_count);
+
+                if (!i2s_advanced && !tx_advanced)
+                {
+                    /* Neither counter moved since last check.
+                     * Pipeline is fully deadlocked. */
+                    ESP_LOGE(TAG, "SUPERVISOR: pipeline stalled — "
+                             "I2S=%u (was %u), TX=%u (was %u), "
+                             "stream_elapsed=%ums, since_check=%ums — REBOOT",
+                             (unsigned)cur_i2s, (unsigned)last_i2s_count,
+                             (unsigned)cur_tx, (unsigned)last_tx_count,
+                             (unsigned)(stream_elapsed * portTICK_PERIOD_MS),
+                             (unsigned)(since_last * portTICK_PERIOD_MS));
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    esp_restart();
+                }
+
+                /* Partial deadlock: I2S producing frames but TX not sending.
+                 * TX task is stuck (sendto timeout, transport not ready, etc.). */
+                if (i2s_advanced && !tx_advanced &&
+                    since_last >= pdMS_TO_TICKS(SUPERVISOR_STALL_TIMEOUT_MS))
+                {
+                    ESP_LOGE(TAG, "SUPERVISOR: TX stalled but I2S active — "
+                             "I2S=%u (was %u), TX=%u (was %u) — REBOOT",
+                             (unsigned)cur_i2s, (unsigned)last_i2s_count,
+                             (unsigned)cur_tx, (unsigned)last_tx_count);
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    esp_restart();
+                }
+
+                last_i2s_count = cur_i2s;
+                last_tx_count = cur_tx;
+            }
+        }
+        else
+        {
+            /* Not streaming — reset baselines so next stream start is clean */
+            last_i2s_count = s_supervisor_i2s_count;
+            last_tx_count = s_supervisor_tx_count;
+        }
+
+        /* ---- Check 3: Stack high-water mark ---- */
+        for (int i = 0; i < TASK_IDX_COUNT; i++)
+        {
+            if (s_task_handles[i])
+            {
+                UBaseType_t hwm = uxTaskGetStackHighWaterMark(s_task_handles[i]);
+                if (hwm < (SUPERVISOR_MIN_STACK_BYTES / sizeof(StackType_t)))
+                {
+                    ESP_LOGE(TAG, "SUPERVISOR: task %d stack low (%u words) — REBOOT",
+                             i, (unsigned)hwm);
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    esp_restart();
+                }
+            }
+        }
+
+        last_check_tick = now;
+    }
+}
+
+#endif /* CONFIG_STREAMER_SUPERVISOR_ENABLED */
+
 /* ====================================================================
  * app_main
  * ==================================================================== */
@@ -1402,6 +1550,25 @@ void app_main(void)
     /* 7. AT command interface. */
 #if AT_CMD_ENABLED
     at_cmd_init();
+#endif
+
+    /* 7.5. Supervisor task — software watchdog.
+     * Started BEFORE the main loop so it's always running, even if
+     * streaming never starts. Catches heap leaks and stack overflows
+     * in any state (IDLE, streaming, transition).
+     * Configurable via menuconfig (CONFIG_STREAMER_SUPERVISOR_ENABLED). */
+#ifdef CONFIG_STREAMER_SUPERVISOR_ENABLED
+    {
+        TaskHandle_t h = NULL;
+        if (xTaskCreate(supervisor_task_fn, "supervisor",
+                        TASK_STACK_SUPERVISOR, NULL,
+                        TASK_PRIO_SUPERVISOR, &h) != pdPASS)
+        {
+            ESP_LOGE(TAG, "Failed to create supervisor task — continuing (no soft-WDT)");
+        }
+    }
+#else
+    ESP_LOGI(TAG, "Supervisor task disabled (menuconfig)");
 #endif
 
     /* 8. Auto-start streaming if the mode requires it

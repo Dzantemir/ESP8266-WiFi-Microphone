@@ -21,6 +21,8 @@
 #include "tcp_stream.h"
 #include "svc_port.h" /* FIX (H1): for svc_port_get_server_ip() */
 
+
+
 #ifndef IPTOS_DSCP_EF
 #define IPTOS_DSCP_EF 0xB8
 #endif
@@ -111,11 +113,9 @@ static void tcp_accept_task_fn(void *arg)
          *   stays ESTABLISHED forever if stream_task_fn isn't calling
          *   send() (e.g. AGC noise gate below threshold). 10s idle,
          *   3s interval, 3 probes = dead in ~19s. */
-#if CFG_TCP_NODELAY_ENABLED
         int flag = 1;
         if (setsockopt(new_sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) != 0)
             ESP_LOGW(TAG, "TCP_NODELAY setsockopt failed: errno=%d", errno);
-#endif
 
         int tos = IPTOS_DSCP_EF;
         if (setsockopt(new_sock, IPPROTO_IP, IP_TOS, &tos, sizeof(tos)) != 0)
@@ -130,42 +130,15 @@ static void tcp_accept_task_fn(void *arg)
             ESP_LOGW(TAG, "SO_SNDTIMEO setsockopt failed: errno=%d", errno);
 
         /* FIX (M7/T4): TCP keepalive so a crashed server is detected even
-         * when the audio pipeline is silent (no send() calls to time out).
-         * Values are configurable via menuconfig:
-         *   CONFIG_STREAMER_TCP_KEEPIDLE  — seconds before first probe
-         *   CONFIG_STREAMER_TCP_KEEPINTVL — seconds between probes
-         *   CONFIG_STREAMER_TCP_KEEPCNT   — failed probes = dead
-         * Total detection time ≈ keepidle + keepcnt * keepintvl. */
-#if CFG_TCP_KEEPALIVE_ENABLED
+         * when the audio pipeline is silent (no send() calls to time out). */
         int keepalive = 1;
-        int keepidle = CFG_TCP_KEEPIDLE_SEC;
-        int keepintvl = CFG_TCP_KEEPINTVL_SEC;
-        int keepcnt = CFG_TCP_KEEPCNT;
+        int keepidle = 10; /* seconds before first probe */
+        int keepintvl = 3; /* seconds between probes */
+        int keepcnt = 3;   /* failed probes = dead */
         setsockopt(new_sock, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
         setsockopt(new_sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
         setsockopt(new_sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
         setsockopt(new_sock, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
-#endif
-
-        /* FIX (ESP-RECONNECT-LEAK): SO_LINGER with linger=0 to force RST
-         * close instead of FIN. This skips TIME_WAIT entirely, preventing
-         * heap exhaustion during rapid reconnect cycles.
-         *
-         * Without this, each closed TCP connection enters TIME_WAIT for
-         * 60-120 seconds on ESP8266 lwIP, holding ~8KB of pbuf memory.
-         * After 3-4 rapid reconnects (e.g., server stop+start cycles),
-         * 24-32KB of heap is consumed by TIME_WAIT PCBs -> sendto ENOMEM,
-         * send EAGAIN -> death spiral -> only a reboot clears it.
-         *
-         * Configurable via menuconfig (CONFIG_STREAMER_TCP_LINGER_ENABLED).
-         * Default: ON (recommended for streaming audio — we don't care
-         * about in-flight data when closing). */
-#if CFG_TCP_LINGER_ENABLED
-        struct linger ling;
-        ling.l_onoff = 1;
-        ling.l_linger = 0;
-        setsockopt(new_sock, SOL_SOCKET, SO_LINGER, &ling, sizeof(ling));
-#endif
 
         /* FIX (Bug #2): close old client and install new one ATOMICALLY under
          * the mutex. Previously the order was:
@@ -403,7 +376,7 @@ esp_err_t tcp_stream_deinit(void)
         if (s_accept_task)
         {
             ESP_LOGW(TAG, "tcp_stream: accept task did not exit in 2s - "
-                          "leaving it (will self-delete; reboot if socket issues)");
+                     "leaving it (will self-delete; reboot if socket issues)");
         }
         s_accept_task = NULL;
     }
