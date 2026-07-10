@@ -9,7 +9,7 @@
 [![PowerBASIC](https://img.shields.io/badge/PowerBASIC-10-red.svg)](https://www.powerbasic.com/)
 [![Platform](https://img.shields.io/badge/Platform-ESP8266%20%7C%20Windows-lightgrey.svg)]()
 
-**24-bit I2S capture • TPDF dithering • IMA ADPCM / PCM • UDP / TCP / Raw 802.11 TX • Real-time playback • WAV recording**
+**24-bit I2S capture • TPDF dithering • IMA ADPCM / PCM • UDP / TCP / Raw 802.11 TX • Real-time playback • WAV recording • Supervisor watchdog • Deep sleep recovery**
 
 </div>
 
@@ -37,7 +37,9 @@
 - **UDP Mode**: Standard WiFi via router, 5+ Mbps throughput
 - **TCP Mode**: ESP = listener, server connects. Length-prefix framing,
   guaranteed delivery, blocking send with backpressure. Persistent
-  listening socket across stop→start cycles (no EADDRINUSE)
+  listening socket across stop→start cycles (no EADDRINUSE).
+  Configurable via menuconfig: TCP_NODELAY, keepalive (idle/interval/count),
+  SO_LINGER=0 (skip TIME_WAIT, prevent heap exhaustion)
 - **Raw 802.11 TX Mode**: Broadcast directly to Monitor Mode receiver
   - No router needed, fixed 11 Mbps TX rate (802.11b)
   - Sequence-numbered frames with auto-increment
@@ -71,6 +73,26 @@ Switchable at runtime via `AT+XPORT=0|1|2` + `AT+HOTRESTART`
 </td>
 </tr>
 <tr>
+<td width="50%" valign="top">
+
+### 🛡️ Reliability & Auto-Recovery
+- **Supervisor task** (software watchdog): monitors heap, pipeline liveness
+  (I2S/TX frame counters), and stack high-water marks. If anything goes
+  wrong → instant `esp_restart()`. Catches "soft" deadlocks the HW WDT
+  can't see (tasks yield but do no work)
+- **WiFi boot retry + deep sleep**: on boot, tries AP connection N times.
+  If all fail → deep sleep 1–2 min → reboot → retry. Prevents zombie
+  state when AP is unreachable (power outage, out of range)
+- **TCP reconnect leak fix**: `tcp_stream_init_listen()` no longer kills
+  valid pre-connected clients. Eliminates TIME_WAIT heap exhaustion
+  (-24KB per 3-4 stop+start cycles)
+- **SO_LINGER=0** on TCP client sockets: RST close skips TIME_WAIT entirely
+- **Sleep/wake recovery**: receiver detects PC sleep/wake, forces
+  CONFIGURE resend + TCP reconnect + WaveOut reopen. Survives 15+ min sleep
+- **Burst-submit prebuffer**: jitter buffer accumulates frames without
+  draining, then burst-submits all at once — eliminates startup underrun clicks
+
+</td>
 <td width="50%" valign="top">
 
 ### 🎛️ Full AT Command Interface
@@ -135,13 +157,24 @@ Switchable at runtime via `AT+XPORT=0|1|2` + `AT+HOTRESTART`
  │  ┌──────────┐  ┌───────────┐  ┌──────────┐             │
  │  │ I2S Task │->│ Enc Task  │->│ TX Task  │             │
  │  │ prio: 5  │  │ prio: 3   │  │ prio: 2  │             │
- │  └──────────┘  └───────────┘  └──────────┘             │
+ │  └────┬─────┘  └─────┬─────┘  └────┬─────┘             │
  │       │              │              │                   │
  │  Gain/AGC       ADPCM nibbles   transport_send()       │
  │  TPDF dither    or PCM copy     (vtable dispatch)      │
  │  I2S timing                     ┌─────┬─────┬───────┐  │
  │                                 │ UDP │ TCP │ RawTX │  │
  │                                 └─────┴─────┴───────┘  │
+ │                                                         │
+ │  ┌──────────────────────────────────────────────────┐  │
+ │  │ Supervisor Task (prio: 1 — software watchdog)   │  │
+ │  │   • Heap < 15KB? → esp_restart()               │  │
+ │  │   • Pipeline stalled 15s? → esp_restart()      │  │
+ │  │   • Stack < 256B? → esp_restart()              │  │
+ │  └──────────────────────────────────────────────────┘  │
+ │  ┌──────────────────────────────────────────────────┐  │
+ │  │ WiFi Boot Retry (on startup)                    │  │
+ │  │   • Try AP ×3 → deep sleep 2 min → reboot       │  │
+ │  └──────────────────────────────────────────────────┘  │
  └─────────────────────────────────────────────────────────┘
                           │
             ┌─────────────┼─────────────┐
@@ -161,11 +194,14 @@ Switchable at runtime via `AT+XPORT=0|1|2` + `AT+HOTRESTART`
  │                           ├── Yes -> Reopen WaveOut     │
  │                           └── No  -> Continue           │
  │                                                         │
+ │  + Burst-submit prebuffer (click-free startup)         │
+ │  + Overflow vs underrun distinction (no false clicks)  │
  │  + Clock drift fix (EspActualRate → 43860 Hz)          │
  │  + WAV Recording (1 GB auto-split)                     │
  │  + ListView with live device stats                     │
  │  + Multi-device simultaneous streaming                 │
  │  + TCP reconnect on disconnect                         │
+ │  + Sleep/wake recovery (CONFIGURE + TCP + WaveOut)     │
  │                                                         │
  └─────────────────────────────────────────────────────────┘
 ```
@@ -290,6 +326,26 @@ AT+AGC=3              # 0=OFF 1=Studio 2=Podcast 3=Balanced 4=Fast 5=Noisy 6=Mus
 AT+XPORT=0          # 0=UDP (default), 1=TCP, 2=Raw 802.11 TX
 AT+HOTRESTART       # Apply changes without reboot
 ```
+
+<details>
+<summary>⚙️ Advanced: tune reliability features via menuconfig (optional)</summary>
+
+The firmware includes several reliability features that are **on by default**
+but can be tuned via `idf.py menuconfig` → **ADPCM Streamer Configuration**:
+
+- **WiFi Boot Retry** — retry AP connection N times, then deep sleep + reboot.
+  Tune: attempts (default 3), sleep duration (default 2 min), sleep mode
+  (deep sleep vs soft sleep).
+- **Supervisor Task** — software watchdog that resets the ESP on heap
+  exhaustion, pipeline stall, or stack overflow. Tune: min heap (default 15 KB),
+  stall timeout (default 15s), check interval (default 2s).
+- **TCP socket options** — TCP_NODELAY, keepalive (idle/interval/count),
+  SO_LINGER=0. All enabled by default, individually toggleable.
+
+These defaults work well for most setups. Change them only if you experience
+false resets or need different behavior.
+
+</details>
 
 ### 3. Start the Receiver
 
@@ -550,6 +606,114 @@ requires only a new `.c` file + one entry in `stream_mode.c`.
 
 ---
 
+## 🛡️ Reliability & Auto-Recovery
+
+This project is designed for **unattended 24/7 operation**. Multiple layers of
+fault detection and recovery ensure the system keeps working even when things
+go wrong.
+
+### Supervisor Task (Software Watchdog)
+
+The ESP8266 hardware watchdog (WDT) is fed by the IDLE task and only fires when
+a task **hogs the CPU without yielding**. But the most insidious bugs involve
+tasks that **do yield** (via `vTaskDelay`, `xQueueReceive` with timeout,
+`sendto` with `SO_SNDTIMEO`) but produce no useful work — soft deadlocks the
+HW WDT cannot detect.
+
+The **supervisor task** (low priority, runs when system is idle) checks every
+2 seconds:
+
+| Check | Threshold | What it catches |
+|-------|-----------|-----------------|
+| Free heap | < 15 KB | TIME_WAIT leak, pbuf leak, heap fragmentation death spiral |
+| Pipeline liveness | I2S + TX counters stalled 15s | Deadlocked mutex, sendto timeout loop, orphaned task |
+| TX stalled, I2S active | TX not sending 15s, I2S reading | TX task stuck in send(), transport not ready |
+| Stack high-water mark | < 256 bytes | Stack overflow (would corrupt heap or crash erratically) |
+
+If any check fails: log the reason → `esp_restart()` → clean reboot.
+
+**Configurable** via menuconfig (enable/disable, thresholds, interval).
+
+### WiFi Boot Retry + Deep Sleep
+
+On boot (after power-on or reset), the ESP tries to connect to the AP multiple
+times. If all attempts fail, it enters deep sleep for a configurable duration,
+then reboots and retries. This prevents the ESP from hanging in a zombie state
+when the AP is unreachable (power outage, AP reboot, out of range).
+
+```
+Boot → WiFi init → Attempt 1/3 (15s timeout)
+                         ├─ Success → normal operation
+                         └─ Fail → Attempt 2/3
+                                    ├─ Success → normal operation
+                                    └─ Fail → Attempt 3/3
+                                               ├─ Success → normal operation
+                                               └─ Fail → DEEP SLEEP 2 min
+                                                          → reboot → repeat
+```
+
+- **Only for UDP (transport=0) and TCP (transport=1)**. RawTX (2) doesn't use
+  AP association — skipped.
+- **Deep sleep mode** (default): requires GPIO16 (XPD_DCDC) connected to RST.
+  Lowest power. On wake, ESP reboots and runs `app_main` from scratch.
+- **Soft sleep mode**: `vTaskDelay` + `esp_restart()`. Works without hardware
+  modification, but uses more power.
+
+**Configurable** via menuconfig (attempts, sleep duration, sleep mode).
+
+### TCP Reconnect Leak Fix
+
+**Bug**: `tcp_stream_init_listen()` unconditionally closed any active client
+connection when reusing the listening socket. This killed valid connections
+that the server established **before** `start_streaming()` ran, causing:
+
+1. Each killed connection → TIME_WAIT → leaks ~8 KB pbuf memory
+2. After 3–4 stop+start cycles: 24–32 KB leaked → heap exhausted
+3. `sendto` ENOMEM, `send` EAGAIN → death spiral → only reboot clears it
+
+**Fix**: The reuse path no longer closes the active client. If a client is
+already connected (server pre-connected), it's kept — the TX task starts
+sending immediately.
+
+**SO_LINGER=0** on client sockets forces RST close instead of FIN, skipping
+TIME_WAIT entirely. Appropriate for streaming audio (we don't care about
+in-flight data when closing; the next connection restarts with fresh seq
+numbers).
+
+### Receiver Sleep/Wake Recovery
+
+When the PC enters sleep/standby mode and wakes up after 10+ minutes:
+
+1. **Server detects resume** via `WM_POWERBROADCAST` (PBT_APMRESUMEAUTOMATIC)
+2. **Forces CONFIGURE ×2** to all active streaming devices (ESP may have
+   gone IDLE during long sleep — only CONFIGURE can restart it)
+3. **Forces stall-detection window** to expire (`dwLastPktTick = now - STALL - 1`)
+4. **Flags WaveOut + TCP reopen** → AudioThread reconnects TCP and reopens
+   WaveOut for the new audio device (HDMI/USB re-init after sleep)
+5. **Resets `pktRecv = 0`** on reopen — prevents seqNum > 32768 from being
+   misclassified as out-of-order (the root cause of "10–15 min sleep" failure)
+
+### Burst-Submit Prebuffer (Click-Free Startup)
+
+The old prebuffer called `waveOutWrite` on each frame immediately, so WaveOut
+started draining from the first write. By the time the jitter buffer was
+"filled", the queue was already partially empty — normal WiFi jitter in the
+first 1–3 seconds easily emptied it → silence → click when audio resumed.
+
+The new **burst-submit** approach:
+1. Decode each frame into a buffer marked `dwUser=1` (ready)
+2. Do **NOT** call `waveOutWrite` during prebuffer
+3. When `jitterFilled >= target` → **burst-submit ALL ready buffers at once**
+4. WaveOut sees a full queue (target frames) from the very first moment →
+   no underrun during the critical startup window
+
+Also: **overflow** (all 16 buffers INQUEUE = network faster than sound card)
+is no longer falsely counted as underrun. The old code incremented
+`underrunCount` and forced re-prebuffer → click. Now: just drop the packet
+(network is ahead, losing one frame is fine).
+
+---
+
 ## 📁 Project Structure
 
 ```
@@ -567,7 +731,7 @@ esp8266-wifi-microphone/
 │   └── main/
 │       ├── CMakeLists.txt
 │       ├── Kconfig.projbuild      # menuconfig options (transport, timing, tasks)
-│       ├── main.c                 # Main app + pipeline tasks + transport switch
+│       ├── main.c                 # Main app + pipeline tasks + supervisor + WiFi boot retry
 │       ├── stream_mode.c          # Transport vtable (UDP/TCP/RawTX ops tables)
 │       ├── wifi_sta.c             # WiFi STA + Raw TX + fixed rate
 │       ├── udp_stream.c           # UDP socket transport (independent)
@@ -592,8 +756,8 @@ esp8266-wifi-microphone/
 │           └── ...                # Other headers
 │
 ├── server/                        # Windows receiver (PowerBASIC 10)
-│   ├── eassp_server.bas           # Main app (UDP+TCP, drift fix, per-device output, context menu)
-│   ├── config.inc                 # Constants + control IDs + menu IDs
+│   ├── eassp_server.bas           # Main app (burst prebuffer, sleep/wake recovery, drift fix, per-device output)
+│   ├── config.inc                 # Constants (JITTER_INITIAL=10, JITTER_MIN=6, JITTER_MAX=12)
 │   └── types.inc                  # DeviceInfo (dwTransport, sHostname, dwWaveDevice)
 │
 ├── patches/                       # Documentation of applied fixes
@@ -631,8 +795,25 @@ Key configuration options (via `idf.py menuconfig` → ADPCM Streamer Configurat
 | | `STREAMER_TASK_PRIO_I2S` | 5 | I2S capture task priority |
 | | `STREAMER_TASK_PRIO_ADPCM` | 3 | Encoder task priority |
 | | `STREAMER_TASK_PRIO_UDP` | 2 | Sender task priority |
-| **Network / UDP** | `STREAMER_UDP_SEND_TIMEOUT_MS` | 2000 | UDP send timeout |
+| **Network / UDP / TCP** | `STREAMER_UDP_SEND_TIMEOUT_MS` | 2000 | UDP send timeout |
 | | `STREAMER_TCP_SEND_TIMEOUT_MS` | 2000 | TCP send timeout (ms) |
+| | `STREAMER_TCP_NODELAY_ENABLED` | y | Disable Nagle (low-latency) |
+| | `STREAMER_TCP_KEEPALIVE_ENABLED` | y | TCP keepalive on client sockets |
+| | `STREAMER_TCP_KEEPIDLE` | 10 | Seconds before first keepalive probe |
+| | `STREAMER_TCP_KEEPINTVL` | 3 | Seconds between probes |
+| | `STREAMER_TCP_KEEPCNT` | 3 | Failed probes = dead (~19s total) |
+| | `STREAMER_TCP_LINGER_ENABLED` | y | SO_LINGER=0 (RST close, skip TIME_WAIT) |
+| **WiFi Boot Retry** | `STREAMER_WIFI_BOOT_RETRY_ENABLED` | y | Retry AP connection + deep sleep |
+| | `STREAMER_WIFI_BOOT_RETRY_ATTEMPTS` | 3 | Connection attempts before sleep |
+| | `STREAMER_WIFI_BOOT_SLEEP_MINUTES` | 2 | Deep sleep duration (minutes) |
+| | `STREAMER_WIFI_BOOT_SLEEP_MODE` | 0 | 0=deep sleep, 1=soft sleep (vTaskDelay) |
+| **Supervisor Task** | `STREAMER_SUPERVISOR_ENABLED` | y | Software watchdog (heap/stall/stack) |
+| | `STREAMER_TASK_STACK_SUPERVISOR` | 2048 | Supervisor task stack |
+| | `STREAMER_TASK_PRIO_SUPERVISOR` | 1 | Supervisor priority (MUST be low) |
+| | `STREAMER_SUPERVISOR_MIN_HEAP` | 15360 | Min free heap before reset (bytes) |
+| | `STREAMER_SUPERVISOR_STALL_TIMEOUT` | 15000 | Pipeline stall timeout (ms) |
+| | `STREAMER_SUPERVISOR_MIN_STACK` | 256 | Min free stack before reset (bytes) |
+| | `STREAMER_SUPERVISOR_CHECK_INTERVAL` | 2000 | Check interval (ms) |
 
 > **Important**: `CONFIG_LWIP_SO_REUSE=y` must be set in sdkconfig (Component config →
 > LWIP → Enable SO_REUSEADDR option) for TCP transport to work across stop→start cycles.
@@ -645,6 +826,7 @@ Key configuration options (via `idf.py menuconfig` → ADPCM Streamer Configurat
 - **PowerBASIC** — Windows application development
 - **Z.ai Code** — AI-assisted development
 - **INMP441** — High-quality I2S MEMS microphone
+- **Grok (xAI)** — Collaborative debugging of sleep/wake and click issues
 
 ---
 
