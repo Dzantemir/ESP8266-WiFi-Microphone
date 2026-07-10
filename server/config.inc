@@ -1,6 +1,13 @@
 ' ============================================================================
 '  EASSP Server - Constants and Equates
 '  PowerBASIC 10 for Windows
+'
+'  NOTE: Win32 system equates (%WAVE_FORMAT_PCM, %CALLBACK_NULL, %WHDR_INQUEUE,
+'  %WAIT_OBJECT_0, %WAIT_TIMEOUT, %WAIT_FAILED, %INADDR_NONE, etc.) are defined
+'  in Win32API.INC (via MMSystem.inc / WinBase.inc / ws2def.inc). They are NOT
+'  redefined here - redefinition with the same value is silently accepted by PB,
+'  but with a different value it is a hard "Duplicate equate" compile error.
+'  Keep this file strictly project-specific.
 ' ============================================================================
 
 ' ---- EASSP Protocol ----
@@ -43,6 +50,14 @@
 ' (same-dest CONFIGURE just resets the ESP watchdog; the ESP dedupes).
 %STREAM_STALL_MS  = 10000
 
+' ---- "No audio after start" CONFIGURE resend threshold ----
+' FIX (BUG#12): previously hardcoded to 3000ms in HeartbeatThread. But
+' startup_skip_ms (1s) + fade_in_ms (1s) + socket open + prebuffer easily
+' exceeds 3s on slow WiFi / cold ESP boot, causing spurious CONFIGURE resends
+' during normal startup (harmless but noisy - extra UDP traffic + log spam).
+' 5s only fires on real 'initial CONFIGURE lost' cases.
+%NO_AUDIO_RESEND_MS = 5000
+
 ' ---- Control IDs ----
 %IDC_LISTVIEW     = 101
 %IDC_LOG          = 106
@@ -82,14 +97,14 @@
 ' deadlocked when GUI was in WaitForSingleObject. PostMessage is async.
 %WM_APP_LOG       = %WM_USER + 600
 
-' ---- Wave Constants ----
-%WAVE_FORMAT_PCM  = 1
-%CALLBACK_NULL    = 0
-%WHDR_INQUEUE     = &H10
-
 ' ---- Jitter Buffer / PLC / Adaptive ----
-%JITTER_INITIAL   = 5     ' Frames to prebuffer before starting WaveOut playback
-%JITTER_MIN       = 3     ' Minimum prebuffer (adaptive, frames)
+%JITTER_INITIAL   = 6     ' FIX (BUG#R3-2): was 5. One extra frame of prebuffer
+                                  ' absorbs startup WiFi jitter that causes underrun-clicks
+                                  ' in the first 1-3 seconds. Steady-state latency +1 frame
+                                  ' (~20ms) is inaudible.
+%JITTER_MIN       = 5     ' FIX (log-fix-B): was 3. Log shows buffer oscillating
+                                  ' 6->5->7->6->5->4 with frequent underruns at 3-4.
+                                  ' 5 gives enough headroom for WiFi jitter on this setup.
 %JITTER_MAX       = 8     ' Maximum prebuffer (adaptive, frames)
 %JITTER_ADAPT_MS  = 10000 ' Adaptive adjustment interval (ms)
 %JITTER_UNDERRUN_THRESHOLD = 2  ' Underruns in interval to trigger increase

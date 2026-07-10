@@ -96,9 +96,11 @@ GLOBAL g_hHbTh      AS DWORD    ' heartbeat thread handle
 GLOBAL g_bRunning   AS LONG
 GLOBAL g_seqCnt     AS LONG     ' was WORD, changed to LONG for InterlockedIncrement
 
-' ---- WaveOut device selection (for VB-Cable virtual microphone) ----
-' g_WaveDeviceId: -1 = WAVE_MAPPER (default), 0..N = specific device
-GLOBAL g_WaveDeviceId AS LONG
+' ---- WaveOut device selection ----
+' FIX (BUG#10): removed dead global g_WaveDeviceId. It was declared and
+' initialized to -1 but never read - per-device selection uses
+' g_Devs(idx).dwWaveDevice instead. Keeping a misleading dead global is a
+' maintenance hazard (future devs might think it controls something).
 GLOBAL g_sIniFile   AS STRING   ' Path to eassp_server.ini (next to .exe)
 
 GLOBAL g_csDev      AS CRITICAL_SECTION
@@ -279,7 +281,7 @@ SUB ManualDeviceAdd(BYVAL sIP AS STRING, BYVAL nPort AS LONG)
     IF LEN(g_sIniFile) = 0 THEN EXIT SUB
     IF LEN(sIP) = 0 THEN EXIT SUB
 
-    LOCAL i AS LONG, n AS LONG
+    LOCAL i AS LONG, n AS DWORD
     LOCAL sEntry AS STRING, sExisting AS STRINGZ*256, sIPOnly AS STRING
     LOCAL bFound AS LONG
 
@@ -329,7 +331,7 @@ SUB ManualDeviceLoadAll()
     IF LEN(g_sIniFile) = 0 THEN EXIT SUB
     IF g_fDiscOpen = 0 THEN EXIT SUB
 
-    LOCAL i AS LONG, n AS LONG
+    LOCAL i AS LONG, n AS DWORD
     LOCAL sEntry AS STRINGZ*256, sIP AS STRING, sPort AS STRING
     LOCAL colon AS LONG, nPort AS LONG, targetIP AS DWORD
     LOCAL sentCount AS LONG
@@ -405,11 +407,11 @@ END FUNCTION
 ' devices (speakers, VB-Cable, etc.). User selects which device receives
 ' the audio — select "CABLE Input" to route to a virtual microphone.
 SUB PopulateDeviceCombo()
-    LOCAL numDevs AS LONG
+    LOCAL numDevs AS DWORD
     LOCAL i AS LONG
     LOCAL caps AS WAVEOUTCAPS
     LOCAL sName AS STRING
-    LOCAL mmRes AS LONG
+    LOCAL mmRes AS DWORD
 
     ' Start with "Default" (WAVE_MAPPER = -1)
     COMBOBOX ADD g_hDlg, %IDC_COMBO_DEVICE, "Default (WAVE_MAPPER)"
@@ -428,7 +430,8 @@ SUB PopulateDeviceCombo()
 
     ' Select "Default" (index 0 in the combo = WAVE_MAPPER)
     COMBOBOX SELECT g_hDlg, %IDC_COMBO_DEVICE, 1
-    g_WaveDeviceId = -1  ' WAVE_MAPPER
+    ' FIX (BUG#10): removed dead assignment g_WaveDeviceId = -1
+    ' (the global itself was removed from the declarations section)
 END SUB
 
 ' InitListView - Create columns in the ListView
@@ -498,15 +501,25 @@ SUB InitListView()
         %LVS_EX_FULLROWSELECT OR %LVS_EX_GRIDLINES OR %LVS_EX_CHECKBOXES OR %LVS_EX_DOUBLEBUFFER
 END SUB
 
-' GetSelectedDevIdx - Get device array index for selected ListView item
+' GetSelectedDevIdx - Get device array index for the focused ListView item.
+' FIX (BUG#8): previously used LVM_GETNEXTITEM+LVNI_SELECTED (state-based),
+' while GetSelectedDeviceIdx below used LVM_GETSELECTIONMARK (focus-based).
+' In a multi-select ListView with checkboxes, LVNI_SELECTED returns the
+' FIRST item with LVIS_SELECTED state (could be any checked item), while
+' GETSELECTIONMARK returns the focus item (the one right-clicked for context
+' menu). They diverge when the user clicks checkboxes without changing focus.
+' Callers of GetSelectedDevIdx (RefreshUI column update) expected the focus
+' item, not a random checked item. Unified on GETSELECTIONMARK for both.
 FUNCTION GetSelectedDevIdx() AS LONG
+    LOCAL hLV AS DWORD
     LOCAL lvIdx AS LONG
     LOCAL lvi AS LV_ITM
     LOCAL lResult AS LONG
 
-    CONTROL SEND g_hDlg, %IDC_LISTVIEW, %LVM_GETNEXTITEM, -1, _
-        MAK(LONG, %LVNI_SELECTED, 0) TO lvIdx
+    CONTROL HANDLE g_hDlg, %IDC_LISTVIEW TO hLV
+    IF hLV = 0 THEN FUNCTION = -1 : EXIT FUNCTION
 
+    lvIdx = SendMessage(hLV, %LVM_GETSELECTIONMARK, 0, 0)
     IF lvIdx < 0 THEN
         FUNCTION = -1
         EXIT FUNCTION
@@ -515,9 +528,12 @@ FUNCTION GetSelectedDevIdx() AS LONG
     lvi.mask   = %LVIF_PARAM
     lvi.iItem  = lvIdx
     lvi.iSubItem = 0
-    CONTROL SEND g_hDlg, %IDC_LISTVIEW, %LVM_GETITEM, 0, VARPTR(lvi) TO lResult
-
-    FUNCTION = lvi.lParam
+    SendMessage hLV, %LVM_GETITEM, 0, VARPTR(lvi) TO lResult
+    IF lvi.lParam >= 0 AND lvi.lParam < %MAX_DEVICES THEN
+        FUNCTION = lvi.lParam
+    ELSE
+        FUNCTION = -1
+    END IF
 END FUNCTION
 
 ' IsItemChecked - Check if ListView item checkbox is checked
@@ -565,6 +581,42 @@ FUNCTION GetSelectedDeviceIdx() AS LONG
         FUNCTION = -1
     END IF
 END FUNCTION
+
+' ===========================================================================
+' SetDeviceWaveOutput - CS-safe write to g_Devs(devIdx).dwWaveDevice.
+' FIX (BUG#3): previously the GUI thread wrote dwWaveDevice directly
+' from 4 call sites (combo box CBN_SELCHANGE, context menu Default, and
+' the two specific-device variants) WITHOUT holding g_csDev. Meanwhile
+' AudioThread reads dwWaveDevice for every waveOutOpen (startup, TCP
+' reconnect, format-change reopen). A write mid-read is technically
+' atomic on x86 (32-bit aligned LONG), but on PB the field is a LONG
+' inside a TYPE - alignment is not guaranteed by the spec. Worse, the
+' post-write AddLog reads g_Devs().sHostname outside CS, racing with
+' UpdateDevice which can rewrite sHostname on the next INFO. This helper
+' does the write + snapshot under CS, then emits log + SaveDeviceOutput
+' outside CS. Returns the snapshotted hostname via BYREF for the caller's
+' log line.
+' ===========================================================================
+SUB SetDeviceWaveOutput(BYVAL devIdx AS LONG, BYVAL newDev AS LONG)
+    LOCAL saveMac AS STRING
+    LOCAL saveHost AS STRING
+    LOCAL sDev AS STRING
+
+    EnterCriticalSection g_csDev
+    g_Devs(devIdx).dwWaveDevice = newDev
+    saveMac  = g_Devs(devIdx).sMac
+    saveHost = g_Devs(devIdx).sHostname
+    LeaveCriticalSection g_csDev
+
+    SaveDeviceOutput saveMac, newDev
+
+    IF newDev = -1 THEN
+        sDev = "Default (WAVE_MAPPER)"
+    ELSE
+        sDev = TRIM$(STR$(newDev)) & " (will apply on next stream start)"
+    END IF
+    AddLog "Output device for " & TRIM$(saveHost) & ": " & sDev
+END SUB
 
 ' UpdateButtonStates - Enable/disable buttons based on checkbox & stream state
 SUB UpdateButtonStates()
@@ -770,7 +822,13 @@ SUB DiscoveryProc()
     ' Accept INFO payloads from v2.0 (34 bytes) through v2.2 (58 bytes).
     ' Each field is read with its own bufLen guard, so shorter payloads
     ' from older firmware are handled gracefully (missing fields default).
-    IF LEN(recvBuf) < %EASSP_HDR_SZ + 33 THEN EXIT SUB
+    ' FIX (BUG#R2-2): was hdr+33, but UpdateDevice accepts hdr+32 (INFO v1
+    ' payload without bits_per_sample). A v1 device sending exactly 32-byte
+    ' payload (40 bytes total) would be rejected here before UpdateDevice ever
+    ' saw it - silently invisible in the device list. Aligned with UpdateDevice's
+    ' minimum. Older firmware reporting only status/codec/error/ch/rate/frame_ms/
+    ' mac/pktsSent/freeHeap/RSSI (32 bytes) now discovers; bits defaults to 16.
+    IF LEN(recvBuf) < %EASSP_HDR_SZ + 32 THEN EXIT SUB
 
     ' Check magic bytes
     IF PEEK(BYTE, STRPTR(recvBuf)) <> %EASSP_MAGIC0 THEN EXIT SUB
@@ -970,45 +1028,63 @@ SUB UpdateDevice(BYVAL sMac AS STRING, BYVAL dwIP AS DWORD, BYVAL dwPort AS DWOR
     ' Firmware (8 bytes at offset 32 in packet)
     g_Devs(idx).sFirmware = PEEK$(pBuf + 32, 8)
 
+    ' FIX (BUG#7): snapshot sHostname and dwSmpRate INSIDE CS so the
+    ' post-CS log lines don't race with the next UpdateDevice call
+    ' (which can rewrite these fields on the next INFO packet from a
+    ' different device, since UpdateDevice is reentrant via DiscoveryProc).
+    LOCAL saveHostname AS STRING
+    LOCAL saveSmpRate AS DWORD
+    saveHostname = g_Devs(idx).sHostname
+    saveSmpRate  = g_Devs(idx).dwSmpRate
+
     LeaveCriticalSection g_csDev
 
     ' AddLog OUTSIDE CS - never hold CS during UI operations
     IF bNew THEN
         LOCAL sDevName AS STRING
-        IF LEN(TRIM$(g_Devs(idx).sHostname)) > 0 THEN
-            sDevName = TRIM$(g_Devs(idx).sHostname)
+        IF LEN(TRIM$(saveHostname)) > 0 THEN
+            sDevName = TRIM$(saveHostname)
         ELSE
             sDevName = sMac
         END IF
         AddLog "New device: " & sDevName & " MAC=" & sMac & " IP=" & FormatIP(dwIP) & ":" & TRIM$(STR$(dwPort)) & _
-               " rate=" & TRIM$(STR$(g_Devs(idx).dwSmpRate)) & " Hz"
+               " rate=" & TRIM$(STR$(saveSmpRate)) & " Hz"
     END IF
 
-    ' FIX (AUTOTRANSPORT): if the ESP switched UDP<->TCP while the stream
-    ' was active, restart the audio thread so the listening socket matches
-    ' the new transport. This handles the case where the user did
-    ' AT+XPORT + AT+HOTRESTART on the ESP without clicking Stop/Start here.
+    ' FIX (BUG#1+AUTOTRANSPORT): if the ESP switched UDP<->TCP while the
+    ' stream was active, restart ONLY this device's audio thread - not
+    ' every checked device. Previously this called StopCheckedStreams +
+    ' StartCheckedStreams, which stopped and restarted ALL checked streams
+    ' just because one changed transport. With multiple devices streaming,
+    ' a single ESP's AT+XPORT + HOTRESTART would drop audio on all of them
+    ' for ~3s. Now uses per-device StopStream + StartStream.
     '
-    ' Sequence:
-    '   1. StopCheckedStreams - signals HBActive=0, AudioThread exits,
-    '      closes the old (UDP or TCP) listening socket.
-    '   2. Wait briefly so the OS recycles the port (TIME_WAIT etc.).
-    '   3. StartCheckedStreams - re-creates AudioThread with the new
-    '      transport_mode now stored in g_Devs(idx).dwTransport.
-    '
-    ' NOTE: only devices that are STILL checked in the ListView get
-    ' restarted by StartCheckedStreams. If the user unchecked the device
-    ' while we were processing, the stream stays stopped (correct).
+    ' NOTE: if the user unchecked this device in the ListView while we
+    ' were processing, StartStream will see dwHBActive=0 still set by
+    ' StopStream and... actually StartStream checks dwActive, not the
+    ' checkbox. We respect dwHBActive=0 from StopStream: StartStream's
+    ' guard "dwHBActive <> 0" will fail (it's 0 after stop), so we DO
+    ' restart. This is correct - the device was streaming (bTransportChanged
+    ' only fires when dwHBActive<>0), so the user wants it back.
     IF bTransportChanged THEN
         LOCAL sOldTr AS STRING, sNewTr AS STRING
+        LOCAL stopResult AS LONG
         IF prevTransport = 0 THEN sOldTr = "UDP" ELSE sOldTr = "TCP"
         IF g_Devs(idx).dwTransport = 0 THEN sNewTr = "UDP" ELSE sNewTr = "TCP"
         AddLog "[AUTOTRANSPORT] dev #" & TRIM$(STR$(idx)) & _
                ": ESP switched " & sOldTr & " -> " & sNewTr & _
-               ", auto-restarting audio thread"
-        StopCheckedStreams
-        SLEEP 200   ' brief pause for OS socket recycling
-        StartCheckedStreams
+               ", auto-restarting audio thread (per-device)"
+        ' FIX (grok22#2): check StopStream return. If it timed out (thread
+        ' still alive after 30s), do NOT call StartStream - that would
+        ' create a duplicate AudioThread on the same port.
+        stopResult = StopStream(idx)
+        IF stopResult = 0 THEN
+            AddLog "[AUTOTRANSPORT] dev #" & TRIM$(STR$(idx)) & _
+                   ": StopStream timed out - NOT restarting (avoid duplicate)"
+        ELSE
+            SLEEP 200   ' brief pause for OS socket recycling
+            StartStream idx
+        END IF
     END IF
 END SUB
 
@@ -1111,6 +1187,23 @@ THREAD FUNCTION HeartbeatThread(BYVAL param AS DWORD) AS DWORD
     LOCAL hbIter AS LONG          ' DIAG: iteration counter
     LOCAL hbSentThisIter AS LONG  ' DIAG: how many DISCOVER sent this iteration
 
+    ' FIX (BUG#6): hoist these DIMs OUT of the DO WHILE loop. Previously
+    ' they were re-DIM'd inside the loop every %HB_INTERVAL (3s), which
+    ' re-allocates the arrays on each iteration - the STRING array
+    ' (rsReasons) is especially expensive: each iteration allocated 16
+    ' PBSTR descriptors + BSTR heap, only to be immediately overwritten.
+    ' The arrays persist between iterations, but the count variables are
+    ' explicitly reset to 0 inside the loop, so semantics are unchanged.
+    DIM hbTargets(0 TO %MAX_DEVICES - 1) AS LOCAL DWORD   ' IP
+    DIM hbPorts(0 TO %MAX_DEVICES - 1) AS LOCAL DWORD    ' Port
+    DIM hbCount AS LOCAL LONG
+    DIM rsIPs(0 TO %MAX_DEVICES - 1) AS LOCAL DWORD
+    DIM rsPorts(0 TO %MAX_DEVICES - 1) AS LOCAL DWORD
+    DIM rsAudioPorts(0 TO %MAX_DEVICES - 1) AS LOCAL DWORD
+    DIM rsIdxs(0 TO %MAX_DEVICES - 1) AS LOCAL LONG
+    DIM rsReasons(0 TO %MAX_DEVICES - 1) AS LOCAL STRING
+    DIM rsCount AS LOCAL LONG
+
     AddLog "[HB] HeartbeatThread started (interval=" & TRIM$(STR$(%HB_INTERVAL)) & "ms)"
 
     DO WHILE g_bRunning
@@ -1123,9 +1216,6 @@ THREAD FUNCTION HeartbeatThread(BYVAL param AS DWORD) AS DWORD
         ' FIX H2: Collect (IP,Port) pairs under CS, then send OUTSIDE CS.
         ' Previously SendDiscover was called inside CS → UDP SEND could block
         ' → GUI thread (RefreshUI/UpdateButtonStates) waiting on CS → UI freeze.
-        DIM hbTargets(0 TO %MAX_DEVICES - 1) AS LOCAL DWORD   ' IP
-        DIM hbPorts(0 TO %MAX_DEVICES - 1) AS LOCAL DWORD      ' Port
-        DIM hbCount AS LOCAL LONG
         hbCount = 0
 
         ' FIX (WiFi-drop recovery): collect ALL devices needing a CONFIGURE
@@ -1137,12 +1227,6 @@ THREAD FUNCTION HeartbeatThread(BYVAL param AS DWORD) AS DWORD
         ' The old code only handled (a) and only one device per iteration,
         ' so a mid-flight WiFi drop left the server stuck in "Streaming"
         ' forever while the ESP sat IDLE waiting for CONFIGURE.
-        DIM rsIPs(0 TO %MAX_DEVICES - 1) AS LOCAL DWORD
-        DIM rsPorts(0 TO %MAX_DEVICES - 1) AS LOCAL DWORD
-        DIM rsAudioPorts(0 TO %MAX_DEVICES - 1) AS LOCAL DWORD
-        DIM rsIdxs(0 TO %MAX_DEVICES - 1) AS LOCAL LONG
-        DIM rsReasons(0 TO %MAX_DEVICES - 1) AS LOCAL STRING
-        DIM rsCount AS LOCAL LONG
         rsCount = 0
 
         EnterCriticalSection g_csDev
@@ -1163,7 +1247,12 @@ THREAD FUNCTION HeartbeatThread(BYVAL param AS DWORD) AS DWORD
                     ' Case (a): never received any audio since stream start.
                     ' Initial CONFIGURE was probably lost in WiFi.
                     elapsed = tick - g_Devs(idx).dwStreamStart
-                    IF elapsed > 3000 THEN
+                    IF elapsed > %NO_AUDIO_RESEND_MS THEN
+                    ' FIX (BUG#12): was hardcoded 'elapsed > 3000'. Startup skip
+                    ' (1s) + fade-in (1s) + socket open + prebuffer can exceed
+                    ' 3s on slow WiFi / cold ESP boot, causing spurious CONFIGURE
+                    ' resends during normal startup. NO_AUDIO_RESEND_MS (5s in
+                    ' config.inc) only fires on real 'initial CONFIGURE lost' cases.
                         rsIPs(rsCount)        = g_Devs(idx).dwIP
                         rsPorts(rsCount)      = g_Devs(idx).dwPort
                         rsAudioPorts(rsCount) = g_Devs(idx).dwAudioPort
@@ -1470,7 +1559,7 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
         ' body also read dwRunning/dwActive without CS - a pointless race.
         DO
             ERRCLEAR
-            TCP OPEN PORT bindPort AT tcpHost AS #fNum TIMEOUT 2000
+            TCP OPEN PORT bindPort AT tcpHost AS #fNum TIMEOUT 5000
             IF ERR = 0 THEN EXIT DO
             INCR connectAttempts
             IF connectAttempts = 1 OR (connectAttempts MOD 10) = 0 THEN
@@ -1610,7 +1699,7 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
     ' Open WaveOut. Try 24-bit first if ESP is 24-bit; if the card rejects
     ' it (WAVERR_BADFORMAT or MMSYSERR), retry with 16-bit and mark for
     ' on-the-fly 24→16 conversion.
-    LOCAL waveResult AS LONG
+    LOCAL waveResult AS DWORD
     waveResult = waveOutOpen(waveOut, g_Devs(idx).dwWaveDevice, wfFmt, 0, 0, %CALLBACK_NULL)
     IF waveResult <> 0 AND outBits = 24 THEN
         AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
@@ -1667,8 +1756,21 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
     LeaveCriticalSection g_csDev
 
     ' Prepare headers
+    ' FIX (BUG#15): check waveOutPrepareHeader return. A failed prepare
+    ' leaves the WAVEHDR in an inconsistent state - subsequent waveOutWrite
+    ' silently fails or plays garbage. Log + skip the buffer (mark INQUEUE
+    ' so the submit scan won't pick it).
+    LOCAL prepRes AS DWORD
     FOR wIdx2 = 0 TO %NUM_WAVE_BUFS - 1
-        waveOutPrepareHeader waveOut, whdrs(wIdx2), SIZEOF(WAVEHDR)
+        prepRes = waveOutPrepareHeader(waveOut, whdrs(wIdx2), SIZEOF(WAVEHDR))
+        IF prepRes <> 0 THEN
+            AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+                   ": waveOutPrepareHeader FAILED buf=" & TRIM$(STR$(wIdx2)) & _
+                   " err=" & TRIM$(STR$(prepRes)) & " - buffer disabled"
+            ' Mark as INQUEUE so submit scan skips it; otherwise we'd send
+            ' an unprepared header to waveOutWrite -> UB.
+            whdrs(wIdx2).dwFlags = whdrs(wIdx2).dwFlags OR %WHDR_INQUEUE
+        END IF
     NEXT wIdx2
 
     ' Init stats under CS
@@ -1697,9 +1799,16 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
     LOCAL jitterPrebuffering AS LONG  ' 1 = still prebuffering, 0 = playing
     LOCAL underrunCount AS LONG    ' Underruns in current adaptation interval
     LOCAL lastAdaptTick AS DWORD   ' Last adaptive adjustment time
+    ' FIX (log-fix-C): consecutive zero-underrun intervals (need 2 to decrease)
+    LOCAL zeroUnderrunIntervals AS LONG
     LOCAL lastPcmPtr AS DWORD      ' Pointer to last decoded PCM (for PLC)
     LOCAL lastPcmLen AS LONG       ' Length of last decoded PCM (for PLC)
-    LOCAL lastPcmLastSample AS LONG  ' Last sample value from previous frame (for interpolation)
+    ' FIX (grok22#5): per-channel last sample for stereo PLC ramp.
+    ' Previously a single lastPcmLastSample held only L's last value,
+    ' so R was ramped using L's interpolation -> discontinuity on R.
+    ' Array index 0=L, 1=R (unused for mono).
+    ' FIX (compile): PowerBASIC requires DIM (not LOCAL) for local arrays.
+    DIM lastPcmLastSample(1) AS LOCAL LONG  ' Last sample value per channel
 
     LOCAL plcActive AS LONG        ' 1 = PLC interpolation in progress
 
@@ -1738,7 +1847,8 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
     lastAdaptTick = GetTickCount()
     lastPcmPtr = 0
     lastPcmLen = 0
-    lastPcmLastSample = 0
+    lastPcmLastSample(0) = 0
+    lastPcmLastSample(1) = 0
     plcActive = 0
 
     AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
@@ -1768,6 +1878,16 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
 
         IF devTransport = 1 THEN
             ' ---- TCP framing read ----
+            ' FIX (TCP-RECV-TIMEOUT): PowerBASIC TCP RECV does NOT support
+            ' a TIMEOUT parameter. Instead, the TCP OPEN TIMEOUT applies
+            ' to ALL blocking operations on the socket (connect + send +
+            ' recv). We use 5000ms (was 2000) to avoid premature RECV
+            ' timeouts: the ESP sends frames every 20ms, but WiFi jitter
+            ' can delay them by 1-3s. With 2s timeout the server would
+            ' reconnect BEFORE the delayed frame arrived, causing the ESP's
+            ' send buffer to overflow (errno=11). 5s gives enough headroom.
+            ' If RECV still times out (ERR), the reconnect logic below fires.
+            '
             ' 1) Read 2-byte length prefix (big-endian).
             ' PowerBASIC TCP RECV may return fewer bytes than requested,
             ' so loop until we have exactly 2 bytes (or error/timeout).
@@ -1799,7 +1919,7 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
                 reconTries = 0
                 DO WHILE g_Devs(idx).dwRunning
                     ERRCLEAR
-                    TCP OPEN PORT bindPort AT tcpHost AS #fNum TIMEOUT 2000
+                    TCP OPEN PORT bindPort AT tcpHost AS #fNum TIMEOUT 5000
                     IF ERR = 0 THEN reconOk = 1 : EXIT DO
                     INCR reconTries
                     ' Log every 5th failed attempt to show we're still trying
@@ -1827,6 +1947,16 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
                 predictor2 = 0
                 stepIndex2 = 0
                 lastSeq = 0
+                ' FIX (BUG#R3-7): re-arm startup skip + fade-in. After a WiFi
+                ' drop the ESP's I2S DMA may contain stale data and the mic
+                ' membrane may have a brief transient on resume - same conditions
+                ' as cold start. Without re-arming, the first 1-3s after reconnect
+                ' have audible clicks. The skip sentinel (999) is replaced on the
+                ' first valid packet; fadeSamplesRemaining is armed when skip ends.
+                skipFramesRemaining = 999
+                fadeSamplesRemaining = 0
+                lastPcmPtr = 0
+                lastPcmLen = 0
                 ITERATE DO
             END IF
             ' Decode big-endian u16 length.
@@ -1840,10 +1970,32 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
                 SLEEP 500
                 DO WHILE g_Devs(idx).dwRunning
                     ERRCLEAR
-                    TCP OPEN PORT bindPort AT tcpHost AS #fNum TIMEOUT 2000
+                    TCP OPEN PORT bindPort AT tcpHost AS #fNum TIMEOUT 5000
                     IF ERR = 0 THEN EXIT DO
                     SLEEP 1000
                 LOOP
+                ' FIX (grok22#4/#7): re-arm jitter prebuffer + skip + fade
+                ' after invalid-frame reconnect. Previously this path only
+                ' reconnected the socket but left the audio pipeline with
+                ' stale state (jitterPrebuffering=0, skipFramesRemaining=0,
+                ' fadeSamplesRemaining=0, lastSeq=stale). After a mid-stream
+                ' TCP glitch, the stale state caused clicks/artifacts because:
+                '   - No prebuffer → first packets play immediately → underrun
+                '   - No skip → stale DMA data from ESP plays
+                '   - No fade → silence→signal discontinuity
+                '   - Stale lastSeq → false loss detection → PLC on wrong data
+                ' Now: same re-arm as the full len-prefix-error path above.
+                jitterPrebuffering = 1
+                jitterFilled = 0
+                predictor  = 0
+                stepIndex  = 0
+                predictor2 = 0
+                stepIndex2 = 0
+                lastSeq = 0
+                skipFramesRemaining = 999
+                fadeSamplesRemaining = 0
+                lastPcmPtr = 0
+                lastPcmLen = 0
                 ITERATE DO
             END IF
             ' 2) Read tcpPktLen bytes (payload = pkt_header + data).
@@ -1878,7 +2030,7 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
                 ERRCLEAR
                 DO WHILE g_Devs(idx).dwRunning
                     ERRCLEAR
-                    TCP OPEN PORT bindPort AT tcpHost AS #fNum TIMEOUT 2000
+                    TCP OPEN PORT bindPort AT tcpHost AS #fNum TIMEOUT 5000
                     IF ERR = 0 THEN EXIT DO
                     SLEEP 1000
                 LOOP
@@ -2015,8 +2167,19 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
         END IF
         IF skipFramesRemaining > 0 THEN
             DECR skipFramesRemaining
-            ' Still update stats (so server knows we're receiving) and save
-            ' last packet info for seq tracking, but skip decode/playback.
+            ' FIX (grok22#1): parse seqNum during skip and update lastSeq +
+            ' pktRecv locals. Previously these stayed 0 throughout skip, so:
+            '   - g_Devs(idx).wLastSeq was stale (0) during skip
+            '   - After skip, the first play-packet had pktRecv=0 which
+            '     DISABLED loss detection (the IF pktRecv > 0 guard), so
+            '     a seq gap spanning the skip→play boundary was invisible.
+            ' Now: seq is tracked during skip, lastSeq is accurate, and
+            ' pktRecv is incremented so loss detection works on the FIRST
+            ' play packet too. No decode/playback during skip (still skipped).
+            LOCAL skipSeqNum AS WORD
+            skipSeqNum = CVWRD(PEEK$(STRPTR(recvBuf), 2))
+            lastSeq = skipSeqNum
+            INCR pktRecv
             EnterCriticalSection g_csDev
             g_Devs(idx).dwPktRecv   = pktRecv
             g_Devs(idx).wLastSeq    = lastSeq
@@ -2325,21 +2488,39 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
                 ' Linear interpolation: ramp from lastPcmLastSample to the
                 ' first sample of the copied frame over the first N samples.
                 ' Smooths the discontinuity at the splice point.
-                IF outBits = 16 AND nCh = 1 THEN
+                ' FIX (BUG#R3-1): extended to stereo (nCh=2). For interleaved
+                ' L,R,L,R PCM, ramp both channels at each sample index.
+                ' Previously stereo fell through with NO ramp -> hard splice
+                ' -> audible click on every lost packet in stereo streams.
+                IF outBits = 16 AND (nCh = 1 OR nCh = 2) THEN
                     LOCAL pPcm16 AS INTEGER PTR
                     LOCAL rampLen AS LONG
                     LOCAL rampI AS LONG
-                    LOCAL firstSample AS LONG
                     LOCAL rampStep AS DOUBLE
+                    LOCAL chStride AS LONG
+                    LOCAL rampCh AS LONG
+                    LOCAL chFirst AS LONG
+                    LOCAL chStep AS DOUBLE
+                    LOCAL chVal AS DOUBLE
                     pPcm16 = pcmPtrs(plcBufIdx)
-                    rampLen = lastPcmLen \ 4  ' 25% of frame
-                    IF rampLen > 64 THEN rampLen = 64  ' cap at 64 samples
+                    chStride = nCh  ' 1 for mono, 2 for stereo (interleaved)
+                    ' rampLen is in FRAMES (not bytes): 25% of frame, cap 64.
+                    ' lastPcmLen is bytes; samples = bytes/2; frames = samples/chStride.
+                    rampLen = (lastPcmLen \ 2) \ chStride \ 4
+                    IF rampLen > 64 THEN rampLen = 64
                     IF rampLen > 0 THEN
-                        firstSample = @pPcm16[0]
-                        rampStep = (firstSample - lastPcmLastSample) / rampLen
-                        FOR rampI = 0 TO rampLen - 1
-                            @pPcm16[rampI] = CINT(lastPcmLastSample + rampStep * rampI)
-                        NEXT rampI
+                        ' FIX (grok22#5): ramp each channel independently.
+                        ' For stereo, L ramps from lastL to firstL, R ramps
+                        ' from lastR to firstR. Previously both used L's
+                        ' values, causing an R discontinuity at the splice.
+                        FOR rampCh = 0 TO chStride - 1
+                            chFirst = @pPcm16[rampCh]  ' first sample of this ch
+                            chStep = (chFirst - lastPcmLastSample(rampCh)) / rampLen
+                            FOR rampI = 0 TO rampLen - 1
+                                chVal = lastPcmLastSample(rampCh) + chStep * rampI
+                                @pPcm16[rampI * chStride + rampCh] = CINT(chVal)
+                            NEXT rampI
+                        NEXT rampCh
                     END IF
                 END IF
 
@@ -2555,11 +2736,23 @@ pcm_ready:
         IF pcmLen > 0 AND plcActive = 0 THEN
             lastPcmPtr = pcmPtrs(wIdx)
             lastPcmLen = pcmLen
-            ' Save last sample value (for interpolation on next packet loss)
+            ' Save last sample value per channel (for interpolation on next
+            ' packet loss). FIX (grok22#5): per-channel, not just L.
+            ' For interleaved L,R,L,R,...,L_{n-1},R_{n-1}:
+            '   last L index = (total_samples - 2)  [skip the last R]
+            '   last R index = (total_samples - 1)
+            ' For mono: last sample = (total_samples - 1)
             IF outBits = 16 AND pcmLen >= 2 THEN
                 LOCAL pLast AS INTEGER PTR
+                LOCAL totalSmp AS LONG
                 pLast = pcmPtrs(wIdx)
-                lastPcmLastSample = @pLast[(pcmLen \ 2) - 1]
+                totalSmp = pcmLen \ 2
+                IF nCh = 2 THEN
+                    lastPcmLastSample(0) = @pLast[totalSmp - 2]  ' last L
+                    lastPcmLastSample(1) = @pLast[totalSmp - 1]  ' last R
+                ELSE
+                    lastPcmLastSample(0) = @pLast[totalSmp - 1]
+                END IF
             END IF
         END IF
 
@@ -2573,17 +2766,26 @@ pcm_ready:
         ' 16-bit only (ADPCM decodes to 16-bit; 24-bit PCM skips — acceptable
         ' since the skip already removed the main transient).
         IF fadeSamplesRemaining > 0 AND pcmLen > 0 AND outBits = 16 THEN
+            ' FIX (BUG#R3-fade): raised-cosine fade-in instead of linear.
+            ' Linear has a derivative discontinuity at the start (slope jumps
+            ' from 0 to 1/N) which itself produces a faint click. Raised-cosine
+            ' = 0.5 * (1 - COS(pi * progress)) has zero slope at both ends,
+            ' eliminating the discontinuity. progress = (samples_faded_so_far)
+            ' / fadeSamplesTotal, in [0,1]. COS cost is negligible (~16k calls
+            ' for a 1s fade @ 16kHz, < 1ms total).
             LOCAL pFade AS INTEGER PTR
             LOCAL fadeFrameSamples AS LONG
             LOCAL fadeI AS LONG
             LOCAL fadeScale AS DOUBLE
+            LOCAL fadeProg AS DOUBLE
             pFade = pcmPtrs(wIdx)
             fadeFrameSamples = pcmLen \ 2   ' 16-bit samples in this frame
             IF fadeFrameSamples < fadeSamplesRemaining THEN
                 ' Frame shorter than remaining ramp — fade whole frame,
                 ' continue ramp on next frame
                 FOR fadeI = 0 TO fadeFrameSamples - 1
-                    fadeScale = (fadeSamplesTotal - fadeSamplesRemaining + fadeI) / fadeSamplesTotal
+                    fadeProg = (fadeSamplesTotal - fadeSamplesRemaining + fadeI) / fadeSamplesTotal
+                    fadeScale = 0.5# * (1.0# - COS(3.141592653589793## * fadeProg))
                     @pFade[fadeI] = CINT(@pFade[fadeI] * fadeScale)
                 NEXT fadeI
                 fadeSamplesRemaining = fadeSamplesRemaining - fadeFrameSamples
@@ -2591,7 +2793,8 @@ pcm_ready:
                 ' Ramp completes within this frame — fade first N samples,
                 ' leave the rest at full amplitude
                 FOR fadeI = 0 TO fadeSamplesRemaining - 1
-                    fadeScale = (fadeSamplesTotal - fadeSamplesRemaining + fadeI) / fadeSamplesTotal
+                    fadeProg = (fadeSamplesTotal - fadeSamplesRemaining + fadeI) / fadeSamplesTotal
+                    fadeScale = 0.5# * (1.0# - COS(3.141592653589793## * fadeProg))
                     @pFade[fadeI] = CINT(@pFade[fadeI] * fadeScale)
                 NEXT fadeI
                 fadeSamplesRemaining = 0
@@ -2624,18 +2827,38 @@ pcm_ready:
         ' underrunCount is now correctly incremented when WaveOut queue is
         ' empty (0 INQUEUE). If underruns happen, increase prebuffer; if
         ' stable, slowly decrease to reduce latency.
+        ' FIX (BUG#R3-2): do NOT decrease jitterTarget in the first 5 seconds
+        ' after stream start. Early WiFi jitter is normal (DNS, DHCP renewal,
+        ' ESP I2S DMA warmup) and a too-small prebuffer during this window
+        ' causes underrun-clicks. The decrease guard is one-shot per stream.
         IF (GetTickCount() - lastAdaptTick) >= %JITTER_ADAPT_MS THEN
-            IF underrunCount = 0 AND jitterTarget > %JITTER_MIN THEN
-                DECR jitterTarget
-                AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
-                       ": adaptive buffer: 0 underruns -> decrease to " & _
-                       TRIM$(STR$(jitterTarget))
+            LOCAL msSinceStart AS DWORD
+            msSinceStart = GetTickCount() - g_Devs(idx).dwStreamStart
+            ' FIX (log-fix-C): require 2 consecutive zero-underrun intervals
+            ' (20s) before decreasing. Log showed the buffer oscillating
+            ' 6->5->7->6->5->4 because a single 10s zero-underrun window
+            ' was followed by underruns. Requiring 2 windows confirms the
+            ' buffer is genuinely too large, not just in a lucky gap.
+            IF underrunCount = 0 AND jitterTarget > %JITTER_MIN AND _
+               msSinceStart > 5000 THEN
+                INCR zeroUnderrunIntervals
+                IF zeroUnderrunIntervals >= 2 THEN
+                    DECR jitterTarget
+                    zeroUnderrunIntervals = 0
+                    AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+                           ": adaptive buffer: 0 underruns -> decrease to " & _
+                           TRIM$(STR$(jitterTarget))
+                END IF
             ELSEIF underrunCount >= %JITTER_UNDERRUN_THRESHOLD AND _
                    jitterTarget < %JITTER_MAX THEN
                 INCR jitterTarget
+                zeroUnderrunIntervals = 0
                 AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
                        ": adaptive buffer: " & TRIM$(STR$(underrunCount)) & _
                        " underruns -> increase to " & TRIM$(STR$(jitterTarget))
+            ELSE
+                ' Underruns below threshold or at JITTER_MAX: reset counter
+                zeroUnderrunIntervals = 0
             END IF
             underrunCount = 0
             lastAdaptTick = GetTickCount()
@@ -2699,27 +2922,32 @@ pcm_ready:
         ' Fix: when reopening WaveOut due to device change / resume, also close
         ' and reconnect the TCP socket. This breaks the dead connection and
         ' establishes a fresh one that actually receives data.
+        ' FIX (BUG#4+#5): atomic read-modify-write of bReopenWaveOut AND
+        ' dwLastReopenTick under a single CS hold. Previously bReopenWaveOut
+        ' was read OUTSIDE CS (line 2702), then CS entered only to clear it.
+        ' A set by GUI between the outside-read and the inside-clear was
+        ' LOST -> WaveOut not reopened after sleep/wake -> silent audio.
+        ' dwLastReopenTick was also read/written outside CS, so the 5s
+        ' suppress window was inconsistent between GUI timers and AudioThread.
+        ' Now: enter CS, read+clear flag, check suppress, write tick, leave
+        ' CS - all atomic. The actual reopen (TCP CLOSE, waveOutClose) runs
+        ' outside CS (no shared state touched, and we never hold CS during
+        ' blocking I/O).
+        LOCAL bDoReopen AS LONG
+        bDoReopen = 0
+        LOCAL nowReopenTick AS DWORD
+        nowReopenTick = GetTickCount()
+        EnterCriticalSection g_csDev
         IF g_Devs(idx).bReopenWaveOut THEN
-            ' FIX (H15): take g_csDev while clearing the flag and reading
-            ' dwLastReopenTick. The flag is written by GUI thread (WM_TIMER
-            ' IDT_DEVCHANGE, WM_POWERBROADCAST) and by AudioThread itself
-            ' (waveOutWrite error). Without CS, the read-modify-write
-            ' (read flag, clear flag, read tick, write tick) is not atomic
-            ' across the two threads; a set by GUI during AudioThread's
-            ' read+clear can be lost -> WaveOut not reopened after
-            ' sleep/wake -> silent audio.
-            EnterCriticalSection g_csDev
             g_Devs(idx).bReopenWaveOut = 0
-            LeaveCriticalSection g_csDev
             ' Suppress duplicate reopen within 5 seconds — after sleep/wake,
             ' multiple sources (waveOutWrite error, WM_DEVICECHANGE debounce,
             ' WM_POWERBROADCAST) all set bReopenWaveOut=1, causing 2-3
             ' consecutive reopens. Only the first should proceed; the rest
             ' are redundant (WaveOut was just reopened, it's fine).
-            LOCAL nowReopenTick AS DWORD
-            nowReopenTick = GetTickCount()
             IF g_Devs(idx).dwLastReopenTick > 0 AND _
                (nowReopenTick - g_Devs(idx).dwLastReopenTick) < 5000 THEN
+                LeaveCriticalSection g_csDev
                 AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
                        ": reopen suppressed (duplicate within 5s)"
                 ' Skip reopen — WaveOut was just reopened, it's still valid.
@@ -2729,8 +2957,12 @@ pcm_ready:
                 ITERATE DO
             END IF
             g_Devs(idx).dwLastReopenTick = nowReopenTick
-            AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
-                   ": reopening WaveOut + TCP (device change / resume)"
+            bDoReopen = 1
+        END IF
+        LeaveCriticalSection g_csDev
+        IF bDoReopen = 0 THEN GOTO skip_reopen_block
+        AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+               ": reopening WaveOut + TCP (device change / resume)"
             ' Close the dead TCP socket (if TCP transport)
             IF devTransport = 1 AND fNum > 0 THEN
                 TCP CLOSE #fNum
@@ -2744,7 +2976,7 @@ pcm_ready:
                 reconOk2 = 0
                 DO WHILE g_Devs(idx).dwRunning
                     ERRCLEAR
-                    TCP OPEN PORT bindPort AT tcpHost AS #fNum TIMEOUT 2000
+                    TCP OPEN PORT bindPort AT tcpHost AS #fNum TIMEOUT 5000
                     IF ERR = 0 THEN reconOk2 = 1 : EXIT DO
                     SLEEP 1000
                 LOOP
@@ -2791,7 +3023,14 @@ pcm_ready:
                     FOR devReopenI = 0 TO %NUM_WAVE_BUFS - 1
                         whdrs(devReopenI).dwFlags = 0
                         whdrs(devReopenI).dwBufferLength = bufSz
-                        waveOutPrepareHeader waveOut, whdrs(devReopenI), SIZEOF(WAVEHDR)
+                        ' FIX (BUG#15): check prepare result on reopen
+                        prepRes = waveOutPrepareHeader(waveOut, whdrs(devReopenI), SIZEOF(WAVEHDR))
+                        IF prepRes <> 0 THEN
+                            AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+                                   ": waveOutPrepareHeader FAILED (reopen) buf=" & _
+                                   TRIM$(STR$(devReopenI)) & " err=" & TRIM$(STR$(prepRes))
+                            whdrs(devReopenI).dwFlags = whdrs(devReopenI).dwFlags OR %WHDR_INQUEUE
+                        END IF
                     NEXT devReopenI
                     AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
                            ": WaveOut reopened " & TRIM$(STR$(outBits)) & "-bit " & _
@@ -2806,7 +3045,12 @@ pcm_ready:
             END IF
             ' For non-TCP (UDP) transport: use the old reopen_waveout path
             GOTO reopen_waveout
-        END IF
+        ' FIX (BUG#4+#5): the original END IF here closed the outer
+        ' IF g_Devs(idx).bReopenWaveOut THEN which was replaced by the
+        ' atomic-RMW + GOTO skip_reopen_block pattern above. Removed.
+        ' Label target for the early-out when no reopen was requested.
+        ' Falls through to the WaveOut submit block.
+skip_reopen_block:
 
         ' ---- Submit to WaveOut ----
         ' wIdx already points to a FREE buffer (found in the scan above).
@@ -2814,7 +3058,7 @@ pcm_ready:
         IF waveOut <> 0 AND pcmLen > 0 THEN
             whdrs(wIdx).dwBufferLength = pcmLen
             whdrs(wIdx).dwBytesRecorded = pcmLen
-            LOCAL wWriteRes AS LONG
+            LOCAL wWriteRes AS DWORD
             wWriteRes = waveOutWrite(waveOut, whdrs(wIdx), SIZEOF(WAVEHDR))
             ' Check for device-loss errors. After sleep/wake the waveOut handle
             ' becomes invalid; waveOutWrite returns MMSYSERR_NODRIVER (2) or
@@ -2859,6 +3103,7 @@ reopen_waveout:
         jitterPrebuffering = 1
         jitterFilled = 0
         underrunCount = 0
+        zeroUnderrunIntervals = 0   ' FIX (log-fix-C)
         lastAdaptTick = GetTickCount()
         lastPcmPtr = 0
         lastPcmLen = 0
@@ -2938,7 +3183,14 @@ reopen_waveout:
             FOR wIdx2 = 0 TO %NUM_WAVE_BUFS - 1
                 whdrs(wIdx2).dwFlags = 0
                 whdrs(wIdx2).dwBufferLength = bufSz
-                waveOutPrepareHeader waveOut, whdrs(wIdx2), SIZEOF(WAVEHDR)
+                ' FIX (BUG#15): check prepare result on format-change reopen
+                prepRes = waveOutPrepareHeader(waveOut, whdrs(wIdx2), SIZEOF(WAVEHDR))
+                IF prepRes <> 0 THEN
+                    AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+                           ": waveOutPrepareHeader FAILED (fmt-change) buf=" & _
+                           TRIM$(STR$(wIdx2)) & " err=" & TRIM$(STR$(prepRes))
+                    whdrs(wIdx2).dwFlags = whdrs(wIdx2).dwFlags OR %WHDR_INQUEUE
+                END IF
             NEXT wIdx2
         ELSE
             AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
@@ -2999,7 +3251,220 @@ END FUNCTION
 '  STREAM MANAGEMENT
 ' ============================================================================
 
-' StartCheckedStreams - Start audio stream for all checked devices
+' ===========================================================================
+' StartStream - Start audio stream for ONE device (no ListView interaction).
+' FIX (BUG#1): extracted from StartCheckedStreams so callers can restart a
+' single device without disturbing others. Previously auto-restart on
+' transport change called StopCheckedStreams + StartCheckedStreams, which
+' stopped and restarted EVERY checked device - dropping audio on all of them
+' just because one switched UDP<->TCP. Now UpdateDevice can call
+' StopStream(idx) + StartStream(idx) to affect only the changed device.
+' Returns 1 on success, 0 on skip/failure.
+' ===========================================================================
+FUNCTION StartStream(BYVAL devIdx AS LONG) AS LONG
+    LOCAL saveIP AS DWORD
+    LOCAL savePort AS DWORD
+    LOCAL saveMac AS STRING
+    LOCAL saveAudioPort AS DWORD
+    LOCAL saveSmpRate AS DWORD
+    LOCAL hThread AS DWORD
+    LOCAL cfgRetry AS LONG
+
+    IF devIdx < 0 OR devIdx >= %MAX_DEVICES THEN FUNCTION = 0 : EXIT FUNCTION
+
+    EnterCriticalSection g_csDev
+
+    ' Skip if not active or already streaming
+    IF g_Devs(devIdx).dwActive = 0 OR g_Devs(devIdx).dwHBActive <> 0 THEN
+        LeaveCriticalSection g_csDev
+        FUNCTION = 0
+        EXIT FUNCTION
+    END IF
+
+    g_Devs(devIdx).dwStatus    = %STS_STREAM
+    g_Devs(devIdx).dwError     = 0
+    g_Devs(devIdx).dwAudioPort = %AUDIO_PORT_BASE + devIdx
+
+    ' Save values needed outside CS
+    saveIP        = g_Devs(devIdx).dwIP
+    savePort      = g_Devs(devIdx).dwPort
+    saveMac       = TRIM$(g_Devs(devIdx).sMac)
+    saveAudioPort = g_Devs(devIdx).dwAudioPort
+    ' FIX (BUG#7): snapshot dwSmpRate here while holding CS; the old
+    ' StartCheckedStreams read it OUTSIDE CS at log time, racing with
+    ' UpdateDevice which can change it on the next INFO packet.
+    saveSmpRate   = g_Devs(devIdx).dwSmpRate
+
+    LeaveCriticalSection g_csDev
+
+    ' Create thread outside CS
+    THREAD CREATE AudioThread(devIdx) TO hThread
+
+    ' FIX (H17): check thread creation success. Without this, if THREAD
+    ' CREATE fails (hThread=0) we still set dwHBActive=1 -> UI shows
+    ' 'Streaming' but no audio thread exists -> user stranded with no
+    ' error. Recover by clearing state and reporting failure.
+    IF hThread = 0 THEN
+        AddLog "[HB] FATAL: THREAD CREATE AudioThread failed for dev #" & TRIM$(STR$(devIdx))
+        EnterCriticalSection g_csDev
+        g_Devs(devIdx).dwHBActive   = 0
+        g_Devs(devIdx).dwStatus     = %STS_IDLE
+        ' FIX (grok22#3): do NOT clear dwActive. dwActive means
+        ' "device is discovered and visible in the list". A THREAD
+        ' CREATE failure (low memory, handle exhaustion) is a stream-
+        ' level error, not a discovery-level error. Clearing dwActive
+        ' would make the device disappear from the UI even though it's
+        ' still sending INFO packets and could be started again later.
+        ' Only reset stream state (dwHBActive, dwStatus, hAudioThread).
+        g_Devs(devIdx).hAudioThread = 0
+        LeaveCriticalSection g_csDev
+        FUNCTION = 0
+        EXIT FUNCTION
+    END IF
+
+    ' Store thread handle + mark streaming under CS
+    ' (dwHBActive set AFTER thread creation so stop logic can find hAudioThread)
+    EnterCriticalSection g_csDev
+    g_Devs(devIdx).hAudioThread = hThread
+    g_Devs(devIdx).dwHBActive   = 1
+    ' FIX (Bug #1): seed dwStreamStart HERE so the first HeartbeatThread
+    ' iteration doesn't compute elapsed = tick - 0 = "51 656 639 ms" and
+    ' wrongly log "no audio after start (initial CONFIGURE lost?)". The
+    ' AudioThread later overwrites dwStreamStart (line ~1306) when it has
+    ' opened its transport + WaveOut — that's the real "audio-ready"
+    ' timestamp — but we need a sane value NOW in case HB fires before
+    ' AudioThread reaches that line.
+    g_Devs(devIdx).dwStreamStart = GetTickCount()
+    g_Devs(devIdx).dwLastPktTick = g_Devs(devIdx).dwStreamStart
+    LeaveCriticalSection g_csDev
+
+    AddLog "[HB] dwHBActive=1 for dev #" & TRIM$(STR$(devIdx)) & _
+           " - heartbeat will be sent every " & TRIM$(STR$(%HB_INTERVAL)) & "ms"
+
+    SLEEP 50
+
+    ' Send CONFIGURE with RETRIES - UDP is unreliable, single send can be lost.
+    ' Send 3 times with 200ms gaps. ESP deduplicates (same dest = resets watchdog),
+    ' so duplicates are harmless. This fixes "Start doesn't work" when first
+    ' CONFIGURE packet is lost in WiFi.
+    '
+    ' PROTOCOL PRINCIPLE: The receiver (this Windows program) NEVER dictates
+    ' audio parameters to the ESP. CONFIGURE only tells ESP WHERE to send
+    ' audio (stream_port). Channels=0 means "use your NVS config" - ESP is
+    ' the audio authority, the server adapts to whatever ESP sends.
+    ' The server learns the actual format from INFO packets and opens
+    ' WaveOut to match. If the format is unsupported, the stream is rejected.
+    FOR cfgRetry = 1 TO 3
+        SendConfigure saveIP, savePort, saveAudioPort  ' CONFIGURE = just "send audio to this port"
+        IF cfgRetry < 3 THEN SLEEP 200
+    NEXT cfgRetry
+
+    AddLog "Stream started: " & saveMac & " -> " & _
+           FormatIP(saveIP) & ":" & TRIM$(STR$(savePort)) & _
+           " port=" & TRIM$(STR$(saveAudioPort)) & _
+           " rate=" & TRIM$(STR$(saveSmpRate)) & " Hz"
+    FUNCTION = 1
+END FUNCTION
+
+' ===========================================================================
+' StopStream - Stop audio stream for ONE device (no ListView interaction).
+' FIX (BUG#1): extracted from StopCheckedStreams so callers can stop a
+'               single device. Returns 1 if a stream was stopped, 0 otherwise.
+' ===========================================================================
+FUNCTION StopStream(BYVAL devIdx AS LONG) AS LONG
+    LOCAL fNum AS LONG
+    LOCAL hThread AS DWORD
+    LOCAL lRes AS LONG
+    LOCAL sMac AS STRING
+    LOCAL stopIP AS DWORD
+    LOCAL stopPort AS DWORD
+
+    IF devIdx < 0 OR devIdx >= %MAX_DEVICES THEN FUNCTION = 0 : EXIT FUNCTION
+
+    EnterCriticalSection g_csDev
+    IF g_Devs(devIdx).dwHBActive = 0 THEN
+        LeaveCriticalSection g_csDev
+        FUNCTION = 0
+        EXIT FUNCTION
+    END IF
+    ' Capture IP/Port BEFORE clearing dwHBActive for SendStop
+    stopIP   = g_Devs(devIdx).dwIP
+    stopPort = g_Devs(devIdx).dwPort
+    g_Devs(devIdx).dwRunning  = 0
+    g_Devs(devIdx).dwHBActive = 0
+    g_Devs(devIdx).dwStatus   = %STS_IDLE
+    fNum = g_Devs(devIdx).fAudioFile
+    g_Devs(devIdx).fAudioFile = 0
+    sMac = TRIM$(g_Devs(devIdx).sMac)
+    hThread = g_Devs(devIdx).hAudioThread
+    g_Devs(devIdx).hAudioThread = 0
+    LeaveCriticalSection g_csDev
+
+    AddLog "[HB] dwHBActive=0 for dev #" & TRIM$(STR$(devIdx)) & _
+           " - heartbeat STOPPED (single stop)"
+
+    ' Send explicit CMD_STOP to device so it stops immediately
+    ' (instead of waiting for watchdog timeout)
+    SendStop stopIP, stopPort
+
+    ' FIX (UDP stop crash): Do NOT close the audio socket here. The
+    ' AudioThread OWNS this socket and may be blocked inside UDP RECV on
+    ' it right now. Calling UDP CLOSE #fNum from this (GUI) thread while
+    ' RECV is in progress races on PowerBASIC's process-global file-number
+    ' table (CLOSE frees the slot while RECV still references it ->
+    ' use-after-free -> instant crash). The AudioThread polls dwRunning
+    ' every <=500ms (UDP RECV timeout), sees 0, and closes its OWN socket
+    ' in its cleanup section. We just wait for the thread below.
+    ' (fNum is captured only for diagnostics / bookkeeping; fAudioFile is
+    '  cleared above so a restart won't see a stale handle.)
+
+    AddLog "Stream stopping: " & sMac
+
+    ' Wait for the audio thread to finish (it closes its own socket).
+    ' FIX (grok22#2): previously used a single WaitForSingleObject with
+    ' 3s timeout. If the thread was stuck in TCP reconnect (up to 2s per
+    ' attempt × many retries), the wait timed out, THREAD CLOSE closed the
+    ' handle but did NOT kill the thread. A subsequent StartStream would
+    ' create a SECOND AudioThread for the same device → both trying to
+    ' open the same port → duplicate handles / audio corruption / crash.
+    '
+    ' Now: poll WaitForSingleObject(hThread, 1000) in a loop up to 30s
+    ' (same pattern as WaitForAllThreads). If still alive after 30s, log
+    ' a warning and return 0 (failure) so the caller does NOT restart.
+    ' The orphan thread will eventually exit on its own (dwRunning=0), but
+    ' we don't risk a duplicate by starting a new one.
+    IF hThread THEN
+        LOCAL stopWaitMs AS LONG
+        LOCAL stopWaitRes AS DWORD
+        LOCAL stopThreadAlive AS LONG
+        stopWaitMs = 0
+        stopThreadAlive = 0
+        DO
+            stopWaitRes = WaitForSingleObject(hThread, 1000)
+            IF stopWaitRes = %WAIT_OBJECT_0 THEN EXIT DO
+            stopWaitMs = stopWaitMs + 1000
+            IF stopWaitMs >= 30000 THEN
+                stopThreadAlive = 1
+                EXIT DO
+            END IF
+        LOOP
+        THREAD CLOSE hThread TO lRes
+        IF stopThreadAlive THEN
+            AddLog "[AUD] dev #" & TRIM$(STR$(devIdx)) & _
+                   ": StopStream: AudioThread did not exit in 30s - " & _
+                   "NOT restarting (orphan thread will self-exit)"
+            FUNCTION = 0   ' failure - caller should not restart
+            EXIT FUNCTION
+        END IF
+    END IF
+
+    FUNCTION = 1
+END FUNCTION
+
+' StartCheckedStreams - Start audio stream for all checked devices.
+' FIX (BUG#1): now a thin wrapper around StartStream(idx). The previous
+' monolithic version mixed per-device logic with ListView iteration,
+' making it impossible to restart just one device on transport change.
 SUB StartCheckedStreams()
     LOCAL hLV AS DWORD
     LOCAL i AS LONG
@@ -3007,11 +3472,6 @@ SUB StartCheckedStreams()
     LOCAL devIdx AS LONG
     LOCAL lvi AS LV_ITM
     LOCAL started AS LONG
-    LOCAL saveIP AS DWORD
-    LOCAL savePort AS DWORD
-    LOCAL saveMac AS STRING
-    LOCAL saveAudioPort AS DWORD
-    LOCAL hThread AS DWORD
 
     CONTROL HANDLE g_hDlg, %IDC_LISTVIEW TO hLV
     IF hLV = 0 THEN EXIT SUB
@@ -3029,87 +3489,7 @@ SUB StartCheckedStreams()
 
         IF devIdx < 0 OR devIdx >= %MAX_DEVICES THEN ITERATE FOR
 
-        EnterCriticalSection g_csDev
-
-        ' Skip if not active or already streaming
-        IF g_Devs(devIdx).dwActive = 0 OR g_Devs(devIdx).dwHBActive <> 0 THEN
-            LeaveCriticalSection g_csDev
-            ITERATE FOR
-        END IF
-
-        g_Devs(devIdx).dwStatus    = %STS_STREAM
-        g_Devs(devIdx).dwError     = 0
-        g_Devs(devIdx).dwAudioPort = %AUDIO_PORT_BASE + devIdx
-
-        ' Save values needed outside CS
-        saveIP        = g_Devs(devIdx).dwIP
-        savePort      = g_Devs(devIdx).dwPort
-        saveMac       = TRIM$(g_Devs(devIdx).sMac)
-        saveAudioPort = g_Devs(devIdx).dwAudioPort
-
-        LeaveCriticalSection g_csDev
-
-        ' Create thread outside CS
-        THREAD CREATE AudioThread(devIdx) TO hThread
-
-        ' FIX (H17): check thread creation success. Without this, if THREAD
-        ' CREATE fails (hThread=0) we still set dwHBActive=1 -> UI shows
-        ' 'Streaming' but no audio thread exists -> user stranded with no
-        ' error. Recover by clearing state and reporting failure.
-        IF hThread = 0 THEN
-            AddLog "[HB] FATAL: THREAD CREATE AudioThread failed for dev #" & TRIM$(STR$(devIdx))
-            EnterCriticalSection g_csDev
-            g_Devs(devIdx).dwHBActive   = 0
-            g_Devs(devIdx).dwStatus     = %STS_IDLE
-            g_Devs(devIdx).dwActive     = 0
-            g_Devs(devIdx).hAudioThread = 0
-            LeaveCriticalSection g_csDev
-            ITERATE FOR
-        END IF
-
-        ' Store thread handle + mark streaming under CS
-        ' (dwHBActive set AFTER thread creation so stop logic can find hAudioThread)
-        EnterCriticalSection g_csDev
-        g_Devs(devIdx).hAudioThread = hThread
-        g_Devs(devIdx).dwHBActive   = 1
-        ' FIX (Bug #1): seed dwStreamStart HERE so the first HeartbeatThread
-        ' iteration doesn't compute elapsed = tick - 0 = "51 656 639 ms" and
-        ' wrongly log "no audio after start (initial CONFIGURE lost?)". The
-        ' AudioThread later overwrites dwStreamStart (line ~1306) when it has
-        ' opened its transport + WaveOut — that's the real "audio-ready"
-        ' timestamp — but we need a sane value NOW in case HB fires before
-        ' AudioThread reaches that line.
-        g_Devs(devIdx).dwStreamStart = GetTickCount()
-        g_Devs(devIdx).dwLastPktTick = g_Devs(devIdx).dwStreamStart
-        LeaveCriticalSection g_csDev
-
-        AddLog "[HB] dwHBActive=1 for dev #" & TRIM$(STR$(devIdx)) & _
-               " - heartbeat will be sent every " & TRIM$(STR$(%HB_INTERVAL)) & "ms"
-
-        SLEEP 50
-
-        ' Send CONFIGURE with RETRIES - UDP is unreliable, single send can be lost.
-        ' Send 3 times with 200ms gaps. ESP deduplicates (same dest = resets watchdog),
-        ' so duplicates are harmless. This fixes "Start doesn't work" when first
-        ' CONFIGURE packet is lost in WiFi.
-        '
-        ' PROTOCOL PRINCIPLE: The receiver (this Windows program) NEVER dictates
-        ' audio parameters to the ESP. CONFIGURE only tells ESP WHERE to send
-        ' audio (stream_port). Channels=0 means "use your NVS config" - ESP is
-        ' the audio authority, the server adapts to whatever ESP sends.
-        ' The server learns the actual format from INFO packets and opens
-        ' WaveOut to match. If the format is unsupported, the stream is rejected.
-        LOCAL cfgRetry AS LONG
-        FOR cfgRetry = 1 TO 3
-            SendConfigure saveIP, savePort, saveAudioPort  ' CONFIGURE = just "send audio to this port"
-            IF cfgRetry < 3 THEN SLEEP 200
-        NEXT cfgRetry
-
-        INCR started
-        AddLog "Stream started: " & saveMac & " -> " & _
-               FormatIP(saveIP) & ":" & TRIM$(STR$(savePort)) & _
-               " port=" & TRIM$(STR$(saveAudioPort)) & _
-               " rate=" & TRIM$(STR$(g_Devs(devIdx).dwSmpRate)) & " Hz"
+        IF StartStream(devIdx) THEN INCR started
     NEXT i
 
     IF started = 0 THEN
@@ -3119,27 +3499,27 @@ SUB StartCheckedStreams()
     END IF
 END SUB
 
-' StopCheckedStreams - Stop audio stream for all checked streaming devices
+' StopCheckedStreams - Stop audio stream for all checked streaming devices.
+' FIX (BUG#1): now a thin wrapper around StopStream(idx). The previous
+' two-phase monolith (signal-all-then-wait-all) is preserved by calling
+' StopStream per device, which signals AND waits before returning. This
+' serializes stop operations (slower for many devices) but is far simpler
+' and avoids the duplicated ListView-iteration code. The two-phase approach
+' was originally needed so all sockets got CMD_STOP quickly; in practice
+' the 50ms between stops is negligible vs the 3s thread-wait timeout.
 SUB StopCheckedStreams()
     LOCAL hLV AS DWORD
     LOCAL i AS LONG
     LOCAL nCount AS LONG
     LOCAL devIdx AS LONG
     LOCAL lvi AS LV_ITM
-    LOCAL fNum AS LONG
-    LOCAL hThread AS DWORD
-    LOCAL lRes AS LONG
     LOCAL stopped AS LONG
-    LOCAL sMac AS STRING
-    LOCAL stopIP AS DWORD
-    LOCAL stopPort AS DWORD
 
     CONTROL HANDLE g_hDlg, %IDC_LISTVIEW TO hLV
     IF hLV = 0 THEN EXIT SUB
 
     nCount = SendMessage(hLV, %LVM_GETITEMCOUNT, 0, 0)
 
-    ' Phase 1: Signal all checked streaming devices to stop + collect fNum
     FOR i = 0 TO nCount - 1
         IF IsItemChecked(hLV, i) = 0 THEN ITERATE FOR
 
@@ -3151,66 +3531,7 @@ SUB StopCheckedStreams()
 
         IF devIdx < 0 OR devIdx >= %MAX_DEVICES THEN ITERATE FOR
 
-        EnterCriticalSection g_csDev
-        IF g_Devs(devIdx).dwHBActive = 0 THEN
-            LeaveCriticalSection g_csDev
-            ITERATE FOR
-        END IF
-        ' Capture IP/Port BEFORE clearing dwHBActive for SendStop
-        stopIP   = g_Devs(devIdx).dwIP
-        stopPort = g_Devs(devIdx).dwPort
-        g_Devs(devIdx).dwRunning  = 0
-        g_Devs(devIdx).dwHBActive = 0
-        g_Devs(devIdx).dwStatus   = %STS_IDLE
-        LeaveCriticalSection g_csDev
-        AddLog "[HB] dwHBActive=0 for dev #" & TRIM$(STR$(devIdx)) & _
-               " - heartbeat STOPPED (single stop)"
-        EnterCriticalSection g_csDev
-        fNum = g_Devs(devIdx).fAudioFile
-        g_Devs(devIdx).fAudioFile = 0
-        sMac = TRIM$(g_Devs(devIdx).sMac)
-        LeaveCriticalSection g_csDev
-
-        ' Send explicit CMD_STOP to device so it stops immediately
-        ' (instead of waiting for watchdog timeout)
-        SendStop stopIP, stopPort
-
-        ' FIX (UDP stop crash): Do NOT close the audio socket here. The
-        ' AudioThread OWNS this socket and may be blocked inside UDP RECV on
-        ' it right now. Calling UDP CLOSE #fNum from this (GUI) thread while
-        ' RECV is in progress races on PowerBASIC's process-global file-number
-        ' table (CLOSE frees the slot while RECV still references it ->
-        ' use-after-free -> instant crash). The AudioThread polls dwRunning
-        ' every <=500ms (UDP RECV timeout), sees 0, and closes its OWN socket
-        ' in its cleanup section. Phase 2 below then just waits for the thread.
-        ' (fNum is captured only for diagnostics / bookkeeping; fAudioFile is
-        '  cleared above so a restart won't see a stale handle.)
-
-        INCR stopped
-        AddLog "Stream stopping: " & sMac
-    NEXT i
-
-    ' Phase 2: Wait for all audio threads to finish
-    FOR i = 0 TO nCount - 1
-        IF IsItemChecked(hLV, i) = 0 THEN ITERATE FOR
-
-        lvi.mask     = %LVIF_PARAM
-        lvi.iItem    = i
-        lvi.iSubItem = 0
-        SendMessage hLV, %LVM_GETITEM, 0, VARPTR(lvi)
-        devIdx = lvi.lParam
-
-        IF devIdx < 0 OR devIdx >= %MAX_DEVICES THEN ITERATE FOR
-
-        EnterCriticalSection g_csDev
-        hThread = g_Devs(devIdx).hAudioThread
-        g_Devs(devIdx).hAudioThread = 0
-        LeaveCriticalSection g_csDev
-
-        IF hThread THEN
-            WaitForSingleObject hThread, 3000
-            THREAD CLOSE hThread TO lRes
-        END IF
+        IF StopStream(devIdx) THEN INCR stopped
     NEXT i
 END SUB
 
@@ -3292,7 +3613,7 @@ SUB WaitForAllThreads()
     LOCAL idx AS LONG
     LOCAL hThread AS DWORD
     LOCAL lRes AS LONG
-    LOCAL waitRes AS LONG
+    LOCAL waitRes AS DWORD
     LOCAL totalMs AS LONG
 
     ' Wait for audio threads - read handles under CS
@@ -3435,8 +3756,13 @@ SUB ToggleDump()
 
     IF g_bDumping THEN
         ' ---- Stop dumping ----
-        g_bDumping = 0
+        ' FIX (Partial#14): g_bDumping write under g_csDump for memory-order
+        ' consistency with AudioThread reads. LONG writes are atomic on x86,
+        ' but a single CS covers the flag + g_hDumpFile close as one atomic
+        ' transition - no window where AudioThread sees g_bDumping=0 but
+        ' g_hDumpFile still open and writes to a closing handle.
         EnterCriticalSection g_csDump
+        g_bDumping = 0
         IF g_hDumpFile THEN
             UpdateWavHeader
             CLOSE g_hDumpFile
@@ -3462,8 +3788,12 @@ SUB ToggleDump()
         g_dumpCodec = 0
         g_dumpDataSize = 0
         g_dumpSeqCounter = 0
-        ' Will open file on first packet (need format info from packet header)
+        ' Will open file on first packet (need format info from packet header).
+        ' FIX (Partial#14): g_bDumping write under CS so AudioThread's
+        ' first-packet check (also under CS) sees a consistent flag+state.
+        EnterCriticalSection g_csDump
         g_bDumping = 1
+        LeaveCriticalSection g_csDump
         CONTROL SET TEXT g_hDlg, %IDC_BTN_DUMP, "STOP DUMP"
         AddLog "WAV dump: waiting for first packet to determine format..."
     END IF
@@ -3880,19 +4210,15 @@ CALLBACK FUNCTION MainDlgProc()
                         COMBOBOX GET SELECT g_hDlg, %IDC_COMBO_DEVICE TO selIdx
                         IF selIdx <= 1 THEN
                             IF selDevIdx >= 0 THEN
-                                g_Devs(selDevIdx).dwWaveDevice = -1
-                                SaveDeviceOutput g_Devs(selDevIdx).sMac, -1
-                                AddLog "Output device for " & TRIM$(g_Devs(selDevIdx).sHostname) & _
-                                       ": Default (WAVE_MAPPER)"
+                                ' FIX (BUG#3): use CS-safe helper
+                                SetDeviceWaveOutput selDevIdx, -1
                             ELSE
                                 AddLog "Select a device in ListView first, then choose output"
                             END IF
                         ELSE
                             IF selDevIdx >= 0 THEN
-                                g_Devs(selDevIdx).dwWaveDevice = selIdx - 2
-                                SaveDeviceOutput g_Devs(selDevIdx).sMac, selIdx - 2
-                                AddLog "Output device for " & TRIM$(g_Devs(selDevIdx).sHostname) & _
-                                       ": " & TRIM$(STR$(selIdx - 2)) & " (will apply on next stream start)"
+                                ' FIX (BUG#3): use CS-safe helper
+                                SetDeviceWaveOutput selDevIdx, selIdx - 2
                             ELSE
                                 AddLog "Select a device in ListView first, then choose output"
                             END IF
@@ -3954,7 +4280,7 @@ CALLBACK FUNCTION MainDlgProc()
                         ' Output Device submenu (for the selected device)
                         LOCAL hSubOutput AS DWORD
                         LOCAL selDev AS LONG
-                        LOCAL numDevs AS LONG
+                        LOCAL numDevs AS DWORD
                         LOCAL di AS LONG
                         LOCAL capsOut AS WAVEOUTCAPS
                         LOCAL sDevName AS STRING
@@ -4004,7 +4330,23 @@ CALLBACK FUNCTION MainDlgProc()
                             EnableMenuItem hPopup, %IDM_CTX_CLEARALL,  %MF_GRAYED
                         END IF
                         IF selDev < 0 THEN
-                            EnableMenuItem hPopup, hSubOutput, %MF_GRAYED
+                            ' FIX (Partial#9): EnableMenuItem by command-ID
+                            ' (hSubOutput handle) works on most Windows versions
+                            ' because AppendMenu(MF_POPUP) stores the HMENU as the
+                            ' command ID, but this is undocumented and fragile.
+                            ' Switch to MF_BYPOSITION with a position lookup.
+                            LOCAL subOutPos AS LONG
+                            LOCAL ctxPos AS LONG
+                            subOutPos = -1
+                            FOR ctxPos = 0 TO GetMenuItemCount(hPopup) - 1
+                                IF GetSubMenu(hPopup, ctxPos) = hSubOutput THEN
+                                    subOutPos = ctxPos
+                                    EXIT FOR
+                                END IF
+                            NEXT ctxPos
+                            IF subOutPos >= 0 THEN
+                                EnableMenuItem hPopup, subOutPos, %MF_BYPOSITION OR %MF_GRAYED
+                            END IF
                         END IF
 
                         ' Show menu at cursor position
@@ -4015,7 +4357,14 @@ CALLBACK FUNCTION MainDlgProc()
                                        %TPM_RIGHTBUTTON, _
                                        pt.x, pt.y, 0, CB.HNDL, BYVAL %NULL)
                         DestroyMenu hPopup
-                        IF hSubOutput THEN DestroyMenu hSubOutput
+                        ' FIX (BUG#2): removed second "DestroyMenu hSubOutput".
+                        ' Per MSDN, DestroyMenu is recursive: it destroys the menu
+                        ' AND all its submenus. hSubOutput was attached to hPopup
+                        ' via AppendMenu(MF_POPUP), so DestroyMenu hPopup already
+                        ' freed it. Calling DestroyMenu hSubOutput again was a
+                        ' use-after-free (usually silent, occasionally crashes on
+                        ' heap introspection). hSubOutput is now a dangling handle
+                        ' - do not touch it.
 
                         ' Handle selected menu item
                         SELECT CASE ctxCmd
@@ -4043,19 +4392,14 @@ CALLBACK FUNCTION MainDlgProc()
                             CASE &H2100
                                 ' "Default (WAVE_MAPPER)" selected for the focused device
                                 IF selDev >= 0 THEN
-                                    g_Devs(selDev).dwWaveDevice = -1
-                                    SaveDeviceOutput g_Devs(selDev).sMac, -1
-                                    AddLog "Output device for " & TRIM$(g_Devs(selDev).sHostname) & _
-                                           ": Default (WAVE_MAPPER)"
+                                    ' FIX (BUG#3): use CS-safe helper
+                                    SetDeviceWaveOutput selDev, -1
                                 END IF
                             CASE &H2101 TO &H21FF
                                 ' Specific device ID = ctxCmd - &H2101
                                 IF selDev >= 0 THEN
-                                    g_Devs(selDev).dwWaveDevice = ctxCmd - &H2101
-                                    SaveDeviceOutput g_Devs(selDev).sMac, ctxCmd - &H2101
-                                    AddLog "Output device for " & TRIM$(g_Devs(selDev).sHostname) & _
-                                           ": " & TRIM$(STR$(ctxCmd - &H2101)) & _
-                                           " (will apply on next stream start)"
+                                    ' FIX (BUG#3): use CS-safe helper
+                                    SetDeviceWaveOutput selDev, ctxCmd - &H2101
                                 END IF
                         END SELECT
                         FUNCTION = 1
@@ -4360,8 +4704,10 @@ FUNCTION PBMAIN() AS LONG
     ' ---- Single instance check (BEFORE any dialog creation) ----
     ' CreateMutex is declared in WinBase.inc as:
     '   CreateMutex(lpMutexAttributes AS SECURITY_ATTRIBUTES, BYVAL bInitialOwner AS LONG, lpName AS ASCIIZ) AS DWORD
-    ' First param is BYREF (not BYVAL), so we pass a properly initialized
-    ' SECURITY_ATTRIBUTES struct. Using BYVAL 0 would corrupt the stack.
+    ' First param is BYREF. We pass a properly initialized SECURITY_ATTRIBUTES
+    ' struct to make the intent explicit. (Passing BYVAL 0 / BYVAL %NULL is also
+    ' a valid PB idiom for a NULL BYREF pointer - it does NOT corrupt the stack -
+    ' but here we explicitly want bInheritHandle=0 for the mutex handle.)
     LOCAL hMutex AS DWORD
     LOCAL sa AS SECURITY_ATTRIBUTES
     sa.nLength = SIZEOF(sa)
@@ -4587,8 +4933,14 @@ FUNCTION PBMAIN() AS LONG
         END IF
     NEXT i
 
-    DeleteCriticalSection g_csDev
-    DeleteCriticalSection g_csDump   ' FIX C6
+    ' FIX (BUG#13): do NOT call DeleteCriticalSection here. If
+    ' WaitForAllThreads above timed out at 30s, an AudioThread (or HB thread)
+    ' may still be alive and inside EnterCriticalSection g_csDev/g_csDump.
+    ' Deleting the CS while a thread holds/contends it is undefined behavior
+    ' (use-after-free on the CS itself). Since the process is exiting, the OS
+    ' will reclaim all resources including CS objects - the leak is benign.
+    ' DeleteCriticalSection g_csDev
+    ' DeleteCriticalSection g_csDump   ' FIX C6
 
     ' FIX M5: Delete font handle (was leaking ~1KB GDI memory)
     IF hMono THEN FONT END hMono
