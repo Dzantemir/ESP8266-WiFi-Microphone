@@ -362,12 +362,22 @@ esp_err_t tcp_stream_deinit(void)
 
     /* Give the accept task time to notice s_running=false (set above) and
      * exit via vTaskDelete(NULL). shutdown() unblocks accept() so the task
-     * loops back, sees s_running=false, and deletes itself. 200ms is plenty
-     * (we don't use eTaskGetState — it's not reliably available across
-     * ESP8266 RTOS SDK versions and needs extra includes). */
+     * loops back, sees s_running=false, and deletes itself.
+     * FIX (FW#4): poll for up to 2s instead of a single 200ms delay.
+     * The accept task may be between accept() returning and looping back
+     * to check s_running; a single 200ms delay could miss the window.
+     * If it doesn't exit in 2s, log a warning (but don't force-delete —
+     * vTaskDelete on a task inside accept/recv can orphan lwIP state).
+     * We just NULL the handle and let the task self-delete eventually. */
     if (s_accept_task)
     {
-        vTaskDelay(pdMS_TO_TICKS(200));
+        for (int i = 0; i < 20 && s_accept_task; i++)
+            vTaskDelay(pdMS_TO_TICKS(100));
+        if (s_accept_task)
+        {
+            ESP_LOGW(TAG, "tcp_stream: accept task did not exit in 2s - "
+                     "leaving it (will self-delete; reboot if socket issues)");
+        }
         s_accept_task = NULL;
     }
 

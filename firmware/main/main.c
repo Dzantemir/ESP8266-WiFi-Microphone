@@ -328,7 +328,10 @@ static void adpcm_task_fn(void *arg)
     ESP_LOGI(TAG, "[ADPCM] Task started (idx=%d, %d ch)", idx, s_channels);
 
     uint32_t frame_count = 0;
-    uint16_t seq_counter = 0;
+    /* FIX (FW#1): removed seq_counter from encoder task. seq is now
+     * assigned in the TX task AFTER successful transport_send, so
+     * dropped frames don't create phantom seq gaps that the server
+     * would misinterpret as packet loss (triggering PLC clicks). */
     int cap = DVI4_HEADER_SIZE + s_adpcm_frame_bytes;
 
     int16_t *ch_left = NULL, *ch_right = NULL;
@@ -393,7 +396,8 @@ static void adpcm_task_fn(void *arg)
         }
 
         adpcm->data_len = (uint16_t)written;
-        adpcm->seq_num = seq_counter++;
+        /* FIX (FW#1): seq_num assigned in TX task after successful send. */
+        adpcm->seq_num = 0;
         adpcm->timestamp_ms = frame_count * s_frame_ms;
 
         if (xQueueSend(adpcm_filled_queue, &adpcm, 0) != pdTRUE)
@@ -439,7 +443,7 @@ static void pcm_task_fn(void *arg)
              idx, s_channels, s_bits_per_sample);
 
     uint32_t frame_count = 0;
-    uint16_t seq_counter = 0;
+    /* FIX (FW#1): removed seq_counter - assigned in TX task. */
 
     while (streaming_is_active())
     {
@@ -498,7 +502,8 @@ static void pcm_task_fn(void *arg)
         }
 
         out->data_len = (uint16_t)written;
-        out->seq_num = seq_counter++;
+        /* FIX (FW#1): seq_num assigned in TX task after successful send. */
+        out->seq_num = 0;
         out->timestamp_ms = frame_count * s_frame_ms;
 
         if (xQueueSend(adpcm_filled_queue, &out, 0) != pdTRUE)
@@ -569,6 +574,12 @@ static void stream_task_fn(void *arg)
     }
 
     uint32_t sent = 0, dropped = 0;
+    /* FIX (FW#1): seq_counter lives in the TX task, not the encoder.
+     * It's incremented ONLY after a successful transport_send, so
+     * dropped frames (transport not ready / send fail) don't create
+     * phantom seq gaps. The server sees a contiguous seq stream and
+     * doesn't fire PLC for frames that were never actually sent. */
+    uint16_t seq_counter = 0;
 
     while (streaming_is_active())
     {
@@ -584,6 +595,9 @@ static void stream_task_fn(void *arg)
         }
 
         pkt_header_t hdr;
+        /* FIX (FW#1): assign seq HERE (in TX task), not in encoder. The
+         * seq is only committed (seq_counter++) after successful send below. */
+        adpcm->seq_num = seq_counter;
         /* bits field carries I2S bit depth (16 or 24). For ADPCM, ESP dithers
          * 24->16 before encoding, so the decoded audio is always 16-bit - but
          * we still report the I2S config so the receiver can detect config
@@ -600,6 +614,10 @@ static void stream_task_fn(void *arg)
         if (transport_send(pkt, PKT_HDR_SIZE + adpcm->data_len) == ESP_OK)
         {
             sent++;
+            /* FIX (FW#1): commit seq only on successful send. If send fails,
+             * seq_counter stays the same -> next frame reuses this seq ->
+             * server sees no gap -> no false PLC -> no click. */
+            seq_counter++;
             /* Clear stale NETWORK error after successful send - the initial
              * send may fail (errno=12 ENOMEM while WiFi still associating),
              * but once streaming works the error flag should be cleared so
@@ -829,6 +847,16 @@ static esp_err_t start_streaming(void)
     else
         s_samples_per_frame &= ~3;   /* кратно 4 (24-bit) */
 
+    /* FIX (FW#2): recompute s_frame_ms from the ALIGNED samples_per_frame.
+     * Previously s_frame_ms was computed from the UNALIGNED value, so the
+     * frame_ms field in the packet header didn't match the actual frame
+     * duration (samples_per_frame / rate). The server used this frame_ms
+     * for skip frame count (STARTUP_SKIP_MS / frame_ms) and jitter timing.
+     * A mismatch caused the skip to end at the wrong time -> click at
+     * startup. Also, timestamp_ms = frame_count * s_frame_ms drifted from
+     * real wallclock time, affecting server HOTRESTART detection. */
+    s_frame_ms = (uint32_t)((uint64_t)s_samples_per_frame * 1000 / s_sample_rate);
+
     /* FIX (M14): post-condition check. If frame_ms was so small that
      * samples_per_frame < 8, the alignment could zero it (8 & ~7 = 0),
      * leading to division by zero in pool sizing (100 / s_frame_ms) and
@@ -840,7 +868,7 @@ static esp_err_t start_streaming(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    ESP_LOGI(TAG, "Computed frame_ms=%u -> samples_per_frame=%d (rate=%u, ch=%u)",
+    ESP_LOGI(TAG, "Computed frame_ms=%u (aligned) -> samples_per_frame=%d (rate=%u, ch=%u)",
              (unsigned)s_frame_ms, s_samples_per_frame,
              (unsigned)s_sample_rate, s_channels);
 

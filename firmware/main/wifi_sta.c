@@ -782,9 +782,17 @@ esp_err_t wifi_sta_init(const char *ssid, const char *password,
             xEventGroupSetBits(s_wifi_evt, WIFI_EVT_EXIT);
         if (s_reconnect_task)
         {
-            vTaskDelay(pdMS_TO_TICKS(300));
-            vTaskDelete(s_reconnect_task);
-            s_reconnect_task = NULL;
+            /* FIX (FW#4): wait up to 3s for the reconnect task to exit on
+             * its own before force-deleting. Force-delete inside
+             * esp_wifi_connect orphans the WiFi driver mutex. */
+            for (int i = 0; i < 30 && s_reconnect_task; i++)
+                vTaskDelay(pdMS_TO_TICKS(100));
+            if (s_reconnect_task)
+            {
+                ESP_LOGW(TAG, "wifi init fail: reconnect task did not exit, force-deleting");
+                vTaskDelete(s_reconnect_task);
+                s_reconnect_task = NULL;
+            }
         }
         esp_wifi_stop();
         esp_wifi_deinit();
@@ -935,10 +943,12 @@ esp_err_t wifi_sta_deinit(void)
 
     if (s_reconnect_task)
     {
-        /* FIX (C4): wait up to 5s for the reconnect task to exit on its own
-         * (it may be inside esp_wifi_connect() which can block several
-         * seconds). Only force-delete as a last resort. Force-deleting a
-         * task inside esp_wifi_connect orphans the WiFi driver mutex. */
+        /* FIX (C4 + FW#4): wait up to 5s for the reconnect task to exit on
+         * its own (it may be inside esp_wifi_connect() which can block
+         * several seconds). Only force-delete as a last resort.
+         * Force-deleting a task inside esp_wifi_connect orphans the WiFi
+         * driver mutex. This is the correct pattern - the other call sites
+         * (svc_port, tcp_stream, wifi init-fail) have been updated to match. */
         for (int i = 0; i < 50 && s_reconnect_task; i++)
         {
             vTaskDelay(pdMS_TO_TICKS(100));

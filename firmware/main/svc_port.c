@@ -258,14 +258,19 @@ void svc_port_deinit(void)
     }
 
     /* Wait for the task to exit (it polls s_state and breaks out of the
-     * loop on SVC_STOPPED). 500 ms is enough for one recvfrom timeout
-     * cycle (200 ms) + small margin. */
+     * loop on SVC_STOPPED). FIX (FW#4): increased from 500ms to 3s.
+     * The task may be inside recvfrom (200ms timeout) or inside
+     * sendto/build_info. 500ms was too tight if a recvfrom just started.
+     * Force-deleting a task inside lwIP orphans the lwIP mutex ->
+     * all future socket calls deadlock. 3s covers 15 recvfrom cycles. */
     if (s_task_handle)
     {
-        for (int i = 0; i < 5 && s_task_handle; i++)
+        for (int i = 0; i < 30 && s_task_handle; i++)
             vTaskDelay(pdMS_TO_TICKS(100));
         if (s_task_handle)
         {
+            ESP_LOGW(TAG, "svc_port: task did not exit in 3s - force-deleting "
+                     "(may orphan lwIP mutex - reboot recommended)");
             vTaskDelete(s_task_handle);
             s_task_handle = NULL;
         }

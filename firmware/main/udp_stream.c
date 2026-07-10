@@ -241,9 +241,21 @@ esp_err_t udp_stream_send(const uint8_t *data, size_t len)
          *   EHOSTUNREACH (118) — WiFi still associating; drop frame.
          *
          * FIX (AUDIT-LOW): log the errno so congestion vs. deinit-race vs.
-         * no-association can be distinguished during debugging. */
+         * no-association can be distinguished during debugging.
+         *
+         * FIX (log-fix-D): on ENOMEM (12), add a 1ms backoff. The log
+         * showed 10+ consecutive errno=12 events because the TX loop
+         * immediately retried sendto() with the next frame, but lwIP's
+         * send buffer was still full from the previous failed send.
+         * A 1ms delay gives lwIP time to drain one buffer slot, so the
+         * next frame has a chance to succeed instead of also failing.
+         * This reduces burst-drop patterns that cause server underruns. */
         int saved_errno = errno;
         ESP_LOGW(TAG, "sendto failed: errno=%d len=%u", saved_errno, (unsigned)len);
+        if (saved_errno == 12) /* ENOMEM - lwIP buffer exhaustion */
+        {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
         (void)saved_errno;
         return ESP_FAIL;
     }

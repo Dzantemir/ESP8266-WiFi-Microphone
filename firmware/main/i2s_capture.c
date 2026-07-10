@@ -278,13 +278,23 @@ esp_err_t i2s_capture_init(uint32_t sample_rate, int bits, int comm_format,
      * MEMORY CAP: total DMA memory <= 8 KB. At 48kHz, dma_buf_len=240 ->
      * 16 bufs = 15.4 KB (too much). Cap reduces to 8 bufs = 7.5 KB (40ms).
      * This keeps free heap >30 KB even at 48kHz/24-bit/stereo. */
+    /* FIX (stereo-mem): bytes_per_dma_word depends on bit depth + channels:
+     *   16-bit (any channels): L+R packed in one 32-bit word -> 4 bytes/word
+     *   24-bit mono: one 32-bit word per sample -> 4 bytes/word
+     *   24-bit stereo: L and R in SEPARATE 32-bit words -> 8 bytes/word
+     * Previously the cap used '* 4' unconditionally, which was correct for
+     * 16-bit and 24-bit mono but WRONG for 24-bit stereo: it allowed 15.3 KB
+     * (8 bufs x 1920) instead of the intended 8 KB, wasting 7 KB of heap.
+     * With stereo TCP, this pushed free heap to ~1 KB -> lwIP send() EAGAIN. */
+    uint32_t bytes_per_dma_word = (s_bits == 24 && s_channels == 2) ? 8U : 4U;
+
     int dma_buf_count = (int)(80U * sample_rate / (1000U * (uint32_t)dma_buf_len)) + 4;
     if (dma_buf_count < 6)
         dma_buf_count = 6;
     if (dma_buf_count > 16)
         dma_buf_count = 16;
     while (dma_buf_count > 4 &&
-           (uint32_t)dma_buf_count * (uint32_t)dma_buf_len * 4U > 8192U)
+           (uint32_t)dma_buf_count * (uint32_t)dma_buf_len * bytes_per_dma_word > 8192U)
     {
         dma_buf_count--;
     }
@@ -294,7 +304,7 @@ esp_err_t i2s_capture_init(uint32_t sample_rate, int bits, int comm_format,
      * this, a caller bypassing compute_frame_ms with a huge
      * samples_per_frame would exceed the cap and exhaust heap. */
     while (dma_buf_len > 8 &&
-           (uint32_t)dma_buf_count * (uint32_t)dma_buf_len * 4U > 8192U)
+           (uint32_t)dma_buf_count * (uint32_t)dma_buf_len * bytes_per_dma_word > 8192U)
     {
         dma_buf_len--;
     }
@@ -352,6 +362,43 @@ esp_err_t i2s_capture_init(uint32_t sample_rate, int bits, int comm_format,
         return err;
     }
 
+    /* FIX (FW#3b): set s_initialized = true NOW (right after install
+     * success), BEFORE the DMA flush and apply_timing. Previously
+     * s_initialized was set at the very end of init(), AFTER
+     * apply_timing() was called. But apply_timing() checks
+     * s_initialized and returns early with a warning if false ->
+     * timing delays were NEVER applied. Moving s_initialized here
+     * fixes both the warning AND the timing issue. */
+    s_initialized = true;
+
+    /* FIX (FW#3): flush stale DMA buffers after i2s_driver_install.
+     * After install, the DMA pipeline contains 2-3 buffers of stale data
+     * (zeros from init, or residual samples from a previous session if
+     * the driver was reinstalled without a reboot). The first
+     * i2s_capture_read calls would return this stale data, causing
+     * startup clicks that the server's 1-second skip must also cover.
+     *
+     * The INMP441 MEMS mic also has a startup transient (DC offset
+     * settling + membrane ringing, ~10-15ms). Draining 6 small buffers
+     * clears the DMA pipeline so only the mic transient remains for
+     * the server-side skip to handle.
+     *
+     * We use a small stack buffer and i2s_read with a short timeout. If
+     * the read times out (I2S clock not fully stable), we stop flushing;
+     * the server's skip will handle whatever stale data remains. */
+    {
+        uint8_t flush_buf[256];
+        size_t flush_got = 0;
+        for (int flush_i = 0; flush_i < 6; flush_i++)
+        {
+            esp_err_t flush_err = i2s_read(I2S_PORT, flush_buf, sizeof(flush_buf),
+                                           &flush_got, pdMS_TO_TICKS(50));
+            if (flush_err != ESP_OK || flush_got == 0)
+                break;
+        }
+        ESP_LOGI(TAG, "I2S DMA flush complete (up to 6 buffers drained)");
+    }
+
     /* Apply RX input timing delays (TRM §10.2.1.6, I2S.timing register).
      * Драйвер установлен → регистры I2S доступны. Делаем до старта захвата. */
     i2s_capture_apply_timing(s_timing_sd_delay, s_timing_ws_delay,
@@ -363,7 +410,7 @@ esp_err_t i2s_capture_init(uint32_t sample_rate, int bits, int comm_format,
                  (unsigned)s_timing_bck_delay);
     }
 
-    s_initialized = true;
+    /* s_initialized already set above (FW#3b) */
     return ESP_OK;
 }
 
