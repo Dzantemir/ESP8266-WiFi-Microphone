@@ -727,7 +727,6 @@ esp8266-wifi-microphone/
 │
 ├── firmware/                      # ESP8266 firmware (ESP8266 RTOS SDK v3.4)
 │   ├── CMakeLists.txt
-│   ├── sdkconfig                  # Build configuration (LWIP_SO_REUSE=y, TCP buffers)
 │   ├── i2s.c                      # Patched I2S driver (REPLACE in SDK)
 │   └── main/
 │       ├── CMakeLists.txt
