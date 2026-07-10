@@ -450,6 +450,62 @@ menu "ADPCM Streamer Configuration"
     endmenu
 
     # ===================================================================
+    #  WiFi Boot Retry (deep sleep on connect failure)
+    # ===================================================================
+
+    menu "WiFi Boot Retry"
+
+        config STREAMER_WIFI_BOOT_RETRY_ENABLED
+            bool "Enable WiFi boot retry with deep sleep"
+            default y
+            help
+                On boot (after reset or power-on), try to connect to the AP
+                multiple times. If all attempts fail, enter deep sleep for
+                a configurable duration, then reboot and try again. This
+                prevents the ESP from hanging in a zombie state when the AP
+                is unreachable (power outage, AP reboot, out of range).
+                Only applies to UDP (transport=0) and TCP (transport=1).
+                RawTX (transport=2) doesn't use AP association - skipped.
+                NOTE: deep sleep on ESP8266 requires GPIO16 (XPD_DCDC)
+                connected to RST. If your board doesn't have this wiring,
+                use "soft sleep" mode (vTaskDelay) instead.
+
+        config STREAMER_WIFI_BOOT_RETRY_ATTEMPTS
+            int "Number of WiFi connection attempts before sleep"
+            range 1 20
+            default 3
+            depends on STREAMER_WIFI_BOOT_RETRY_ENABLED
+            help
+                How many times to try connecting to the AP before giving up
+                and entering sleep. Each attempt waits WIFI_CONNECT_TIMEOUT_MS
+                (default 15s). 3 attempts = ~45s total before sleep.
+
+        config STREAMER_WIFI_BOOT_SLEEP_MINUTES
+            int "Deep sleep duration after WiFi connect failure (minutes)"
+            range 1 30
+            default 2
+            depends on STREAMER_WIFI_BOOT_RETRY_ENABLED
+            help
+                How long to sleep before rebooting and retrying WiFi.
+                1-2 minutes is short enough for quick recovery when the AP
+                comes back. Increase to save power on battery.
+
+        config STREAMER_WIFI_BOOT_SLEEP_MODE
+            int "Sleep mode (0=deep sleep, 1=soft sleep vTaskDelay)"
+            range 0 1
+            default 0
+            depends on STREAMER_WIFI_BOOT_RETRY_ENABLED
+            help
+                0 = Deep sleep (esp_deep_sleep): lowest power, requires
+                    GPIO16 connected to RST. On wake, the ESP reboots
+                    (runs app_main from scratch).
+                1 = Soft sleep (vTaskDelay): works without hardware mod,
+                    but uses more power. After the delay, WiFi reconnect
+                    is retried in-place (no reboot).
+
+    endmenu
+
+    # ===================================================================
     #  Service Port (EASSP Protocol)
     # ===================================================================
 

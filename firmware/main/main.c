@@ -34,6 +34,7 @@
 
 /* ---- Project includes ---- */
 #include "board_config.h"
+#include "esp_sleep.h"  /* FIX (wifi-boot-retry): esp_deep_sleep for WiFi boot retry */
 #include "config_mgr.h"
 #include "wifi_sta.h"
 #include "svc_port.h"
@@ -1439,6 +1440,93 @@ static void supervisor_task_fn(void *arg)
 #endif /* CONFIG_STREAMER_SUPERVISOR_ENABLED */
 
 /* ====================================================================
+ * WiFi Boot Retry — connect or deep sleep
+ * ====================================================================
+ *
+ * On boot, tries to connect to the AP WIFI_BOOT_RETRY_ATTEMPTS times.
+ * If all attempts fail, enters deep sleep for WIFI_BOOT_SLEEP_MINUTES,
+ * then reboots (deep sleep wake = reboot on ESP8266) and retries.
+ *
+ * Only applies to UDP (transport=0) and TCP (transport=1). RawTX (2)
+ * doesn't use AP association — skipped.
+ *
+ * This prevents the ESP from hanging in a zombie state when the AP is
+ * unreachable (power outage, AP reboot, out of range). Without this, the
+ * WiFi reconnect task retries forever with exponential backoff, but the
+ * ESP never reboots — it just sits there, invisible to the server. */
+#if WIFI_BOOT_RETRY_ENABLED
+static void wifi_boot_retry_or_sleep(uint8_t transport_mode)
+{
+    /* RawTX doesn't use AP association — nothing to retry. */
+    if (transport_mode != TRANSPORT_MODE_UDP &&
+        transport_mode != TRANSPORT_MODE_TCP)
+    {
+        return;
+    }
+
+    ESP_LOGI(TAG, "WiFi boot retry: %d attempts, %ds timeout each, %d min sleep on failure",
+             WIFI_BOOT_RETRY_ATTEMPTS,
+             (int)(WIFI_CONNECT_TIMEOUT_MS / 1000),
+             WIFI_BOOT_SLEEP_MINUTES);
+
+    for (int attempt = 1; attempt <= WIFI_BOOT_RETRY_ATTEMPTS; attempt++)
+    {
+        if (wifi_sta_is_connected())
+        {
+            ESP_LOGI(TAG, "WiFi connected on attempt %d/%d",
+                     attempt, WIFI_BOOT_RETRY_ATTEMPTS);
+            return;
+        }
+
+        ESP_LOGW(TAG, "WiFi connect attempt %d/%d (waiting %d ms)...",
+                 attempt, WIFI_BOOT_RETRY_ATTEMPTS,
+                 (int)WIFI_CONNECT_TIMEOUT_MS);
+
+        esp_err_t err = wifi_sta_wait_connected(WIFI_CONNECT_TIMEOUT_MS);
+        if (err == ESP_OK)
+        {
+            ESP_LOGI(TAG, "WiFi connected on attempt %d/%d",
+                     attempt, WIFI_BOOT_RETRY_ATTEMPTS);
+            return;
+        }
+
+        ESP_LOGW(TAG, "WiFi connect attempt %d/%d failed (timeout)",
+                 attempt, WIFI_BOOT_RETRY_ATTEMPTS);
+    }
+
+    /* All attempts failed — enter sleep. */
+    ESP_LOGE(TAG, "WiFi connect failed after %d attempts — entering %s for %d minutes",
+             WIFI_BOOT_RETRY_ATTEMPTS,
+             (WIFI_BOOT_SLEEP_MODE == 0) ? "deep sleep" : "soft sleep",
+             WIFI_BOOT_SLEEP_MINUTES);
+
+#if WIFI_BOOT_SLEEP_MODE == 0
+    /* Deep sleep: requires GPIO16 (XPD_DCDC) connected to RST.
+     * On wake, ESP reboots → app_main runs → WiFi retry loop repeats. */
+    ESP_LOGW(TAG, "Entering deep sleep for %d minutes...", WIFI_BOOT_SLEEP_MINUTES);
+    vTaskDelay(pdMS_TO_TICKS(500));  /* let log flush */
+    esp_deep_sleep_set_rf_option(2); /* RF cal on wake, don't write NVS */
+    esp_deep_sleep((uint64_t)WIFI_BOOT_SLEEP_MINUTES * 60ULL * 1000000ULL);
+    /* Should never reach here. */
+    ESP_LOGE(TAG, "esp_deep_sleep returned unexpectedly! Restarting...");
+    esp_restart();
+#else
+    /* Soft sleep: works without GPIO16-RST wiring, but uses more power.
+     * After the delay, retry WiFi in-place (no reboot). */
+    ESP_LOGW(TAG, "Soft sleep (vTaskDelay) for %d minutes, then retry...",
+             WIFI_BOOT_SLEEP_MINUTES);
+    vTaskDelay(pdMS_TO_TICKS(WIFI_BOOT_SLEEP_MINUTES * 60 * 1000));
+
+    /* After soft sleep, force a WiFi reconnection cycle and reboot
+     * to restart cleanly (the WiFi state may be corrupted by now). */
+    ESP_LOGW(TAG, "Soft sleep complete — rebooting for clean retry");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+#endif
+}
+#endif /* WIFI_BOOT_RETRY_ENABLED */
+
+/* ====================================================================
  * app_main
  * ==================================================================== */
 
@@ -1518,9 +1606,19 @@ void app_main(void)
     if (err == ESP_OK)
     {
         s_wifi_initialized = true;
+
+#if WIFI_BOOT_RETRY_ENABLED
+        /* FIX (wifi-boot-retry): On boot, try to connect to the AP multiple
+         * times. If all attempts fail, deep sleep + reboot. This prevents
+         * the ESP from hanging in a zombie state when the AP is unreachable.
+         * Only applies to UDP/TCP (RawTX doesn't use AP association).
+         * Replaces the old single wifi_wait_ready call. */
+        wifi_boot_retry_or_sleep(cfg.transport_mode);
+#else
         /* Block until WiFi is ready (UDP: wait for AP association;
          * RAWTX: no-op). Ignoring errors - start_streaming will retry. */
         stream_mode_ops()->wifi_wait_ready(&cfg);
+#endif
     }
     else
     {
