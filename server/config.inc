@@ -4,8 +4,12 @@
 '
 '  NOTE: Win32 system equates (%WAVE_FORMAT_PCM, %CALLBACK_NULL, %WHDR_INQUEUE,
 '  %WAIT_OBJECT_0, %WAIT_TIMEOUT, %WAIT_FAILED, %INADDR_NONE, etc.) are defined
-'  in Win32API.INC (via MMSystem.inc / WinBase.inc / ws2def.inc). They are NOT
-'  redefined here - redefinition with the same value is silently accepted by PB,
+'  in Win32API.INC (via MMSystem.inc / WinBase.inc).
+'  EXCEPTION: %INADDR_NONE and %FD_READ are defined in WINSOCK2.INC /
+'  ws2def.inc, which is NOT part of the Win32API.INC include chain. The main
+'  file (eassp_server.bas) explicitly $INCLUDE "WINSOCK2.INC" right after
+'  Win32API.INC to provide inet_addr, htons, %INADDR_NONE and %FD_READ.
+'  Project equates are NOT redefined here - redefinition with the same value is silently accepted by PB,
 '  but with a different value it is a hard "Duplicate equate" compile error.
 '  Keep this file strictly project-specific.
 ' ============================================================================
@@ -36,7 +40,8 @@
 %HB_INTERVAL      = 3000
 %DEV_TIMEOUT_MS   = 30000
 %REFRESH_MS       = 2000
-%RECV_BUF_SZ      = 2048   ' NOTE (L35): declared but never referenced in eassp_server.bas - safe to remove
+' FIX (GROK-10): removed dead %RECV_BUF_SZ equate (was declared but never
+' referenced in eassp_server.bas - L35 self-flagged it). Safe to delete.
 %AUDIO_PORT_BASE  = 5000
 
 ' ---- Stream stall / WiFi-drop recovery ----
