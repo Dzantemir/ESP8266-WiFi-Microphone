@@ -52,11 +52,29 @@ static const char *TAG = "main";
 
 /* ---- Frame types with flexible array members ---- */
 
+/* FIX (GROK-22): the PCM frame's flexible array is declared as int16_t[]
+ * but in PCM 24-bit mode the buffer is allocated, written (memcpy of
+ * int32_t) and read (int32_t* cast) as int32_t[]. Under C11 strict
+ * aliasing (and -fstrict-aliasing at -O2) this is UB. The clean fix is
+ * to declare the flexible array as uint8_t[] — the "char array" aliasing
+ * rule (C11 6.5p7) explicitly allows any object type to be accessed
+ * through a pointer to char/uint8_t, and conversely a uint8_t[] buffer
+ * may be cast to any type the caller knows it actually holds.
+ *
+ * Callers that previously wrote `pcm->samples` now write
+ * `pcm->samples_raw` and cast to the appropriate type. The helper
+ * inlines pcm_samples16() / pcm_samples32() make the casts explicit
+ * and self-documenting. */
 typedef struct
 {
     int num_samples;
-    int16_t samples[];
+    uint8_t samples_raw[];
 } pcm_frame_t;
+
+static inline int16_t *pcm_samples16(pcm_frame_t *f) { return (int16_t *)f->samples_raw; }
+static inline int32_t *pcm_samples32(pcm_frame_t *f) { return (int32_t *)f->samples_raw; }
+static inline const int16_t *pcm_samples16_const(const pcm_frame_t *f) { return (const int16_t *)f->samples_raw; }
+static inline const int32_t *pcm_samples32_const(const pcm_frame_t *f) { return (const int32_t *)f->samples_raw; }
 
 typedef struct
 {
@@ -144,6 +162,14 @@ static int s_adpcm_pool_size = 6;
 
 /* Frame duration (ms) - computed in start_streaming from I2S params. */
 static uint32_t s_frame_ms = 20;
+/* FIX (GROK-21): tracks whether s_frame_ms has ever been computed by a
+ * successful start_streaming() call. Before the first start, the static
+ * initializer gives s_frame_ms = 20, which svc_port INFO / AT+GMR /
+ * AT+STATUS would report as if it were the runtime value — misleading
+ * (the actual runtime value is computed from rate/channels/codec and
+ * ranges 5..60 ms). Callers can now distinguish "not yet started" from
+ * "real value" via streaming_frame_ms_known(). */
+static bool s_frame_ms_known = false;
 
 /* Accessor for other modules (svc_port, at_cmd) - returns current frame_ms. */
 uint32_t streaming_get_frame_ms(void)
@@ -151,8 +177,29 @@ uint32_t streaming_get_frame_ms(void)
     /* FIX (L25): return the actual computed frame_ms (s_frame_ms) which is
      * updated in start_streaming(). The default of 20 is only seen before
      * the first stream start - documented in AT+GMR / AT+STATUS as
-     * "post-last-stream value". */
+     * "post-last-stream value".
+     *
+     * FIX (GROK-21): callers that want to distinguish "no stream ever
+     * started" from "real value" should call streaming_frame_ms_known()
+     * first. Legacy callers that just want a number (e.g. packet header
+     * bitrate computation) still get 20 as a placeholder, which is what
+     * they always got — no behavior change for them. */
     return s_frame_ms;
+}
+
+bool streaming_frame_ms_known(void)
+{
+    return s_frame_ms_known;
+}
+
+/* FIX (B3): accessor for the ACTIVE stream's channel count. svc_port's
+ * build_info_payload uses this (instead of its own s_channels which can be
+ * updated by AT+CH before the stream actually restarts) so INFO packets
+ * always report the channel count the running stream is actually using.
+ * If no stream is active, returns the configured (NVS) channel count. */
+uint8_t streaming_get_channels(void)
+{
+    return s_channels;
 }
 
 /* ---- Stream control API (for AT commands) ---- */
@@ -259,6 +306,12 @@ static void i2s_task_fn(void *arg)
     /* Diagnostic counters - log every 50 frames or on timeout. */
     uint32_t ok_count = 0;
     uint32_t timeout_count = 0;
+    /* FIX (GROK-2.3): partial-read underrun counter. When i2s_capture_read
+     * returns ESP_OK with n < total, the missing samples are zero-padded
+     * and the frame is sent as if complete — masking the underrun as
+     * silence. Track consecutive partial reads so we can log + signal
+     * SVC_ERR_I2S after N in a row, instead of silently degrading audio. */
+    uint32_t partial_count = 0;
 
     while (streaming_is_active())
     {
@@ -302,6 +355,44 @@ static void i2s_task_fn(void *arg)
                      (unsigned)ok_count, (unsigned)timeout_count);
         }
 
+        /* FIX (GROK-2.3): detect partial reads (n < total). The zero-pad
+         * below masks the underrun as silence — without this counter the
+         * server receives a full-length frame with embedded silence but
+         * has no way to know. Track consecutive partials; after 5 in a
+         * row, log + signal SVC_ERR_I2S so the receiver can take action
+         * (e.g. PLC, jitter buffer refill). Reset on a full read. */
+        if (n < total)
+        {
+            partial_count++;
+            if (partial_count == 1 || (partial_count % 50) == 0)
+            {
+                ESP_LOGW(TAG, "[I2S] partial read #%u: got %d/%d samples - "
+                              "zero-padding (underrun masked as silence)",
+                         (unsigned)partial_count, n, total);
+            }
+            if (partial_count == 5)
+            {
+                ESP_LOGE(TAG, "[I2S] %u consecutive partial reads - signaling "
+                              "SVC_ERR_I2S", (unsigned)partial_count);
+                svc_port_set_error(SVC_ERR_I2S);
+            }
+        }
+        else
+        {
+            /* FIX (B4 REGRESSION): GROK-2.3 added svc_port_set_error(SVC_ERR_I2S)
+             * after 5 partial reads, but did NOT clear it on recovery. This
+             * left INFO/status stuck in ERROR/I2S forever after a brief underrun.
+             * Now: if we had signaled an error (partial_count >= 5) and I2S has
+             * recovered (full read), clear the error so INFO/status reflect
+             * the actual healthy state. */
+            if (partial_count >= 5)
+            {
+                ESP_LOGI(TAG, "[I2S] recovered from partial reads - clearing SVC_ERR_I2S");
+                svc_port_clear_error();
+            }
+            partial_count = 0;
+        }
+
         for (int i = n; i < total; i++)
             raw[i] = 0;
 
@@ -311,12 +402,12 @@ static void i2s_task_fn(void *arg)
              * 24-bit values). pcm_task_fn will strip the high byte and
              * emit 3 bytes per sample. No dither - we want full 24-bit
              * precision in the stream. */
-            memcpy(pcm->samples, raw, (size_t)total * sizeof(int32_t));
+            memcpy(pcm_samples32(pcm), raw, (size_t)total * sizeof(int32_t));
         }
         else if (is_24bit)
-            dither_buffer_24_to_16(raw, pcm->samples, total);
+            dither_buffer_24_to_16(raw, pcm_samples16(pcm), total);
         else
-            dither_buffer_passthrough(raw, pcm->samples, total);
+            dither_buffer_passthrough(raw, pcm_samples16(pcm), total);
 
         if (xQueueSend(pcm_filled_queue, &pcm, 0) != pdTRUE)
             xQueueSend(pcm_free_queue, &pcm, 0);
@@ -379,23 +470,33 @@ static void adpcm_task_fn(void *arg)
 
         if (s_channels == 1)
         {
-            err = adpcm_enc_process(adpcm_enc[0], pcm->samples, pcm->num_samples,
+            err = adpcm_enc_process(adpcm_enc[0], pcm_samples16(pcm), pcm->num_samples,
                                     adpcm->data, cap, &written);
         }
         else
         {
             /* Stereo: deinterleave L,R,L,R -> ch_left[], ch_right[] */
+            int16_t *samples = pcm_samples16(pcm);
             for (int i = 0; i < s_samples_per_frame; i++)
             {
-                ch_left[i] = pcm->samples[i * 2];
-                ch_right[i] = pcm->samples[i * 2 + 1];
+                ch_left[i] = samples[i * 2];
+                ch_right[i] = samples[i * 2 + 1];
             }
+            /* FIX (GROK-14): pass the REMAINING buffer size to the second
+             * adpcm_enc_process call, not the per-channel `cap`. Today the
+             * invariant s_pkt_data_len == 2*cap holds, so this is equivalent,
+             * but if a future change breaks that invariant (e.g. a different
+             * per-channel payload shape, or a header size change), the
+             * second call could write past s_pkt_data_len. Defensive coding:
+             * track `rem` and subtract each channel's written bytes. */
+            size_t rem = (size_t)s_pkt_data_len;
             size_t wl = 0, wr = 0;
             err = adpcm_enc_process(adpcm_enc[0], ch_left, s_samples_per_frame,
-                                    adpcm->data, cap, &wl);
+                                    adpcm->data, rem, &wl);
+            rem -= wl;
             if (err == ESP_OK)
                 err = adpcm_enc_process(adpcm_enc[1], ch_right, s_samples_per_frame,
-                                        adpcm->data + wl, cap, &wr);
+                                        adpcm->data + wl, rem, &wr);
             written = wl + wr;
         }
 
@@ -484,20 +585,20 @@ static void pcm_task_fn(void *arg)
 
         if (s_bits_per_sample == 16)
         {
-            /* 16-bit: samples already int16 in pcm->samples[]. Just copy. */
+            /* 16-bit: samples already int16 in pcm->samples_raw[]. Just copy. */
             size_t bytes = (size_t)n * sizeof(int16_t);
             if (bytes > (size_t)s_pkt_data_len)
                 bytes = s_pkt_data_len;
-            memcpy(dst, pcm->samples, bytes);
+            memcpy(dst, pcm_samples16(pcm), bytes);
             written = bytes;
         }
         else
         {
-            /* 24-bit: pcm->samples[] actually holds int32_t (sign-extended
+            /* 24-bit: pcm->samples_raw[] actually holds int32_t (sign-extended
              * 24-bit values, copied raw from i2s_capture_read). Emit only
              * the low 3 bytes (LE) per sample, stripping the redundant
              * high byte. */
-            int32_t *s32 = (int32_t *)pcm->samples;
+            int32_t *s32 = pcm_samples32(pcm);
             for (int i = 0; i < n; i++)
             {
                 /* FIX (H4): bounds check BEFORE the 3-byte write. The
@@ -694,7 +795,16 @@ static bool wait_for_task_exit(int idx, uint32_t timeout_ms)
 
     if (s_task_handles[idx])
     {
-        ESP_LOGW(TAG, "Task %d did not exit in %u ms - force deleting",
+        /* FIX (GROK-18): the previous log only said "force deleting"
+         * without explaining the consequence. Force-deleting a task
+         * blocked inside lwIP send()/sendto() orphans any mutex the
+         * task held (e.g. svc_port::s_mutex), which can deadlock the
+         * next start_streaming() and trigger a watchdog reboot ~8 s
+         * later. Make the consequence explicit so the operator knows
+         * to issue AT+RST proactively rather than waiting for the WDT. */
+        ESP_LOGE(TAG, "Task %d did not exit in %u ms - force deleting. "
+                 "WARNING: this may orphan lwIP/svc_port mutexes and "
+                 "deadlock the next stream start. REBOOT RECOMMENDED (AT+RST).",
                  idx, (unsigned)timeout_ms);
         vTaskDelete(s_task_handles[idx]);
         s_task_handles[idx] = NULL;
@@ -713,6 +823,21 @@ static esp_err_t start_streaming(void)
         /* Duplicate CONFIGURE from server (it sends 3 with 200ms gaps).
          * Not an error - just ignore. */
         return ESP_ERR_INVALID_STATE;
+    }
+
+    /* FIX (A1 defense-in-depth): refuse to start if any pipeline task is
+     * still alive. The main loop normally serializes STOP→START, but this
+     * guard catches any future code path that might call start_streaming()
+     * directly (bypassing the event loop). Without this, a start during an
+     * incomplete stop would create duplicate tasks racing on the same I2S
+     * DMA / queues / transport. */
+    for (int i = 0; i < TASK_IDX_COUNT; i++)
+    {
+        if (s_task_handles[i] != NULL)
+        {
+            ESP_LOGE(TAG, "start_streaming: task %d handle non-NULL - stop not complete", i);
+            return ESP_ERR_INVALID_STATE;
+        }
     }
 
     device_config_t cfg;
@@ -872,6 +997,11 @@ static esp_err_t start_streaming(void)
      * startup. Also, timestamp_ms = frame_count * s_frame_ms drifted from
      * real wallclock time, affecting server HOTRESTART detection. */
     s_frame_ms = (uint32_t)((uint64_t)s_samples_per_frame * 1000 / s_sample_rate);
+    /* FIX (GROK-21): mark s_frame_ms as valid so streaming_get_frame_ms()
+     * callers (and the new streaming_frame_ms_known() predicate) can
+     * distinguish "real computed value" from the static-init placeholder
+     * of 20 ms seen before the first successful start_streaming(). */
+    s_frame_ms_known = true;
 
     /* FIX (M14): post-condition check. If frame_ms was so small that
      * samples_per_frame < 8, the alignment could zero it (8 & ~7 = 0),
@@ -1181,6 +1311,12 @@ cleanup_on_fail:
         {
             wait_for_task_exit(i, stop_to);
         }
+        /* FIX (B10): ensure s_task_handles[i] is NULLed even if
+         * wait_for_task_exit returned false (e.g. s_task_done_sems was
+         * NULL, or the task was force-deleted). Without this, the
+         * supervisor's stack-high-water check (uxTaskGetStackHighWaterMark
+         * on a deleted handle) is undefined behavior. */
+        s_task_handles[i] = NULL;
     }
 
     /* FIX (C4): NULL the semaphore pointer BEFORE deleting the semaphore.
@@ -1343,7 +1479,19 @@ static void supervisor_task_fn(void *arg)
 
     uint32_t last_i2s_count = 0;
     uint32_t last_tx_count = 0;
-    TickType_t last_check_tick = xTaskGetTickCount();
+    /* FIX (GROK-3.3): track per-counter "last progress" ticks instead of a
+     * single last_check_tick. The old code computed `since_last = now -
+     * last_check_tick` which was ALWAYS ~SUPERVISOR_CHECK_INTERVAL_MS (2s)
+     * because last_check_tick was updated at the END of every iteration.
+     * The TX-only stall condition `since_last >= SUPERVISOR_STALL_TIMEOUT_MS
+     * (15s)` was therefore NEVER true → dead code. Only the "both counters
+     * stalled" branch (which didn't depend on since_last) could fire.
+     *
+     * Now: last_i2s_progress_tick and last_tx_progress_tick are updated ONLY
+     * when their respective counter advances. The age check `now - last_X_progress_tick
+     * >= 15s` then correctly detects a TX-only stall (or I2S-only stall). */
+    TickType_t last_i2s_progress_tick = xTaskGetTickCount();
+    TickType_t last_tx_progress_tick = xTaskGetTickCount();
 
     while (1)
     {
@@ -1365,7 +1513,6 @@ static void supervisor_task_fn(void *arg)
         if (streaming_is_active())
         {
             TickType_t stream_elapsed = now - s_supervisor_stream_start_tick;
-            TickType_t since_last = now - last_check_tick;
 
             /* Only check after grace period has passed since stream start.
              * During startup, counters may not move for legitimate reasons
@@ -1378,30 +1525,82 @@ static void supervisor_task_fn(void *arg)
                 bool i2s_advanced = (cur_i2s != last_i2s_count);
                 bool tx_advanced = (cur_tx != last_tx_count);
 
+                /* FIX (GROK-3.3): update per-counter progress ticks only when
+                 * that counter actually advanced. This makes the age-based
+                 * partial-stall detection below actually work. */
+                if (i2s_advanced)
+                    last_i2s_progress_tick = now;
+                if (tx_advanced)
+                    last_tx_progress_tick = now;
+
                 if (!i2s_advanced && !tx_advanced)
                 {
                     /* Neither counter moved since last check.
                      * Pipeline is fully deadlocked. */
                     ESP_LOGE(TAG, "SUPERVISOR: pipeline stalled — "
                              "I2S=%u (was %u), TX=%u (was %u), "
-                             "stream_elapsed=%ums, since_check=%ums — REBOOT",
+                             "stream_elapsed=%ums — REBOOT",
                              (unsigned)cur_i2s, (unsigned)last_i2s_count,
                              (unsigned)cur_tx, (unsigned)last_tx_count,
-                             (unsigned)(stream_elapsed * portTICK_PERIOD_MS),
-                             (unsigned)(since_last * portTICK_PERIOD_MS));
+                             (unsigned)(stream_elapsed * portTICK_PERIOD_MS));
                     vTaskDelay(pdMS_TO_TICKS(500));
                     esp_restart();
                 }
 
                 /* Partial deadlock: I2S producing frames but TX not sending.
-                 * TX task is stuck (sendto timeout, transport not ready, etc.). */
+                 * TX task is stuck (sendto timeout, transport not ready, etc.).
+                 * FIX (GROK-3.3): use last_tx_progress_tick age instead of
+                 * since_last (which was always ~2s, making this dead code).
+                 *
+                 * FIX (B6 REGRESSION): the GROK-3.3 fix reactivated this
+                 * branch, but it falsely reboots when a TCP client hasn't
+                 * connected yet (transport_is_ready()==false → TX counter
+                 * stays at 0 while I2S produces frames → 15s later REBOOT).
+                 * Now we only fire if TX has EVER progressed (cur_tx > 0),
+                 * meaning the transport was ready at least once and then
+                 * stalled. A stream that never sent a single packet is in
+                 * the "waiting for client" phase, not a stall. */
+                TickType_t tx_stall_age = now - last_tx_progress_tick;
                 if (i2s_advanced && !tx_advanced &&
-                    since_last >= pdMS_TO_TICKS(SUPERVISOR_STALL_TIMEOUT_MS))
+                    cur_tx > 0 &&
+                    tx_stall_age >= pdMS_TO_TICKS(SUPERVISOR_STALL_TIMEOUT_MS))
                 {
                     ESP_LOGE(TAG, "SUPERVISOR: TX stalled but I2S active — "
-                             "I2S=%u (was %u), TX=%u (was %u) — REBOOT",
+                             "I2S=%u (was %u), TX=%u (was %u), "
+                             "tx_stall_age=%ums — REBOOT",
                              (unsigned)cur_i2s, (unsigned)last_i2s_count,
-                             (unsigned)cur_tx, (unsigned)last_tx_count);
+                             (unsigned)cur_tx, (unsigned)last_tx_count,
+                             (unsigned)(tx_stall_age * portTICK_PERIOD_MS));
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    esp_restart();
+                }
+                /* FIX (B6): if TX has never progressed (cur_tx == 0), log a
+                 * diagnostic but DON'T reboot — the transport may still be
+                 * waiting for a client to connect (TCP) or for WiFi to
+                 * settle. The TX task has its own 30s transport-wait timeout
+                 * that will signal SVC_ERR_NETWORK if the client never comes. */
+                if (i2s_advanced && !tx_advanced && cur_tx == 0 &&
+                    tx_stall_age >= pdMS_TO_TICKS(SUPERVISOR_STALL_TIMEOUT_MS))
+                {
+                    ESP_LOGW(TAG, "SUPERVISOR: TX idle (no client yet?), "
+                             "I2S=%u active, TX=%u — waiting (not rebooting)",
+                             (unsigned)cur_i2s, (unsigned)cur_tx);
+                    /* Reset last_tx_progress_tick so we don't log this every 2s */
+                    last_tx_progress_tick = now;
+                }
+
+                /* Symmetric: I2S stalled but TX still sending (rare — TX task
+                 * recycling old buffers?). Also detect via last_i2s_progress_tick. */
+                TickType_t i2s_stall_age = now - last_i2s_progress_tick;
+                if (!i2s_advanced && tx_advanced &&
+                    i2s_stall_age >= pdMS_TO_TICKS(SUPERVISOR_STALL_TIMEOUT_MS))
+                {
+                    ESP_LOGE(TAG, "SUPERVISOR: I2S stalled but TX active — "
+                             "I2S=%u (was %u), TX=%u (was %u), "
+                             "i2s_stall_age=%ums — REBOOT",
+                             (unsigned)cur_i2s, (unsigned)last_i2s_count,
+                             (unsigned)cur_tx, (unsigned)last_tx_count,
+                             (unsigned)(i2s_stall_age * portTICK_PERIOD_MS));
                     vTaskDelay(pdMS_TO_TICKS(500));
                     esp_restart();
                 }
@@ -1415,6 +1614,8 @@ static void supervisor_task_fn(void *arg)
             /* Not streaming — reset baselines so next stream start is clean */
             last_i2s_count = s_supervisor_i2s_count;
             last_tx_count = s_supervisor_tx_count;
+            last_i2s_progress_tick = xTaskGetTickCount();
+            last_tx_progress_tick = xTaskGetTickCount();
         }
 
         /* ---- Check 3: Stack high-water mark ---- */
@@ -1432,8 +1633,6 @@ static void supervisor_task_fn(void *arg)
                 }
             }
         }
-
-        last_check_tick = now;
     }
 }
 
@@ -1594,6 +1793,24 @@ void app_main(void)
         esp_restart();
     }
 
+    /* 4. AT command interface — started EARLY (before WiFi init) so the user
+     * can issue commands even while WiFi is still trying to connect.
+     *
+     * FIX (AT-DURING-WIFI-RETRY): previously at_cmd_init() was called AFTER
+     * wifi_boot_retry_or_sleep(), which is a BLOCKING call that can take up
+     * to WIFI_BOOT_RETRY_ATTEMPTS * WIFI_CONNECT_TIMEOUT_MS (tens of seconds)
+     * when the AP is unreachable. During that window the AT task did not
+     * exist yet, so NO AT commands could be issued — the user was stranded
+     * with no way to AT+WIFI=... to fix credentials or AT+RST to reboot.
+     * Now AT is started right after config_mgr_init (which AT+ commands
+     * depend on) and BEFORE WiFi. Commands that require WiFi (AT+WIFI,
+     * AT+STREAM) will return ESP_ERR_INVALID_STATE if WiFi isn't initialized
+     * yet — that's correct and expected. Read-only commands (AT+GMR,
+     * AT+BATT, AT+HELP, AT+STATUS, AT+FACTORY) work immediately. */
+#if AT_CMD_ENABLED
+    at_cmd_init();
+#endif
+
     /* 5. WiFi init - mode-specific (UDP: connect to AP; RAWTX: radio+channel). */
     device_config_t cfg;
     config_get_copy(&cfg);
@@ -1645,10 +1862,9 @@ void app_main(void)
     stream_mode_ops()->set_channels(s_channels);
     ESP_LOGI(TAG, "Config from NVS: ch=%u (fmt=%u)", s_channels, cfg.channel_format);
 
-    /* 7. AT command interface. */
-#if AT_CMD_ENABLED
-    at_cmd_init();
-#endif
+    /* 7. AT command interface — already initialized in step 4 (before WiFi)
+     * so the user can issue commands during WiFi boot retry. Nothing to do
+     * here; this comment is kept for historical reference. */
 
     /* 7.5. Supervisor task — software watchdog.
      * Started BEFORE the main loop so it's always running, even if
@@ -1681,6 +1897,17 @@ void app_main(void)
 
     /* 9. Main loop - wait for START_REQ / STOP_REQ from svc_port. */
     ESP_LOGI(TAG, "Main loop running");
+    /* FIX (B10): track auto-start retry state. If the initial auto-start
+     * (RawTX mode) fails due to transient OOM/I2S error, retry up to 3
+     * times with 1/2/5s backoff. Without this, a single boot-time failure
+     * leaves the device stuck in idle forever (only manual AT+START or
+     * AT+RST could recover). The supervisor will eventually reboot on
+     * persistent OOM, but transient failures that free heap on cleanup
+     * would not trigger a reboot — leaving the device stranded. */
+    int auto_start_attempts = 0;
+    const int AUTO_START_MAX_ATTEMPTS = 3;
+    const TickType_t auto_start_backoff_ms[3] = {0, 1000, 5000};
+
     while (1)
     {
         EventBits_t bits = xEventGroupWaitBits(s_stream_evt_grp,
@@ -1700,10 +1927,40 @@ void app_main(void)
              * 200ms chosen empirically: 50ms (i2s_capture_deinit delay) is
              * not enough; 200ms allows full task cleanup. */
             vTaskDelay(pdMS_TO_TICKS(200));
+            /* Stop cancels any pending auto-start retry sequence. */
+            auto_start_attempts = 0;
         }
         if (bits & STREAM_EVT_START_REQ)
         {
-            start_streaming();
+            esp_err_t start_err = start_streaming();
+            /* FIX (B10): if auto-start (RawTX) fails and we haven't exhausted
+             * retries, re-arm START_REQ after a backoff delay. This only
+             * applies to the initial auto-start sequence (before any manual
+             * stop). Once the user manually stops, auto_start_attempts resets
+             * to 0 and no further auto-retry happens until reboot. */
+            if (start_err != ESP_OK && stream_mode_ops()->auto_start &&
+                auto_start_attempts < AUTO_START_MAX_ATTEMPTS)
+            {
+                auto_start_attempts++;
+                TickType_t delay = auto_start_backoff_ms[auto_start_attempts - 1];
+                ESP_LOGW(TAG, "Auto-start failed (attempt %d/%d) - retrying in %u ms",
+                         auto_start_attempts, AUTO_START_MAX_ATTEMPTS,
+                         (unsigned)delay);
+                if (delay > 0)
+                    vTaskDelay(pdMS_TO_TICKS(delay));
+                xEventGroupSetBits(s_stream_evt_grp, STREAM_EVT_START_REQ);
+            }
+            else if (start_err != ESP_OK)
+            {
+                ESP_LOGE(TAG, "Auto-start exhausted %d attempts - manual AT+START or AT+RST required",
+                         AUTO_START_MAX_ATTEMPTS);
+                auto_start_attempts = 0;
+            }
+            else
+            {
+                /* Start succeeded — reset retry counter. */
+                auto_start_attempts = 0;
+            }
         }
     }
 }

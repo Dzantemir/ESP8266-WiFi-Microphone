@@ -13,6 +13,13 @@
 
 /* ---- System / SDK includes ---- */
 #include <stdlib.h>
+/* FIX (GROK-G11-21): explicit <stdint.h> for int16_t/uint8_t/int32_t used
+ * below (step_table, index_table, encode_sample, etc.). Previously these
+ * types were pulled in transitively via adpcm_encoder.h -> esp_err.h ->
+ * stdint.h, which is fragile — refactoring the header could break the .c
+ * file with cryptic "unknown type name 'int16_t'" errors. Best practice:
+ * a .c file includes what it uses. */
+#include <stdint.h>
 #include "esp_attr.h"
 #include "esp_log.h"
 

@@ -229,6 +229,24 @@ static void tcp_accept_task_fn(void *arg)
         s_drop_count = 0;
     }
 
+    /* FIX (GROK-3): clear our own task handle BEFORE vTaskDelete(NULL).
+     * Without this, tcp_stream_deinit's wait-loop never sees the handle
+     * go NULL, runs the full 2-second timeout, then unconditionally
+     * NULLs the handle while the task may still be alive (e.g. blocked
+     * inside accept() on a socket lwIP hasn't unblocked). A subsequent
+     * tcp_stream_init_listen would then create a NEW accept task while
+     * the zombie is still running — two tasks racing on the same listen
+     * socket. Clearing the handle here lets deinit observe the exit
+     * promptly and skip the force-delete path entirely on a clean exit. */
+    if (s_client_mutex && xSemaphoreTake(s_client_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+        s_accept_task = NULL;
+        xSemaphoreGive(s_client_mutex);
+    }
+    else
+    {
+        s_accept_task = NULL;
+    }
     vTaskDelete(NULL);
 }
 
@@ -393,9 +411,16 @@ esp_err_t tcp_stream_deinit(void)
      * FIX (FW#4): poll for up to 2s instead of a single 200ms delay.
      * The accept task may be between accept() returning and looping back
      * to check s_running; a single 200ms delay could miss the window.
-     * If it doesn't exit in 2s, log a warning (but don't force-delete —
-     * vTaskDelete on a task inside accept/recv can orphan lwIP state).
-     * We just NULL the handle and let the task self-delete eventually. */
+     *
+     * FIX (GROK-3): with the accept task now clearing its own handle
+     * before vTaskDelete(NULL), this loop exits promptly on a clean
+     * shutdown. If the task is truly stuck inside accept() (lwIP didn't
+     * unblock it after shutdown), we force-delete it. The old code just
+     * NULL'd the handle WITHOUT killing the task, leaving a zombie that
+     * could compete with a new accept task on re-init. Force-deleting a
+     * task inside accept() does carry some lwIP-state risk, but that
+     * risk is smaller than leaking the task — and the warning log
+     * explicitly recommends a reboot. */
     if (s_accept_task)
     {
         for (int i = 0; i < 20 && s_accept_task; i++)
@@ -403,9 +428,10 @@ esp_err_t tcp_stream_deinit(void)
         if (s_accept_task)
         {
             ESP_LOGW(TAG, "tcp_stream: accept task did not exit in 2s - "
-                          "leaving it (will self-delete; reboot if socket issues)");
+                          "force-deleting (reboot recommended to clean lwIP state)");
+            vTaskDelete(s_accept_task);
+            s_accept_task = NULL;
         }
-        s_accept_task = NULL;
     }
 
     s_listen_port = 0;

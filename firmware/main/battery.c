@@ -26,6 +26,9 @@
 #if BATTERY_ENABLED
 
 #include "battery.h"
+/* FIX (GROK-3.7): needed for streaming_is_active() / streaming_request_stop()
+ * in battery_enter_deep_sleep() (graceful stream stop before deep sleep). */
+#include "stream_control.h"
 
 static const char *TAG = "battery";
 
@@ -116,6 +119,20 @@ void battery_enter_deep_sleep(uint32_t minutes)
 {
     ESP_LOGW(TAG, "Entering deep sleep for %u minutes", (unsigned)minutes);
 
+    /* FIX (GROK-3.7): stop the stream gracefully before deep sleep. Without
+     * this, TCP/UDP sockets disappear without FIN/close -> server has to
+     * time out (cosmetic), and no final INFO packet is sent. A short delay
+     * lets the pipeline flush, the TX task send a final frame, and sockets
+     * close cleanly. streaming_request_stop() is async (sets a bit); the
+     * 500ms delay gives the main loop time to process it. If streaming is
+     * not active, this is a no-op. */
+    if (streaming_is_active())
+    {
+        ESP_LOGI(TAG, "Stopping stream before deep sleep...");
+        streaming_request_stop();
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
     /* RF calibration on wake: 0=no cal, 1=cal, 2=cal but don't write to NVS.
      * Option 2 is safe and faster than 1, doesn't wear out NVS. */
     esp_deep_sleep_set_rf_option(2);
@@ -134,7 +151,16 @@ void battery_monitor_task(void *arg)
 
     if (v_batt == 0)
     {
-        ESP_LOGW(TAG, "Battery reading invalid (0 mV) - ADC not connected?");
+        /* FIX (GROK-9): ADC returning 0 mV almost certainly means the
+         * battery divider is disconnected or the ADC is not wired up.
+         * Continuing to boot means the runtime loop will also see 0 and
+         * skip every check (no battery protection at all). The OLD code
+         * just warned and continued — making the device boot-dependent on
+         * an ADC that may not exist. We still continue (so a bench device
+         * without a battery can run off USB), but log prominently so the
+         * integrator notices the missing divider. */
+        ESP_LOGW(TAG, "Battery reading invalid (0 mV) - ADC not connected? "
+                      "Battery protection DISABLED (running without gauge).");
     }
     else if (v_batt < BATT_BAD_MV)
     {
@@ -155,7 +181,15 @@ void battery_monitor_task(void *arg)
          * this as "below on boot -> don't start" but the previous code only
          * checked CRITICAL_MV, allowing the device to boot and stream with
          * a nearly-dead battery (between CRITICAL=3700 and START=3900),
-         * draining it further into deep-sleep territory. */
+         * draining it further into deep-sleep territory.
+         *
+         * FIX (GROK-9): note that this boot-only START check creates an
+         * asymmetry with the runtime loop, which used to check only
+         * CRITICAL_MV. A device booting at 3800 mV would sleep, wake
+         * after BATT_SLEEP_MIN, measure ~3800 mV again, and sleep again
+         * forever — until charged above 3900 mV. To fix this, the runtime
+         * loop below now ALSO checks BATT_START_MV, making the policy
+         * symmetric: same threshold at boot and at runtime. */
         ESP_LOGW(TAG, "Battery LOW (%u mV < %u) - deep sleeping",
                  (unsigned)v_batt, (unsigned)BATT_START_MV);
         battery_enter_deep_sleep(BATT_SLEEP_MIN);
@@ -197,6 +231,23 @@ void battery_monitor_task(void *arg)
             battery_enter_deep_sleep(BATT_SLEEP_MIN);
             return; /* never reached */
         }
+        /* FIX (B1 REGRESSION): GROK-9 made the runtime check symmetric with
+         * the boot check (both checked BATT_START_MV). This was WRONG:
+         * a Li-ion cell under WiFi-TX + I2S load sags to 3.7-3.85V even at
+         * 50% SoC. With START=3900mV, the symmetric policy caused the device
+         * to deep-sleep every BATT_CHECK_MIN minutes on a healthy battery,
+         * making it nearly unusable below ~75% SoC.
+         *
+         * The CORRECT policy is ASYMMETRIC:
+         *   - Boot: sleep at < START (conservative — don't bring up the
+         *     full pipeline if the cell is already weak)
+         *   - Runtime: sleep ONLY at < CRITICAL (transient sags under load
+         *     are normal; only true critical level should trigger sleep)
+         * The boot START check (above, in the boot section) is kept. The
+         * runtime START check is removed here. This is the original design
+         * intent — the GROK-9 "fix" broke it by misinterpreting the
+         * asymmetry as a bug. */
+        /* NOTE: runtime START check intentionally removed — see comment above. */
 
         ESP_LOGI(TAG, "Battery: %u mV (%u%%)",
                  (unsigned)v_batt, (unsigned)battery_get_percent());

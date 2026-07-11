@@ -57,6 +57,13 @@ static uint8_t s_channels = AUDIO_CHANNELS;
 static uint8_t s_error_code = SVC_ERR_NONE;
 static uint16_t s_seq_counter = 0;
 
+/* FIX (GROK-19): pending error to be reported by the svc_task on its next
+ * 100 ms loop iteration, instead of doing a synchronous UDP send_info()
+ * from the audio path (i2s_task_fn / stream_task_fn). The old code took
+ * s_mutex twice + did a sendto() with up to UDP_SEND_TIMEOUT_MS (2 s)
+ * latency ON THE AUDIO TASK's stack, causing jitter/underruns. */
+static volatile uint8_t s_error_pending = SVC_ERR_NONE;
+
 static ip_addr_t s_server_ip; /* audio destination */
 static uint16_t s_server_port;
 static ip_addr_t s_server_svc_addr; /* service port (for INFO replies) */
@@ -134,6 +141,11 @@ esp_err_t svc_port_init(uint16_t port, void *stream_evt_grp)
     if (!s_mutex || !s_stop_done_sem)
     {
         ESP_LOGE(TAG, "Failed to create sync primitives");
+        /* FIX (GROK-4b): if one primitive succeeded but the other failed,
+         * the successful one must be deleted to avoid an 80-120 byte RAM
+         * leak per failed init (the next init overwrites the handles). */
+        if (s_mutex)        { vSemaphoreDelete(s_mutex);        s_mutex = NULL; }
+        if (s_stop_done_sem){ vSemaphoreDelete(s_stop_done_sem); s_stop_done_sem = NULL; }
         return ESP_ERR_NO_MEM;
     }
 
@@ -204,7 +216,20 @@ esp_err_t svc_port_init(uint16_t port, void *stream_evt_grp)
                              .tv_usec = (UDP_SEND_TIMEOUT_MS % 1000) * 1000};
     setsockopt(s_sock, SOL_SOCKET, SO_SNDTIMEO, &tv_snd, sizeof(tv_snd));
 
-    /* Create task. */
+    /* Create task.
+     *
+     * FIX (GROK-3.2): set s_state = SVC_IDLE HERE (under mutex, BEFORE
+     * xTaskCreate) so that svc_port_is_running() returns true immediately
+     * after init returns. Previously s_state was set to SVC_IDLE only
+     * inside svc_task_fn (line ~1032) after the task started running,
+     * leaving a window where a second svc_port_init() call would pass
+     * the "s_state != SVC_STOPPED" guard (line ~130) and create a
+     * duplicate socket + task. The task's own s_state = SVC_IDLE at
+     * line ~1032 now becomes a redundant no-op (safe). */
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_state = SVC_IDLE;
+    xSemaphoreGive(s_mutex);
+
     BaseType_t res = xTaskCreate(svc_task_fn, "svc_port", TASK_STACK_SVC,
                                  NULL, TASK_PRIO_SVC, &s_task_handle);
     if (res != pdPASS)
@@ -212,6 +237,12 @@ esp_err_t svc_port_init(uint16_t port, void *stream_evt_grp)
         ESP_LOGE(TAG, "Failed to create task");
         close(s_sock);
         s_sock = -1;
+        /* FIX (GROK-4): leak sync primitives on this error path too.
+         * Without this, every failed init orphaned ~80-120 bytes of
+         * FreeRTOS heap (mutex + binary semaphore), eventually exhausting
+         * RAM on a memory-constrained ESP8266 with repeated re-init. */
+        if (s_mutex)        { vSemaphoreDelete(s_mutex);        s_mutex = NULL; }
+        if (s_stop_done_sem){ vSemaphoreDelete(s_stop_done_sem); s_stop_done_sem = NULL; }
         return ESP_ERR_NO_MEM;
     }
 
@@ -244,10 +275,22 @@ bool svc_port_is_running(void)
  * signals the task to exit, waits for it, frees sync primitives. */
 void svc_port_deinit(void)
 {
-    if (s_state == SVC_STOPPED)
+    /* FIX (GROK-G11-4): take the mutex for the s_state read + write.
+     * Previously s_state = SVC_STOPPED was written WITHOUT the mutex while
+     * svc_task_fn reads s_state UNDER the mutex (line ~1046) — a data race
+     * (C11/TSAN would flag it). Practically benign on ESP8266 (32-bit
+     * aligned enum = atomic read/write), but this closes the consistency
+     * hole and matches the project's own discipline. */
+    if (!s_mutex)
         return;
-
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_state == SVC_STOPPED)
+    {
+        xSemaphoreGive(s_mutex);
+        return;
+    }
     s_state = SVC_STOPPED;
+    xSemaphoreGive(s_mutex);
 
     /* Close socket - wakes any recvfrom() in the svc task (EBADF). */
     if (s_sock >= 0)
@@ -495,8 +538,6 @@ void svc_port_set_error(uint8_t error_code)
 {
     if (!s_mutex)
         return;
-    ip_addr_t addr;
-    uint16_t port;
 
     /* FIX (C2): timeout instead of portMAX_DELAY to avoid deadlock if
      * the mutex was orphaned by a force-deleted task. */
@@ -504,18 +545,18 @@ void svc_port_set_error(uint8_t error_code)
     {
         ESP_LOGW(TAG, "set_error: mutex timeout - error %u not reported",
                  (unsigned)error_code);
+        /* Still set the pending flag (lock-free) so the svc_task can
+         * eventually flush it on its next loop iteration. */
+        s_error_pending = error_code;
         return;
     }
     s_error_code = error_code;
-    addr = s_server_svc_addr;
-    port = s_server_svc_port;
+    /* FIX (GROK-19): do NOT send_info() from this audio-path context.
+     * Set a volatile pending flag instead; the svc_task will pick it up
+     * on its next 100 ms iteration and emit the INFO packet from its
+     * own stack. This removes UDP send jitter from the i2s/TX hot path. */
+    s_error_pending = error_code;
     xSemaphoreGive(s_mutex);
-
-    /* Trigger immediate INFO send to server if address known. */
-    if (addr.addr != 0 && port != 0)
-    {
-        { uint16_t s; xSemaphoreTake(s_mutex, portMAX_DELAY); s = s_seq_counter++; xSemaphoreGive(s_mutex); send_info(s, &addr, port); }
-    }
 }
 
 void svc_port_clear_error(void)
@@ -532,6 +573,14 @@ void svc_port_clear_error(void)
         return;
     }
     s_error_code = SVC_ERR_NONE;
+    /* FIX (GROK-3.5): also clear s_error_pending. Without this, the svc_task
+     * could flush a stale pending error on its next 100ms iteration even
+     * AFTER clear_error was called — producing an extra (unnecessary)
+     * send_info and a misleading "flushed pending error N" log line. The
+     * INFO packet itself would contain error=NONE (send_info reads
+     * s_error_code which was just cleared), but the extra UDP traffic and
+     * log noise are worth avoiding. */
+    s_error_pending = SVC_ERR_NONE;
     xSemaphoreGive(s_mutex);
 }
 
@@ -667,7 +716,17 @@ static void build_info_payload(svc_info_payload_t *info)
     info->status = (state_local == SVC_STREAMING) ? SVC_STATUS_STREAMING : SVC_STATUS_IDLE;
     info->error = s_error_code;
     info->packets_sent = s_packets_sent;
-    info->channels = s_channels;
+    /* FIX (B3): use streaming_get_channels() (the ACTIVE stream's actual
+     * channel count) instead of s_channels (which AT+CH updates immediately
+     * before HOTRESTART applies the change). This prevents INFO/STATUS from
+     * reporting the NEW channel count while the OLD stream is still running
+     * with the OLD count — a desync that could cause the receiver to
+     * mis-allocate WaveOut buffers. When no stream is active,
+     * streaming_get_channels() returns the configured (NVS) value. */
+    {
+        extern uint8_t streaming_get_channels(void);
+        info->channels = streaming_get_channels();
+    }
     xSemaphoreGive(s_mutex);
 
     /* Only override status to ERROR when streaming.
@@ -927,7 +986,15 @@ static void handle_configure(const svc_header_t *hdr, const uint8_t *payload,
                 }
                 else
                 {
-                    s_last_discover_ticks = now_ticks();
+                    /* FIX (A4): skip the write if we can't take the mutex.
+                     * Previously this wrote s_last_discover_ticks WITHOUT the
+                     * mutex — a C11 data race with svc_task_fn's locked read.
+                     * On ESP8266 (single-core, 32-bit atomic writes) this is
+                     * benign in practice, but skipping the write keeps the
+                     * "all writes under mutex" invariant honest and silences
+                     * static analyzers. The worst case is a slightly stale
+                     * discover timestamp, which the watchdog tolerates. */
+                    /* (intentionally no write — see comment above) */
                 }
             }
             if (xSemaphoreTake(s_stop_done_sem, pdMS_TO_TICKS(50)) == pdTRUE)
@@ -1128,7 +1195,27 @@ static void svc_task_fn(void *arg)
         uint16_t svc_port = s_server_svc_port;
         uint32_t elapsed = (uint32_t)(now - s_last_discover_ticks) * portTICK_PERIOD_MS;
         ip_addr_t bcast = s_broadcast_addr;
+        /* FIX (GROK-19): snapshot any pending error flagged by the audio
+         * path (svc_port_set_error) and clear the pending flag. The actual
+         * UDP send_info() is then done from this svc_task context — no
+         * socket/mutex work on the i2s/TX hot path. */
+        uint8_t pending_err = s_error_pending;
+        if (pending_err != SVC_ERR_NONE)
+            s_error_pending = SVC_ERR_NONE;
         xSemaphoreGive(s_mutex);
+
+        /* Flush a pending error immediately (regardless of state) so the
+         * server is notified of e.g. I2S underrun / encode failure without
+         * waiting for the next periodic INFO interval. */
+        if (pending_err != SVC_ERR_NONE && svc_addr.addr != 0)
+        {
+            uint16_t s;
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s = s_seq_counter++;
+            xSemaphoreGive(s_mutex);
+            send_info(s, &svc_addr, svc_port);
+            ESP_LOGI(TAG, "flushed pending error %u via INFO", (unsigned)pending_err);
+        }
 
         if (st == SVC_STREAMING)
         {
@@ -1191,5 +1278,25 @@ static void svc_task_fn(void *arg)
     }
 
     ESP_LOGI(TAG, "Service port task exiting");
+
+    /* FIX (GROK-1): clear our own task handle BEFORE vTaskDelete(NULL).
+     * Without this, svc_port_deinit's wait-loop never sees the handle go
+     * NULL, runs the full 3-second timeout, then calls vTaskDelete() on
+     * an already-freed TCB (use-after-free). Mirrors the pattern used in
+     * wifi_sta.c::wifi_reconnect_task (line 513). The mutex guards the
+     * handle against a concurrent deinit reading it. */
+    if (s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+        s_task_handle = NULL;
+        xSemaphoreGive(s_mutex);
+        if (s_stop_done_sem)
+            xSemaphoreGive(s_stop_done_sem);
+    }
+    else
+    {
+        /* Mutex unavailable (e.g. orphaned) — still clear the handle
+         * unsynchronized; worst case is one stale poll by deinit. */
+        s_task_handle = NULL;
+    }
     vTaskDelete(NULL);
 }

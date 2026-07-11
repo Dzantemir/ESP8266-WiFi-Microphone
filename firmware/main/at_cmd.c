@@ -112,6 +112,11 @@ static void cmd_batt_query(void);
 static void cmd_status(void);
 static void cmd_factory(void);
 static void cmd_hotrestart(void);
+/* FIX (UART0/B9): AT+LOG command to mute/unmute ESP_LOG output on UART0.
+ * Since AT and ESP_LOG share UART0, log lines mixed with AT responses can
+ * break host-side AT parsers. AT+LOG=0 silences logs; AT+LOG=1 restores. */
+static void cmd_log_set(const char *args);
+static void cmd_log_query(void);
 
 static volatile bool s_running = false;
 
@@ -178,6 +183,17 @@ static void at_send_data(const char *fmt, ...)
          * uninitialized stack memory past buf[]. */
         size_t write_len = ((size_t)n < sizeof(buf)) ? (size_t)n : sizeof(buf) - 1;
         uart_write_bytes(UART_NUM, buf, write_len);
+        /* FIX (GROK-26): if the output was truncated, append a visible
+         * ellipsis marker so the user knows the response is incomplete.
+         * Without this, a long +STATUS:... response would silently lose
+         * its tail and the user couldn't tell whether the data ended
+         * naturally or was cut off. The ellipsis fits because write_len
+         * was capped at sizeof(buf)-1, leaving one byte for '\0'; we
+         * overwrite the last 3 chars with "..." to stay in-bounds. */
+        if ((size_t)n > sizeof(buf) - 1 && write_len >= 3)
+        {
+            uart_write_bytes(UART_NUM, "...[truncated]\r\n", 16);
+        }
     }
 }
 
@@ -187,6 +203,18 @@ static void at_task_fn(void *arg)
 {
     char cmd_buf[CMD_BUF_SIZE];
     int pos = 0;
+    /* FIX (GROK-25): one-shot flag so we report command-buffer overflow
+     * once per over-long line, not once per discarded byte. Reset on
+     * every CR/LF so a subsequent long command can also report. */
+    bool overflow_reported = false;
+    /* FIX (GROK-G11-16): discard flag — once overflow is detected, discard
+     * ALL remaining bytes of the current line until CR/LF. Previously the
+     * truncated buffer was still dispatched to at_process_line on the next
+     * CR/LF, which could parse a valid-but-unintended command (e.g.
+     * "AT+RATE=48000,extra" truncated to "AT+RATE=48000" would set the rate
+     * to 48000 instead of returning an error). Now the line is fully
+     * discarded. */
+    bool overflow_discard = false;
 
     at_send_str("\r\n=== ESP8266 ADPCM Streamer ===\r\n");
     at_send_str("AT command interface ready (115200 8N1)\r\n");
@@ -203,14 +231,24 @@ static void at_task_fn(void *arg)
 
         if (ch == '\r' || ch == '\n')
         {
-            if (pos > 0)
+            /* Only dispatch if we were NOT in discard mode. If overflow_discard
+             * is set, the line was too long and we intentionally dropped the
+             * rest — do NOT process the partial buffer. */
+            if (pos > 0 && !overflow_discard)
             {
                 cmd_buf[pos] = '\0';
                 at_process_line(cmd_buf, pos);
-                pos = 0;
             }
+            pos = 0;
+            /* Reset overflow flags for the next command line. */
+            overflow_reported = false;
+            overflow_discard = false;
             continue;
         }
+
+        /* If we're discarding an over-long line, skip the buffer write. */
+        if (overflow_discard)
+            continue;
 
         if (pos < CMD_BUF_SIZE - 1)
         {
@@ -218,7 +256,21 @@ static void at_task_fn(void *arg)
         }
         else
         {
-            /* Overflow - discard char, wait for line end. */
+            /* Overflow - discard char, wait for line end.
+             * FIX (GROK-25): emit an ERROR so the user knows their
+             * command was truncated. Use a one-shot flag so we don't spam
+             * ERROR for every discarded byte of a long paste.
+             * FIX (GROK-G11-16): set overflow_discard so the rest of the
+             * line is dropped and at_process_line is NOT called with the
+             * truncated buffer (which could parse a valid-but-unintended
+             * command). */
+            if (!overflow_reported)
+            {
+                at_send_data("+ERR:command too long (max %d chars), discarded\r\n",
+                             (int)(CMD_BUF_SIZE - 1));
+                overflow_reported = true;
+                overflow_discard = true;
+            }
             continue;
         }
     }
@@ -487,6 +539,22 @@ static void at_process_line(const char *line, int len)
             return;
         }
         cmd_hotrestart();
+    }
+    else if (strcasecmp(cmd_name, "LOG") == 0)
+    {
+        /* FIX (UART0/B9): AT+LOG=0/1 or AT+LOG? */
+        if (is_query && !args)
+        {
+            cmd_log_query();
+        }
+        else if (args && !is_query)
+        {
+            cmd_log_set(args);
+        }
+        else
+        {
+            at_send_error();
+        }
     }
     else
     {
@@ -914,6 +982,18 @@ static void cmd_ch_set(const char *args)
 {
     char *endptr = NULL;
     long ch = strtol(args, &endptr, 10);
+    /* FIX (GROK-15): validate the entire argument was consumed.
+     * Without this, "AT+CH=2foo" parses 2 and silently ignores "foo",
+     * configuring stereo instead of returning an error. All other
+     * numeric AT setters (cmd_rate_set, cmd_port_set, cmd_bits_set,
+     * cmd_codec_set, cmd_xport_set, cmd_gain_set, cmd_agc_set) already
+     * have this check — cmd_ch_set was the only one missing it. */
+    if (endptr == args || *endptr != '\0')
+    {
+        at_send_data("+ERR:ch must be a number (0, 1, or 2)\r\n");
+        at_send_error();
+        return;
+    }
     uint8_t fmt;
     switch (ch)
     {
@@ -1533,17 +1613,102 @@ static void cmd_factory(void)
         at_send_error();
         return;
     }
+
+    /* FIX (GROK-8): apply the just-restored default WiFi credentials at
+     * RUNTIME, not only to NVS. Without this, the device keeps running
+     * on the OLD (user-configured) SSID until the next reboot, while NVS
+     * now holds the factory-default SSID — memory WiFi != NVS WiFi, and
+     * a subsequent NVS load would silently switch networks. This mirrors
+     * what cmd_wifi does after config_set_wifi(): call wifi_sta_reconfigure
+     * with the freshly-written SSID/password so the device actually
+     * disconnects from the old AP and joins the new (factory-default) one. */
+    device_config_t cfg;
+    config_get_copy(&cfg);
+    esp_err_t wifi_err = wifi_sta_reconfigure(cfg.wifi_ssid, cfg.wifi_password);
+    /* Wipe the plaintext password from the stack copy. */
+    memset(&cfg, 0, sizeof(cfg));
+
     /* FIX (L33): if a stream is currently active, request a restart so the
-     * factory defaults actually take effect (otherwise the old runtime
-     * config keeps streaming until the user manually AT+RST). */
+     * factory defaults actually take effect (audio config + transport). */
     if (streaming_is_active())
     {
         streaming_request_restart();
-        at_send_str("\r\n+FACTORY:defaults restored, stream restarting\r\n");
+        if (wifi_err == ESP_OK)
+            at_send_str("\r\n+FACTORY:defaults restored, WiFi reconnecting, stream restarting\r\n");
+        else
+            at_send_str("\r\n+FACTORY:defaults restored (WiFi reconfigure pending), stream restarting\r\n");
     }
     else
     {
-        at_send_str("\r\n+FACTORY:defaults restored (restart required)\r\n");
+        if (wifi_err == ESP_OK)
+            at_send_str("\r\n+FACTORY:defaults restored, WiFi reconnecting\r\n");
+        else
+            at_send_str("\r\n+FACTORY:defaults restored (restart required - WiFi reconfigure failed)\r\n");
     }
+    at_send_ok();
+}
+
+/* FIX (UART0/B9): AT+LOG implementation.
+ *
+ * Problem: AT commands and ESP_LOG output share UART0 on ESP8266 (UART1 is
+ * TX-only on GPIO2, a boot strap pin). Log lines (e.g. "I (1234) main: ...")
+ * mixed with AT responses (e.g. "OK\r\n+STATUS:...") break host-side AT
+ * parsers that expect strict +CMD:/OK/ERROR framing.
+ *
+ * Solution: AT+LOG=0 silences all ESP_LOG output by setting every tag's
+ * level to ESP_LOG_NONE. AT+LOG=1 restores the previous levels. The default
+ * level is controlled by CONFIG_LOG_DEFAULT_LEVEL (menuconfig).
+ *
+ * This is the cheapest fix that doesn't require hardware changes (unlike
+ * routing logs to UART1, which needs GPIO2 free). Production builds can
+ * also set CONFIG_LOG_DEFAULT_LEVEL=0 to disable logs entirely at compile
+ * time. */
+
+/* Track whether logs are currently muted, so AT+LOG? can report the state
+ * and so AT+LOG=1 can restore. We don't save the per-tag levels — we just
+ * restore to CONFIG_LOG_DEFAULT_LEVEL (the compile-time default). */
+static bool s_logs_muted = false;
+
+static void cmd_log_set(const char *args)
+{
+    char *endptr = NULL;
+    long val = strtol(args, &endptr, 10);
+    if (endptr == args || *endptr != '\0')
+    {
+        at_send_data("+ERR:LOG must be 0 (mute) or 1 (unmute)\r\n");
+        at_send_error();
+        return;
+    }
+
+    if (val == 0)
+    {
+        /* Mute: set all tags to ESP_LOG_NONE. */
+        esp_log_level_set("*", ESP_LOG_NONE);
+        s_logs_muted = true;
+        at_send_data("+LOG:logs muted (ESP_LOG_NONE)\r\n");
+        at_send_ok();
+    }
+    else if (val == 1)
+    {
+        /* Unmute: restore to the compile-time default level. */
+#if defined(CONFIG_LOG_DEFAULT_LEVEL)
+        esp_log_level_set("*", (esp_log_level_t)CONFIG_LOG_DEFAULT_LEVEL);
+#else
+        esp_log_level_set("*", ESP_LOG_INFO);
+#endif
+        s_logs_muted = false;
+        at_send_data("+LOG:logs restored\r\n");
+        at_send_ok();
+    }
+    else
+    {
+        at_send_data("+ERR:LOG must be 0 (mute) or 1 (unmute)\r\n");
+        at_send_error();
+    }
+}
+
+static void cmd_log_query(void)
+{
+    at_send_data("+LOG:%s\r\n", s_logs_muted ? "0 (muted)" : "1 (enabled)");
     at_send_ok();
 }

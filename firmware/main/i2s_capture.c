@@ -47,6 +47,11 @@ static uint8_t s_agc_attack = 75;  /* from preset, % per frame */
 static uint8_t s_agc_release = 20; /* from preset, % per frame */
 static int32_t s_agc_target = 0;   /* target level (raw, bit-depth dependent) */
 static int32_t s_agc_noise_gate = 0; /* noise gate threshold (raw) */
+/* FIX (GROK-5): per-preset min-gain floor in Q16.16. Loaded from
+ * AGC_PRESETS[mode].min_gain_q16 in i2s_capture_init. Presets 1..6 keep
+ * (1<<16)=1.0x (boost-only, historical behavior); Limiter (7) and
+ * Surveillance (8) use (1<<10)=1/64x so they can actually attenuate. */
+static int32_t s_agc_min_gain_q16 = (1 << 16);
 static uint8_t s_timing_sd_delay = 0;
 static uint8_t s_timing_ws_delay = 0;
 static uint8_t s_timing_bck_delay = 0;
@@ -56,7 +61,6 @@ static int32_t s_agc_envelope = 0;         /* peak envelope follower */
 static int32_t s_agc_gain_q16 = (1 << 16); /* Q16.16 gain (65536 = 1.0x) */
 
 #define AGC_MAX_GAIN_Q16 (64 << 16) /* 64.0 in Q16.16 = +36 dB */
-#define AGC_MIN_GAIN_Q16 (1 << 16)  /* 1.0 in Q16.16 = 0 dB */
 
 int i2s_capture_channel_count(int channel_format)
 {
@@ -216,6 +220,10 @@ esp_err_t i2s_capture_init(uint32_t sample_rate, int bits, int comm_format,
         const agc_preset_t *p = &AGC_PRESETS[agc_mode];
         s_agc_attack  = p->attack;
         s_agc_release = p->release;
+        /* FIX (GROK-5): load per-preset min-gain floor. */
+        s_agc_min_gain_q16 = p->min_gain_q16;
+        if (s_agc_min_gain_q16 < 1)
+            s_agc_min_gain_q16 = 1;  /* defensive: never multiply by 0 */
 
         /* Compute target and noise_gate for current bit depth.
          * Presets use 0 for target → default (-18 dBFS).
@@ -285,8 +293,22 @@ esp_err_t i2s_capture_init(uint32_t sample_rate, int bits, int comm_format,
      * Previously the cap used '* 4' unconditionally, which was correct for
      * 16-bit and 24-bit mono but WRONG for 24-bit stereo: it allowed 15.3 KB
      * (8 bufs x 1920) instead of the intended 8 KB, wasting 7 KB of heap.
-     * With stereo TCP, this pushed free heap to ~1 KB -> lwIP send() EAGAIN. */
-    uint32_t bytes_per_dma_word = (s_bits == 24 && s_channels == 2) ? 8U : 4U;
+     * With stereo TCP, this pushed free heap to ~1 KB -> lwIP send() EAGAIN.
+     *
+     * FIX (GROK-2.2): the 16-bit mono case is actually 2 bytes/sample on
+     * the DMA wire (one 16-bit LEFT sample per 32-bit DMA word slot, but
+     * the custom i2s.c driver allocates dma_buf_len * sample_size bytes
+     * where sample_size = bytes_per_sample * channel_num = 2 * 1 = 2 for
+     * 16-bit mono). Using 4 here overestimated the DMA pool by 2x for
+     * 16-bit mono, causing the while-loop below to reduce dma_buf_count
+     * more aggressively than necessary -> worse jitter at high rates.
+     * Now: 16-bit mono = 2U, 16-bit stereo = 4U, 24-bit mono = 4U,
+     * 24-bit stereo = 8U (matches the driver's actual sample_size). */
+    uint32_t bytes_per_dma_word =
+        (s_bits == 24 && s_channels == 2) ? 8U :
+        (s_bits == 24 && s_channels == 1) ? 4U :
+        (s_bits == 16 && s_channels == 2) ? 4U :
+        2U;  /* 16-bit mono */
 
     int dma_buf_count = (int)(80U * sample_rate / (1000U * (uint32_t)dma_buf_len)) + 4;
     if (dma_buf_count < 6)
@@ -442,7 +464,16 @@ esp_err_t i2s_capture_deinit(void)
     esp_err_t err = i2s_driver_uninstall(I2S_PORT);
     if (err != ESP_OK)
     {
-        ESP_LOGW(TAG, "i2s_driver_uninstall: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "i2s_driver_uninstall: %s - clearing s_initialized anyway "
+                 "(caller should reboot if re-init fails)", esp_err_to_name(err));
+        /* FIX (GROK-7): clear s_initialized even on uninstall failure.
+         * Without this, the next i2s_capture_init() sees s_initialized==true
+         * and returns ESP_OK without re-installing the driver — leaving
+         * the device stuck in a half-torn-down state where the only
+         * recovery is a reboot. Best-effort cleanup is safer than a
+         * hard-lock: if the next install genuinely fails because the
+         * driver is in a bad state, that error will surface explicitly. */
+        s_initialized = false;
         return err;
     }
     s_initialized = false;
@@ -494,7 +525,7 @@ static void apply_agc(int32_t *buf, int n)
      * to the division by zero below. */
     if (s_agc_envelope <= noise_gate)
     {
-        target_gain_q16 = AGC_MIN_GAIN_Q16;
+        target_gain_q16 = s_agc_min_gain_q16;
     }
     else
     {
@@ -506,8 +537,12 @@ static void apply_agc(int32_t *buf, int n)
         int64_t raw = num / s_agc_envelope;
         if (raw > AGC_MAX_GAIN_Q16)
             raw = AGC_MAX_GAIN_Q16;
-        if (raw < AGC_MIN_GAIN_Q16)
-            raw = AGC_MIN_GAIN_Q16;
+        /* FIX (GROK-5): use the per-preset min-gain floor instead of the
+         * historical hardcoded (1<<16). This lets Limiter/Surveillance
+         * actually attenuate loud signals instead of clamping to 1.0x
+         * and then hard-clipping at the integer range. */
+        if (raw < (int64_t)s_agc_min_gain_q16)
+            raw = (int64_t)s_agc_min_gain_q16;
         target_gain_q16 = (int32_t)raw;
     }
 
@@ -643,7 +678,19 @@ esp_err_t i2s_capture_read(int32_t *buf, int buf_len, int *samples_read)
          * i+1<n; for odd n the last sample was not swapped but was
          * still sign-extended (from the wrong DMA half). Round n down
          * to even for the swap; for odd trailing sample, copy the hi16
-         * of the last DMA word into the lo16 slot before sign-extend. */
+         * of the last DMA word into the lo16 slot before sign-extend.
+         *
+         * FIX (GROK-16) DOCUMENTATION ONLY (no behavior change):
+         * The ESP8266 I2S driver's default msb_right/right_first
+         * configuration determines whether the LEFT-channel sample
+         * lands in the hi16 or lo16 of each 32-bit DMA word in stereo
+         * mode. We do NOT call i2s_set_clk(...,msb_right=...) here, so
+         * we rely on the SDK default for I2S_CHANNEL_FMT_RIGHT_LEFT.
+         * If a future SDK version flips that default, the stereo L/R
+         * ordering would silently swap on the wire. Receivers that
+         * care about L/R identity should validate at stream start
+         * (e.g. encode a known L-only or R-only marker frame), or
+         * call i2s_set_clk explicitly with the desired msb_right. */
         if (s_channels == 1)
         {
             int n_swap = n & ~1;

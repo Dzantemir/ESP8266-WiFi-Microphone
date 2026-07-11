@@ -147,6 +147,14 @@ typedef struct {
     uint8_t  release;       /* % per frame, gain rising (1-100) */
     int32_t  target_q16;    /* target level in Q16.16 (0 = use bit-depth default) */
     int32_t  noise_gate_q16;/* noise gate in Q16.16 (0 = use default) */
+    /* FIX (GROK-5): per-preset minimum gain floor in Q16.16.
+     *   (1<<16) = 1.0x (0 dB) — boost-only, the historical behavior.
+     *   Lower values allow the preset to ATTENUATE loud signals (true
+     *   limiter/compressor behavior). Without this field, the AGC could
+     *   only boost (gain clamp >= 1.0x), so the "Limiter" preset could
+     *   not actually limit peaks — it just boosted quiet signals and
+     *   hard-clipped peaks at the integer range, producing distortion. */
+    int32_t  min_gain_q16;  /* floor; defaults to (1<<16) for backward compat */
 } agc_preset_t;
 
 /* 16-bit equivalents for target/noise_gate (used when target_q16 = 0) */
@@ -154,41 +162,50 @@ typedef struct {
 #define AGC_TARGET_24BIT    (1 << 20)   /* -18 dBFS raw in 24-bit domain (1048576) */
 #define AGC_NOISE_GATE_DIV  64          /* noise gate = target / DIV (if preset has 0) */
 
+/* FIX (GROK-5): default min-gain for boost-only presets (1..6) — preserves
+ * the historical behavior so existing streams sound identical. */
+#define AGC_MIN_GAIN_BOOST_ONLY  (1 << 16)       /* 1.0x = 0 dB  */
+/* Limiter/Surveillance can attenuate down to 1/64x (-36 dB) so peaks above
+ * target are actually reduced, not just hard-clipped. */
+#define AGC_MIN_GAIN_LIMITER     (1 << 10)       /* 1/64x = -36 dB */
+
 static const agc_preset_t AGC_PRESETS[AGC_MODE_COUNT] = {
     /* 0: OFF — bypass, use fixed gain (AT+GAIN) */
-    { "OFF",             0,   0,  0,        0 },
+    { "OFF",             0,   0,  0,        0, AGC_MIN_GAIN_BOOST_ONLY },
 
     /* 1: Studio Soft — very smooth, minimal pumping, for clean recordings.
      *   target=-18dBFS (0.126), gate=-48dBFS (0.004) */
-    { "Studio Soft",    30,   5,  8248,     261 },
+    { "Studio Soft",    30,   5,  8248,     261, AGC_MIN_GAIN_BOOST_ONLY },
 
     /* 2: Podcast — smooth control for voice, moderate gate.
      *   target=-18dBFS, gate=-42dBFS (0.008) */
-    { "Podcast",        50,  15,  8248,     521 },
+    { "Podcast",        50,  15,  8248,     521, AGC_MIN_GAIN_BOOST_ONLY },
 
     /* 3: Voice Balanced — current MEDIUM, good default for speech.
      *   target=-18dBFS, gate=-42dBFS */
-    { "Voice Balanced", 75,  20,  8248,     521 },
+    { "Voice Balanced", 75,  20,  8248,     521, AGC_MIN_GAIN_BOOST_ONLY },
 
     /* 4: Voice Fast — fast reaction for dynamic speech.
      *   target=-18dBFS, gate=-36dBFS (0.016) */
-    { "Voice Fast",     90,  40,  8248,    1039 },
+    { "Voice Fast",     90,  40,  8248,    1039, AGC_MIN_GAIN_BOOST_ONLY },
 
     /* 5: Noisy Room — high noise gate, cuts background noise.
      *   target=-15dBFS (0.178, slightly louder), gate=-30dBFS (0.032) */
-    { "Noisy Room",     60,  25, 11658,    2073 },
+    { "Noisy Room",     60,  25, 11658,    2073, AGC_MIN_GAIN_BOOST_ONLY },
 
     /* 6: Music — slow attack (don't compress transients), fast release.
      *   target=-12dBFS (0.251, preserves dynamics), gate=-60dBFS (0.001) */
-    { "Music",          15,  60, 16463,      66 },
+    { "Music",          15,  60, 16463,      66, AGC_MIN_GAIN_BOOST_ONLY },
 
-    /* 7: Limiter — only limits peaks, doesn't boost quiet signal.
+    /* 7: Limiter — NOW actually limits peaks (can attenuate down to -36 dB),
+     *   doesn't boost quiet signal.
      *   target=-6dBFS (0.501, high threshold), gate=-60dBFS */
-    { "Limiter",       100,   5, 32846,      66 },
+    { "Limiter",       100,   5, 32846,      66, AGC_MIN_GAIN_LIMITER },
 
     /* 8: Surveillance — aggressive, keeps level constant for monitoring.
+     *   Also allowed to attenuate to avoid clipping on loud transients.
      *   target=-12dBFS, gate=-60dBFS */
-    { "Surveillance",   95,  80, 16463,      66 },
+    { "Surveillance",   95,  80, 16463,      66, AGC_MIN_GAIN_LIMITER },
 };
 
 /* I2S RX input timing delays (ESP8266 TRM §10.2.1.6, I2S.timing register).
@@ -630,19 +647,16 @@ uint32_t i2s_capture_compute_frame_ms(uint32_t sample_rate, int channels,
  * Software watchdog that monitors heap, pipeline liveness, and stack
  * health. Runs independently of the streaming pipeline. If any check
  * fails, calls esp_restart() immediately. See supervisor_task_fn in
- * main.c for details. */
-#ifdef CONFIG_STREAMER_TASK_STACK_SUPERVISOR
-#define TASK_STACK_SUPERVISOR  CONFIG_STREAMER_TASK_STACK_SUPERVISOR
-#else
-#define TASK_STACK_SUPERVISOR  2048
-#endif
-
-#ifdef CONFIG_STREAMER_TASK_PRIO_SUPERVISOR
-#define TASK_PRIO_SUPERVISOR   CONFIG_STREAMER_TASK_PRIO_SUPERVISOR
-#else
-#define TASK_PRIO_SUPERVISOR   1    /* low prio — runs when system is idle */
-#endif
-
+ * main.c for details.
+ *
+ * FIX (GROK-12): TASK_STACK_SUPERVISOR and TASK_PRIO_SUPERVISOR were
+ * previously REDEFINED here (token-identical copies of the definitions
+ * further up near line 551). The duplicate was benign (identical
+ * redefinitions don't trigger -Wredefinition), but it was a maintenance
+ * hazard: editing one copy without the other would have caused a real
+ * redefinition warning under -Werror. The duplicate has been removed;
+ * the canonical definitions above (search for "Supervisor task") are
+ * the single source of truth. */
 /* (Heap threshold, stall timeout, stack threshold, and check interval are
  *  defined above via CONFIG_STREAMER_SUPERVISOR_* macros — see lines ~538-560.
  *  Do NOT redefine them here.) */

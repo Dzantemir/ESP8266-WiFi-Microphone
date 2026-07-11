@@ -107,7 +107,15 @@ static tcpip_adapter_ip_info_t s_cached_ip_info;
  *
  * NOTE: function returns int (0=OK, non-zero=error), NOT esp_err_t.
  * Declared in NON-OS SDK user_interface.h, not in RTOS SDK v3.4 public
- * headers - must be extern-declared locally. */
+ * headers - must be extern-declared locally.
+ *
+ * IMPORTANT (raw TX mode): we use wifi_set_user_fixed_rate() here, NOT
+ * wifi_set_user_sup_rate(). The latter sets the SUPPORTED RATES advertised
+ * to an ASSOCIATED AP (STA mode) — it has no effect in raw 802.11 TX mode
+ * where there is no association. wifi_set_user_fixed_rate() pins the actual
+ * TX rate used by esp_wifi_80211_tx(), which is what we need for raw frame
+ * injection. WIFI_RATE_11M = 0x03 corresponds to the 11 Mbps 802.11b CCK
+ * rate. */
 extern esp_err_t wifi_set_user_fixed_rate(uint8_t enable_mask, uint8_t rate);
 #define FIXED_RATE_MASK_NONE 0x00
 #define FIXED_RATE_MASK_STA 0x01
@@ -117,22 +125,6 @@ extern esp_err_t wifi_set_user_fixed_rate(uint8_t enable_mask, uint8_t rate);
 #define WIFI_RATE_2M 0x01
 #define WIFI_RATE_5_5M 0x02
 #define WIFI_RATE_11M 0x03
-#define WIFI_RATE_6M 0x0b
-#define WIFI_RATE_9M 0x0f
-#define WIFI_RATE_12M 0x0a
-#define WIFI_RATE_18M 0x0e
-#define WIFI_RATE_24M 0x09
-#define WIFI_RATE_36M 0x0d
-#define WIFI_RATE_48M 0x08
-#define WIFI_RATE_54M 0x0c
-#define WIFI_RATE_MCS0 0x10
-#define WIFI_RATE_MCS1 0x11
-#define WIFI_RATE_MCS2 0x12
-#define WIFI_RATE_MCS3 0x13
-#define WIFI_RATE_MCS4 0x14
-#define WIFI_RATE_MCS5 0x15
-#define WIFI_RATE_MCS6 0x16
-#define WIFI_RATE_MCS7 0x17
 
 /* ---- Forward declarations ---- */
 static void wifi_reconnect_task(void *arg);
@@ -594,7 +586,13 @@ static void wifi_raw_event_handler(void *arg, esp_event_base_t base,
      *    the 1 Mbps base rate -> ~50% packet drop at 200 pkt/s (air time
      *    exceeds real time). At 11 Mbps the same traffic fits in ~10% air
      *    time. Non-fatal: if it fails the stream still works but with a
-     *    higher drop rate for high-bitrate codecs. */
+     *    higher drop rate for high-bitrate codecs.
+     *
+     * NOTE: wifi_set_user_fixed_rate() is the correct function for raw TX
+     * mode — it pins the actual TX rate used by esp_wifi_80211_tx().
+     * wifi_set_user_sup_rate() would be WRONG here: it sets the supported
+     * rates advertised to an ASSOCIATED AP, which is irrelevant for raw
+     * frame injection (no association exists). WIFI_RATE_11M = 0x03. */
     err = wifi_set_user_fixed_rate(FIXED_RATE_MASK_STA, WIFI_RATE_11M);
     if (err != ESP_OK)
     {
@@ -846,6 +844,21 @@ esp_err_t wifi_sta_init_raw(uint8_t channel, uint8_t tx_power)
         return ESP_ERR_NO_MEM;
     }
 
+    /* FIX (GROK-G11-2): create s_backoff_mtx here too. Previously this was
+     * only created in wifi_sta_init() (line ~728), NOT in init_raw. If
+     * wifi_sta_reconfigure() was called in raw TX mode (e.g. via AT+WIFI=...),
+     * it would xSemaphoreTake(s_backoff_mtx, portMAX_DELAY) on a NULL handle
+     * -> FreeRTOS dereferences NULL -> CRASH. Creating the mutex here (and
+     * deinit() already destroys + NULLs it) makes reconfigure safe in both
+     * STA and raw modes. */
+    s_backoff_mtx = xSemaphoreCreateMutex();
+    if (!s_backoff_mtx)
+    {
+        vEventGroupDelete(s_wifi_evt);
+        s_wifi_evt = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
     /* Raw TX mode has no reconnect task (no AP to reconnect to). */
     s_intentional_disconnect = false;
 
@@ -858,18 +871,18 @@ esp_err_t wifi_sta_init_raw(uint8_t channel, uint8_t tx_power)
     /* 1. Init WiFi hardware (esp_wifi_init, set_mode). */
     esp_err_t err = wifi_hw_init();
     if (err != ESP_OK)
-        return err;
+        goto fail_raw_init;
 
     /* 2. Register the STA_START handler BEFORE esp_wifi_start(). */
     err = esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_START,
                                      wifi_raw_event_handler, NULL);
     if (err != ESP_OK)
-        return err;
+        goto fail_raw_init_after_hw;
 
     /* 3. Start WiFi hardware (queues the radio bring-up; STA_START fires soon). */
     err = wifi_hw_start(tx_power);
     if (err != ESP_OK)
-        return err;
+        goto fail_raw_init_after_handler;
 
     /* 4. Wait for the STA_START handler to finish configuring the radio. */
     EventBits_t bits = xEventGroupWaitBits(s_wifi_evt,
@@ -881,7 +894,8 @@ esp_err_t wifi_sta_init_raw(uint8_t channel, uint8_t tx_power)
         ESP_LOGE(TAG, "Timeout (%d ms) waiting for WIFI_EVENT_STA_START "
                       "(raw TX) - radio did not come up",
                  WIFI_RAW_START_TIMEOUT_MS);
-        return ESP_ERR_TIMEOUT;
+        err = ESP_ERR_TIMEOUT;
+        goto fail_raw_init_after_start;
     }
 
     /* 5. Surface any fatal config error captured by the handler. */
@@ -889,7 +903,8 @@ esp_err_t wifi_sta_init_raw(uint8_t channel, uint8_t tx_power)
     {
         ESP_LOGE(TAG, "Raw TX radio configuration failed: %s",
                  esp_err_to_name(s_raw_ctx.config_err));
-        return s_raw_ctx.config_err;
+        err = s_raw_ctx.config_err;
+        goto fail_raw_init_after_start;
     }
 
     /* 6. Radio is up and fully configured. Mark "connected" so the pipeline
@@ -901,6 +916,31 @@ esp_err_t wifi_sta_init_raw(uint8_t channel, uint8_t tx_power)
                   "protocol=11B, rate=11 Mbps)",
              channel);
     return ESP_OK;
+
+    /* FIX (GROK-3.6): proper cleanup on all error paths. Previously each
+     * error return leaked s_wifi_evt, s_backoff_mtx, registered handlers,
+     * and/or a half-initialized WiFi stack. Now we unwind in reverse order
+     * via labeled cleanup blocks. This mirrors the fail_init pattern used
+     * by wifi_sta_init() (line ~810). */
+fail_raw_init_after_start:
+    esp_wifi_stop();
+fail_raw_init_after_handler:
+    esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_STA_START,
+                                 wifi_raw_event_handler);
+fail_raw_init_after_hw:
+    esp_wifi_deinit();
+fail_raw_init:
+    if (s_backoff_mtx)
+    {
+        vSemaphoreDelete(s_backoff_mtx);
+        s_backoff_mtx = NULL;
+    }
+    if (s_wifi_evt)
+    {
+        vEventGroupDelete(s_wifi_evt);
+        s_wifi_evt = NULL;
+    }
+    return err;
 }
 
 /* ====================================================================
@@ -1028,10 +1068,22 @@ esp_err_t wifi_sta_reconfigure(const char *ssid, const char *password)
     if (err != ESP_OK)
         return err;
 
-    /* Reset backoff for the new credentials. */
-    xSemaphoreTake(s_backoff_mtx, portMAX_DELAY);
-    s_backoff_ms = WIFI_RECONNECT_BACKOFF_MIN_MS;
-    xSemaphoreGive(s_backoff_mtx);
+    /* Reset backoff for the new credentials.
+     * FIX (GROK-G11-2): NULL guard for defense-in-depth. In raw TX mode the
+     * mutex is now created by init_raw (above), so this should never be NULL
+     * when s_initialized is true. But if a future code path forgets to create
+     * it, this guard prevents a crash (backoff reset is best-effort, not
+     * critical for raw TX which has no reconnect task). */
+    if (s_backoff_mtx)
+    {
+        xSemaphoreTake(s_backoff_mtx, portMAX_DELAY);
+        s_backoff_ms = WIFI_RECONNECT_BACKOFF_MIN_MS;
+        xSemaphoreGive(s_backoff_mtx);
+    }
+    else
+    {
+        s_backoff_ms = WIFI_RECONNECT_BACKOFF_MIN_MS;
+    }
 
     /* FIX (C6/H8): Set the intentional_disconnect flag BEFORE calling
      * esp_wifi_connect(). If the STA is currently associated, esp_wifi_connect
@@ -1046,15 +1098,48 @@ esp_err_t wifi_sta_reconfigure(const char *ssid, const char *password)
      * not suppressed), and the handler will NOT schedule a task reconnect. */
     s_intentional_disconnect = true;
 
-    /* esp_wifi_connect() here runs in the caller's task. If it triggers a
-     * DISCONNECTED event, the handler will see our flag and NOT schedule a
-     * reconnect. */
+    /* esp_wifi_connect() here runs in the caller's task. If the STA is
+     * currently associated, the SDK queues a STA_DISCONNECTED event that
+     * is dispatched asynchronously from the event-loop task — it has NOT
+     * been processed yet when esp_wifi_connect() returns. */
     err = esp_wifi_connect();
 
-    /* Clear the flag in case esp_wifi_connect returned without firing a
-     * DISCONNECTED event (STA was not associated). Otherwise the next
-     * organic disconnect would be wrongly suppressed. */
-    s_intentional_disconnect = false;
+    /* FIX (GROK-2): RACE on s_intentional_disconnect.
+     *
+     * OLD CODE: unconditionally cleared the flag right after
+     * esp_wifi_connect() returned. The asynchronous STA_DISCONNECTED
+     * handler (in event-loop task) then ran LATER, saw the flag already
+     * false, and scheduled a spurious reconnect via the backoff task —
+     * racing with the connect initiated here, resetting backoff, and
+     * (with new SSID just written) potentially connecting to the wrong AP.
+     *
+     * NEW CODE: only clear the flag if esp_wifi_connect() returned an
+     * error indicating NO DISCONNECTED event will fire (i.e. the STA was
+     * not associated and connect failed synchronously). When the SDK
+     * fires a DISCONNECTED event, the handler clears the flag itself
+     * (see wifi_event_handler, around line 199).
+     *
+     * As a belt-and-suspenders guard, we also wait briefly for the
+     * handler to consume the flag — this covers the rare case where
+     * esp_wifi_connect returns ESP_OK without firing DISCONNECTED (e.g.
+     * already connected to the same AP). After 200 ms the flag is force-
+     * cleared so the next organic disconnect isn't suppressed. */
+    if (err != ESP_OK)
+    {
+        /* Synchronous failure: no DISCONNECTED event will fire, so the
+         * handler will not clear the flag. Clear it here. */
+        s_intentional_disconnect = false;
+    }
+    else
+    {
+        /* Wait up to 200 ms for the event handler to consume the flag
+         * (it sets it to false on line ~199 of this file). If the flag
+         * is still set after the wait, no DISCONNECTED event ever fired
+         * (e.g. already associated to the same SSID) — clear it manually. */
+        for (int i = 0; i < 20 && s_intentional_disconnect; i++)
+            vTaskDelay(pdMS_TO_TICKS(10));
+        s_intentional_disconnect = false;
+    }
 
     /* FIX (L29): wipe the password from the stack. */
     memset(&wifi_cfg, 0, sizeof(wifi_cfg));

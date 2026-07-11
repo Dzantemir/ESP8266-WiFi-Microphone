@@ -174,6 +174,24 @@ esp_err_t rawtx_stream_send(const uint8_t *data, size_t len)
 
     memcpy(s_frame_buf + WIFI_HDR_LEN, data, len);
 
+    /* FIX (GROK-24) DOCUMENTATION: esp_wifi_80211_tx() in ESP8266 RTOS SDK
+     * v3.x internally enqueues a COPY of the frame into the WiFi driver's
+     * TX buffer pool before returning, so the caller's buffer may be reused
+     * immediately. s_frame_buf is static and reused per call — safe today
+     * because the copy is made synchronously before this function returns.
+     *
+     * IF a future SDK version switches to zero-copy TX (passing the caller's
+     * buffer pointer to the radio layer and writing it back asynchronously),
+     * this static buffer would race with the next call's memcpy. The
+     * contract is documented here so a future SDK upgrade can revisit it:
+     *   - If zero-copy is introduced, s_frame_buf must become per-call
+     *     malloc'd (and freed in a TX-done callback), OR guarded by a
+     *     "TX done" semaphore with the caller blocking until completion.
+     *   - Verify with a 1-packet stress test (back-to-back rawtx_stream_send
+     *     with no delay) that no on-air corruption occurs on the target SDK.
+     *
+     * single-threaded contract: only stream_task_fn calls this (via
+     * transport_send), so no mutex is needed for the static buffer. */
     esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, s_frame_buf, total_len, false);
 
     if (err != ESP_OK)
