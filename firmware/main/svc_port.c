@@ -534,6 +534,16 @@ void svc_port_set_channels(uint8_t channels)
     xSemaphoreGive(s_mutex);
 }
 
+uint8_t svc_port_get_channels(void)
+{
+    if (!s_mutex)
+        return s_channels;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint8_t ch = s_channels;
+    xSemaphoreGive(s_mutex);
+    return ch;
+}
+
 void svc_port_set_error(uint8_t error_code)
 {
     if (!s_mutex)
@@ -707,6 +717,17 @@ static void build_info_payload(svc_info_payload_t *info)
      * the server always sees what's actually running. */
     info->transport_mode = stream_mode_current_transport();
 
+    /* FIX (B3/channels-desync + lock-ordering): read channels BEFORE taking
+     * s_mutex. streaming_get_channels() may call config_get_copy() (which
+     * takes the config_mgr mutex). Calling it under s_mutex would nest two
+     * mutexes — not a deadlock (config_mgr never calls back into svc_port),
+     * but bad lock-ordering hygiene. Reading channels here (outside s_mutex)
+     * is safe: channel count is a single uint8_t, and the brief window
+     * between this read and the mutex-protected info->channels assignment
+     * can at worst show a one-packet-stale value. */
+    extern uint8_t streaming_get_channels(void);
+    uint8_t channels_snapshot = streaming_get_channels();
+
     /* FIX (L22): capture s_state into a local inside the mutex and use the
      * local after release. The previous code re-read s_state without the
      * mutex at line 614, which could race with a concurrent state change. */
@@ -716,17 +737,7 @@ static void build_info_payload(svc_info_payload_t *info)
     info->status = (state_local == SVC_STREAMING) ? SVC_STATUS_STREAMING : SVC_STATUS_IDLE;
     info->error = s_error_code;
     info->packets_sent = s_packets_sent;
-    /* FIX (B3): use streaming_get_channels() (the ACTIVE stream's actual
-     * channel count) instead of s_channels (which AT+CH updates immediately
-     * before HOTRESTART applies the change). This prevents INFO/STATUS from
-     * reporting the NEW channel count while the OLD stream is still running
-     * with the OLD count — a desync that could cause the receiver to
-     * mis-allocate WaveOut buffers. When no stream is active,
-     * streaming_get_channels() returns the configured (NVS) value. */
-    {
-        extern uint8_t streaming_get_channels(void);
-        info->channels = streaming_get_channels();
-    }
+    info->channels = channels_snapshot;
     xSemaphoreGive(s_mutex);
 
     /* Only override status to ERROR when streaming.

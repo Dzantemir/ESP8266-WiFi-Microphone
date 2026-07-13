@@ -86,6 +86,14 @@ bool svc_port_get_server_ip(uint32_t *ip);
  * count from NVS config. */
 void svc_port_set_channels(uint8_t channels);
 
+/* FIX (B3/channels-desync): get the CONFIG channel count (what will be
+ * applied on the next stream start). Updated immediately by AT+CH.
+ * Use this for INFO/STATUS when no stream is active (IDLE) so the receiver
+ * sees the pending channel count, not a stale value from the last stream.
+ * When a stream IS active, use streaming_get_channels() instead — it
+ * returns the channel count the running stream is actually using. */
+uint8_t svc_port_get_channels(void);
+
 /* Refresh broadcast address after IP change. */
 void svc_port_update_broadcast(void);
 

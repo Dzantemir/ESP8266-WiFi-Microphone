@@ -1651,22 +1651,38 @@ static void cmd_factory(void)
 /* FIX (UART0/B9): AT+LOG implementation.
  *
  * Problem: AT commands and ESP_LOG output share UART0 on ESP8266 (UART1 is
- * TX-only on GPIO2, a boot strap pin). Log lines (e.g. "I (1234) main: ...")
- * mixed with AT responses (e.g. "OK\r\n+STATUS:...") break host-side AT
- * parsers that expect strict +CMD:/OK/ERROR framing.
+ * TX-only on GPIO2, a boot strap pin). Log lines mixed with AT responses
+ * break host-side AT parsers.
  *
- * Solution: AT+LOG=0 silences all ESP_LOG output by setting every tag's
- * level to ESP_LOG_NONE. AT+LOG=1 restores the previous levels. The default
- * level is controlled by CONFIG_LOG_DEFAULT_LEVEL (menuconfig).
+ * Solution: AT+LOG=0 redirects ALL log output via esp_log_set_putchar() —
+ * the ESP8266 RTOS SDK v3.4 API (NOT esp_log_set_vprintf which is ESP-IDF
+ * only). esp_log_set_putchar replaces the per-character output function
+ * for ALL log tags/levels at once.
  *
- * This is the cheapest fix that doesn't require hardware changes (unlike
- * routing logs to UART1, which needs GPIO2 free). Production builds can
- * also set CONFIG_LOG_DEFAULT_LEVEL=0 to disable logs entirely at compile
- * time. */
+ * AT+LOG=1 restores the original putchar function (saved at first mute).
+ *
+ * NOTE: AT responses use uart_write_bytes() directly, NOT esp_log — so
+ * they are NOT affected by this mute and always reach UART0.
+ *
+ * WHY NOT esp_log_level_set("*, ESP_LOG_NONE")?
+ *   1. It's a no-op macro if CONFIG_LOG_SET_LEVEL is not defined in menuconfig.
+ *   2. Even with CONFIG_LOG_SET_LEVEL, the ESP_LOGI/W/E macros do a
+ *      COMPILE-TIME check (LOG_LOCAL_LEVEL >= level) — if the compile-time
+ *      level allows INFO, ESP_LOGI still calls esp_log_write(), and the
+ *      runtime level check is inside esp_log_write, not the macro.
+ *      esp_log_set_putchar bypasses all of that by replacing the output
+ *      function itself. */
 
-/* Track whether logs are currently muted, so AT+LOG? can report the state
- * and so AT+LOG=1 can restore. We don't save the per-tag levels — we just
- * restore to CONFIG_LOG_DEFAULT_LEVEL (the compile-time default). */
+/* No-op log putchar function — swallows ALL log output character by character. */
+static int log_putchar_noop(int ch)
+{
+    (void)ch;
+    return ch;
+}
+
+/* Saved original putchar function (the SDK default, writes to UART0).
+ * Captured at first AT+LOG=0 call, reused for AT+LOG=1 restore. */
+static putchar_like_t s_orig_putchar = NULL;
 static bool s_logs_muted = false;
 
 static void cmd_log_set(const char *args)
@@ -1682,21 +1698,25 @@ static void cmd_log_set(const char *args)
 
     if (val == 0)
     {
-        /* Mute: set all tags to ESP_LOG_NONE. */
-        esp_log_level_set("*", ESP_LOG_NONE);
-        s_logs_muted = true;
-        at_send_data("+LOG:logs muted (ESP_LOG_NONE)\r\n");
+        /* Mute: save the original putchar on first call, then redirect to
+         * our no-op function. This suppresses ALL log output (all tags,
+         * all levels) by replacing the per-character output function. */
+        if (!s_logs_muted)
+        {
+            s_orig_putchar = esp_log_set_putchar(log_putchar_noop);
+            s_logs_muted = true;
+        }
+        at_send_data("+LOG:logs muted (putchar redirected to noop)\r\n");
         at_send_ok();
     }
     else if (val == 1)
     {
-        /* Unmute: restore to the compile-time default level. */
-#if defined(CONFIG_LOG_DEFAULT_LEVEL)
-        esp_log_level_set("*", (esp_log_level_t)CONFIG_LOG_DEFAULT_LEVEL);
-#else
-        esp_log_level_set("*", ESP_LOG_INFO);
-#endif
-        s_logs_muted = false;
+        /* Unmute: restore the original putchar (writes to UART0). */
+        if (s_logs_muted && s_orig_putchar)
+        {
+            esp_log_set_putchar(s_orig_putchar);
+            s_logs_muted = false;
+        }
         at_send_data("+LOG:logs restored\r\n");
         at_send_ok();
     }

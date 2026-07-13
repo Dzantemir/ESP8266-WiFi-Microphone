@@ -192,14 +192,35 @@ bool streaming_frame_ms_known(void)
     return s_frame_ms_known;
 }
 
-/* FIX (B3): accessor for the ACTIVE stream's channel count. svc_port's
- * build_info_payload uses this (instead of its own s_channels which can be
- * updated by AT+CH before the stream actually restarts) so INFO packets
- * always report the channel count the running stream is actually using.
- * If no stream is active, returns the configured (NVS) channel count. */
+/* FIX (B3/channels-desync): dual-path channel count for INFO/STATUS.
+ *
+ *   - Stream ACTIVE: return main::s_channels (the channel count the
+ *     running stream is ACTUALLY using). Prevents B3 desync where
+ *     AT+CH=2 updates NVS but the stream is still 1 ch — INFO must
+ *     report 1 so the receiver doesn't mis-allocate stereo buffers.
+ *
+ *   - Stream NOT active (IDLE / boot / between stop and start): return
+ *     the NVS config channel count (what the NEXT stream will use).
+ *     This fixes the user's bug: after AT+CH=2 in IDLE, INFO now shows
+ *     "stereo" immediately, without waiting for start_streaming().
+ *
+ * CRITICAL: config_get_copy() takes the config_mgr mutex (NOT svc_port's
+ * s_mutex), so calling this from build_info_payload (which holds s_mutex)
+ * does NOT deadlock. However, for lock-ordering hygiene, build_info_payload
+ * calls this BEFORE taking s_mutex.
+ *
+ * Race safety: streaming_is_active() reads the ACTIVE bit atomically.
+ * In start_streaming(), ACTIVE is set AFTER s_channels is updated, so a
+ * concurrent read either sees ACTIVE=0 (returns NVS, which equals the
+ * about-to-be-set s_channels) or ACTIVE=1 (returns new s_channels). */
 uint8_t streaming_get_channels(void)
 {
-    return s_channels;
+    if (streaming_is_active())
+        return s_channels;
+    /* IDLE: return the config (pending) channel count from NVS. */
+    device_config_t cfg;
+    config_get_copy(&cfg);
+    return channel_format_to_count(cfg.channel_format);
 }
 
 /* ---- Stream control API (for AT commands) ---- */
