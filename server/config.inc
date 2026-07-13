@@ -102,16 +102,39 @@
 ' deadlocked when GUI was in WaitForSingleObject. PostMessage is async.
 %WM_APP_LOG       = %WM_USER + 600
 
-' ---- Jitter Buffer / PLC / Adaptive ----
-%JITTER_INITIAL   = 10    ' FIX (CLICKS-A1): was 6. ~200ms prebuffer absorbs WiFi cold-start
-                                  ' jitter (DNS, DHCP, ESP I2S DMA warmup) that caused underrun-
-                                  ' clicks in the first 1-3 seconds. With burst-submit (A2) the
-                                  ' prebuffer actually accumulates now, so 10 frames = 200ms is
-                                  ' real buffer depth, not just a counter.
-%JITTER_MIN       = 6     ' FIX (CLICKS-A1): was 5. Raised to match new JITTER_INITIAL floor.
-%JITTER_MAX       = 12    ' FIX (CLICKS-A1): was 8. Raised to allow adaptive growth for bad WiFi.
-%JITTER_ADAPT_MS  = 10000 ' Adaptive adjustment interval (ms)
-%JITTER_UNDERRUN_THRESHOLD = 2  ' Underruns in interval to trigger increase
+' ---- PCM Ring Buffer / Jitter depth (ms) / Adaptive ----
+' GROK-RINGBUFFER refactor: jitter is now a bytes-level PCM ring buffer
+' (single-writer/reader, AudioThread only). The constants below express
+' jitter DEPTH in milliseconds, not frames. bytesPerMs is computed from
+' the actual WaveOut rate/channels/bits, then target/min/max are derived
+' as bytesPerMs * JITTER_*_MS. Ring capacity is fixed at 256KB (enough
+' for ~500ms of 48k/16/mono or ~178ms of 48k/24/stereo — comfortably
+' above JITTER_MAX_MS=200ms with headroom for bursty WiFi).
+' Adaptive is GROW-ONLY (no shrink) per Grok response_4 step 7: simpler,
+' avoids oscillation, and the ring drops oldest on overflow so shrink
+' isn't needed for correctness.
+%JITTER_INITIAL_MS = 120   ' Target ring depth (ms) at stream start / reopen
+%JITTER_MIN_MS     = 80   ' Soft-refill threshold after first underrun (ms)
+%JITTER_MAX_MS     = 200   ' Adaptive grow ceiling (ms) for bad WiFi
+%JITTER_ADAPT_MS   = 30000 ' Adaptive grow check interval (ms)
+%JITTER_UNDERRUN_THRESHOLD = 1  ' Underruns in interval to trigger grow
+%RING_CAP_BYTES    = 262144   ' 256 KB ring capacity (HeapAlloc'd per device)
+' ---- BWSOLA PLC (per Yeh et al. 2013) ----
+' Bilateral Waveform Similarity Overlap-Add for Packet Loss Concealment.
+' When a packet is lost, BWSOLA reconstructs it using BOTH the previous good
+' packet (L_WSOLA) AND the next good packet (R_WSOLA) - hence "bilateral".
+' Voiced/unvoiced detection via autocorrelation picks one of 4 strategies:
+' BV (both voiced), PV (prev voiced/next unvoiced), NV (mirror), BU (both unvoiced).
+' See /tmp/bwsola_original.txt for the paper.
+'
+' Master switch: 0 = simple frame-repeat PLC (V2 behavior), 1 = BWSOLA PLC.
+' When enabled, AudioThread forces 16-bit WaveOut (BWSOLA operates on INTEGER
+' PCM; 24-bit ESP PCM is down-converted via the existing >>8 path).
+%BWSOLA_PLC_ENABLE    = 1      ' master switch (0 = simple frame-repeat PLC)
+%BWSOLA_PITCH_MIN     = 80     ' min pitch period (samples @ 48kHz, per-channel)
+%BWSOLA_PITCH_MAX     = 400    ' max pitch period (samples @ 48kHz, per-channel)
+%BWSOLA_VOICED_THRESH = 30     ' ACF threshold /100 (0.30) for voiced decision
+%BWSOLA_SEARCH_Q      = 4      ' search region = frameLen / Q (paper uses 4)
 
 ' ---- Startup click suppression ----
 ' Skip the first N ms of received audio after stream start. The INMP441 I2S

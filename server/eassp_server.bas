@@ -139,7 +139,8 @@ GLOBAL g_dumpBits       AS LONG     ' 16 or 24 (PCM), 16 (ADPCM decoded)
 GLOBAL g_dumpDataSize   AS QUAD     ' bytes written to data chunk
 GLOBAL g_dumpFileIdx    AS LONG     ' file split index (1, 2, 3...)
 GLOBAL g_dumpBaseName   AS STRING   ' base filename without extension
-GLOBAL g_dumpSeqCounter AS LONG     ' to detect format change mid-dump
+' FIX (AUDIT-ANTON#5): removed GLOBAL g_dumpSeqCounter - it was declared
+' and zeroed but never incremented or read anywhere. Dead variable.
 
 ' g_wfFormat removed - was unused (each AudioThread creates its own local wfFmt)
 
@@ -1522,9 +1523,18 @@ MACRO ResetPipelineState()
     stepIndex  = 0
     predictor2 = 0
     stepIndex2 = 0
-    ' Jitter buffer: force re-prebuffer from scratch
-    jitterPrebuffering = 1
-    jitterFilled = 0
+    ' Ring buffer reset (GROK-RINGBUFFER): clear ring + gate state so the
+    ' next iteration re-prebuffers from scratch. ringEverStarted is NOT reset
+    ' here (kept 1 after first start so subsequent reconnects use the faster
+    ' ringMinBytes refill gate instead of full ringTargetBytes prebuffer).
+    ringW = 0
+    ringR = 0
+    ringUsed = 0
+    ringPlaying = 0
+    frameBytes = 0
+    underrunCount = 0
+    overflowCount = 0
+    lastAdaptTick = GetTickCount()
     ' Startup skip + fade-in (1s skip + 1s fade, same as cold start)
     skipFramesRemaining = 999
     fadeSamplesRemaining = 0
@@ -1532,6 +1542,12 @@ MACRO ResetPipelineState()
     plcActive = 0
     lastPcmPtr = 0
     lastPcmLen = 0
+    ' BWSOLA PLC pending state (reset on pipeline reset so a stale plcPending
+    ' from before the reset doesn't fire reconstruction on the next good packet
+    ' using a stale/invalid plcLPtr).
+    plcPending = 0
+    plcLPtr = 0
+    plcLLen = 0
     ' FIX (GROK-4): CRITICAL - reset pktRecv so the OOO detection on the
     ' next packet doesn't misfire. With pktRecv > 0 and lastSeq = 0,
     ' seqDiff = (seqNum - 0 - 1) AND 0xFFFF would be > 32768 for any
@@ -1551,6 +1567,488 @@ MACRO ResetPipelineState()
     g_Devs(idx).dwLastPktTick = g_Devs(idx).dwStreamStart
     LeaveCriticalSection g_csDev
 END MACRO
+
+' ============================================================================
+'  PCM RING BUFFER HELPERS (GROK-RINGBUFFER refactor)
+'  Single-writer (producer = decode path) / single-reader (consumer =
+'  FeedWaveOut GOSUB). AudioThread only - no locks needed.
+'
+'  NOTE on CopyMemory / FillMemory: these are ALREADY declared as SUBs in
+'  WinBase.inc (part of the Win32API.INC chain). Signatures:
+'    SUB CopyMemory (BYVAL pDest AS DWORD, BYVAL pSrc AS DWORD, BYVAL ncBytes AS LONG)
+'    SUB FillMemory (BYVAL pDest AS DWORD, BYVAL ncBytes AS DWORD, BYVAL nValue AS BYTE)
+'  Do NOT add a DECLARE here - it would clash ("Duplicate declaration").
+' ============================================================================
+
+' RingWrite - copy nBytes from pSrc into ring. On overflow: drop OLDEST bytes
+' until there is room (keeps newest audio, advances ringR). Returns 1 if any
+' oldest was dropped, 0 otherwise.
+' ringW/ringR/ringUsed are passed BYREF (PB default) and updated in place.
+FUNCTION RingWrite(BYVAL pRing AS DWORD, BYVAL ringCap AS LONG, _
+                   BYREF ringW AS LONG, BYREF ringR AS LONG, BYREF ringUsed AS LONG, _
+                   BYVAL pSrc AS DWORD, BYVAL nBytes AS LONG) AS LONG
+    LOCAL dropped AS LONG, chunk AS LONG, bytesLeft AS LONG
+    LOCAL pD AS DWORD, pS AS DWORD
+
+    IF nBytes <= 0 OR pRing = 0 OR pSrc = 0 THEN
+        FUNCTION = 0
+        EXIT FUNCTION
+    END IF
+    ' Frame larger than whole ring: keep only the last ringCap bytes
+    IF nBytes > ringCap THEN
+        pSrc   = pSrc + (nBytes - ringCap)
+        nBytes = ringCap
+    END IF
+
+    dropped = 0
+    ' Make room by dropping oldest bytes (advance ringR) until fit
+    DO WHILE ringUsed + nBytes > ringCap
+        chunk = ringUsed + nBytes - ringCap
+        IF chunk > ringUsed THEN chunk = ringUsed
+        IF chunk <= 0 THEN EXIT DO
+        ringR = (ringR + chunk) MOD ringCap
+        ringUsed = ringUsed - chunk
+        dropped = 1
+    LOOP
+
+    ' Copy in chunks (may wrap around ringW -> 0)
+    bytesLeft = nBytes
+    pS = pSrc
+    DO WHILE bytesLeft > 0
+        chunk = ringCap - ringW
+        IF chunk > bytesLeft THEN chunk = bytesLeft
+        pD = pRing + ringW
+        CopyMemory pD, pS, chunk
+        ringW = (ringW + chunk) MOD ringCap
+        pS = pS + chunk
+        bytesLeft = bytesLeft - chunk
+    LOOP
+    ringUsed = ringUsed + nBytes
+    FUNCTION = dropped
+END FUNCTION
+
+' RingRead - copy nBytes from ring to pDst if available.
+' Returns nBytes on success, 0 if not enough data (or invalid params).
+' ringR/ringUsed are passed BYREF and updated in place. ringW is read-only
+' here but kept in signature for symmetry with RingWrite.
+FUNCTION RingRead(BYVAL pRing AS DWORD, BYVAL ringCap AS LONG, _
+                  BYREF ringW AS LONG, BYREF ringR AS LONG, BYREF ringUsed AS LONG, _
+                  BYVAL pDst AS DWORD, BYVAL nBytes AS LONG) AS LONG
+    LOCAL bytesLeft AS LONG, chunk AS LONG
+    LOCAL pS AS DWORD, pD AS DWORD
+
+    IF nBytes <= 0 OR ringUsed < nBytes OR pRing = 0 OR pDst = 0 THEN
+        FUNCTION = 0
+        EXIT FUNCTION
+    END IF
+
+    bytesLeft = nBytes
+    pD = pDst
+    DO WHILE bytesLeft > 0
+        chunk = ringCap - ringR
+        IF chunk > bytesLeft THEN chunk = bytesLeft
+        pS = pRing + ringR
+        CopyMemory pD, pS, chunk
+        ringR = (ringR + chunk) MOD ringCap
+        pD = pD + chunk
+        bytesLeft = bytesLeft - chunk
+    LOOP
+    ringUsed = ringUsed - nBytes
+    FUNCTION = nBytes
+END FUNCTION
+
+' RingFillZero - write nBytes of silence (zeros) to pDst. Used for underrun
+' injection in FeedWaveOut (one silence frame to avoid hard WaveOut click).
+SUB RingFillZero(BYVAL pDst AS DWORD, BYVAL nBytes AS LONG)
+    IF pDst = 0 OR nBytes <= 0 THEN EXIT SUB
+    FillMemory pDst, nBytes, 0
+END SUB
+
+' ===========================================================================
+'  BWSOLA PLC HELPERS (per Yeh et al. 2013, Bilateral WSOLA for PLC)
+'  Operates on 16-bit INTEGER PCM. For stereo, voiced detection searches
+'  only same-channel lags (STEP nCh) so the detected pitch is the true
+'  per-channel pitch period (scaled to flat samples). Reconstruction
+'  operates on the flat interleaved buffer (treats L+R as one stream -
+'  the algorithm is waveform-similarity based and works on interleaved
+'  data; the pitch continuation preserves channel interleaving naturally
+'  because the flat pitch period is nCh * per-channel-pitch).
+'
+'  NOTE: %BWSOLA_PITCH_MIN/MAX are PER-CHANNEL samples (e.g. 80-400 @48kHz).
+'  BWSOLA_IsVoiced/BWSOLA_FindPitch multiply by nCh internally to get the
+'  flat-sample search range, so callers pass the flat buffer + flat nSmp.
+' ===========================================================================
+
+' BWSOLA_IsVoiced - Detect voiced speech via normalized autocorrelation.
+' Computes ACF(lag) for lag in [PITCH_MIN*nCh .. PITCH_MAX*nCh] step nCh
+' (same-channel lags only for stereo), normalizes by ACF(0), returns 1 if
+' max normalized ACF > threshold, 0 otherwise.
+' DEVIATION from spec: added nCh parameter (spec lists only pPcm, nSmp) so
+' the per-channel pitch range is correctly scaled for stereo. Without this,
+' stereo detection would search flat lags 80-400 = per-channel 40-200,
+' missing high-pitched voices.
+FUNCTION BWSOLA_IsVoiced(BYVAL pPcm AS INTEGER PTR, BYVAL nSmp AS LONG, _
+                         BYVAL nCh AS LONG) AS LONG
+    LOCAL i AS LONG, lag AS LONG
+    LOCAL acf0 AS QUAD, acfLag AS QUAD
+    LOCAL maxNacf AS DOUBLE, nacf AS DOUBLE
+    LOCAL s0 AS LONG, sLag AS LONG
+    LOCAL pitchMin AS LONG, pitchMax AS LONG
+
+    IF nCh < 1 THEN nCh = 1
+    IF nCh > 2 THEN nCh = 2
+    pitchMin = %BWSOLA_PITCH_MIN * nCh
+    pitchMax = %BWSOLA_PITCH_MAX * nCh
+    ' Need at least pitchMin+1 samples to compute ACF at the minimum lag.
+    ' Shorter frames (e.g. 5ms @ 48kHz = 240 samples) can still detect voices
+    ' with pitch >= smpRate/nSmp; the inner loop EXIT FORs when lag >= nSmp.
+    IF nSmp < pitchMin + 1 THEN
+        FUNCTION = 0
+        EXIT FUNCTION
+    END IF
+
+    ' ACF(0) = sum of x[i]^2 (energy). QUAD accumulator avoids LONG overflow
+    ' (16-bit^2 * 480 samples ~ 5e9 > LONG max 2.1e9).
+    acf0 = 0
+    FOR i = 0 TO nSmp - 1
+        s0 = @pPcm[i]
+        acf0 = acf0 + CQUD(s0) * CQUD(s0)
+    NEXT i
+    IF acf0 = 0 THEN
+        FUNCTION = 0
+        EXIT FUNCTION
+    END IF
+
+    ' Find max normalized ACF in [pitchMin..pitchMax], step nCh (same-channel)
+    maxNacf = 0
+    FOR lag = pitchMin TO pitchMax STEP nCh
+        IF lag >= nSmp THEN EXIT FOR
+        acfLag = 0
+        FOR i = 0 TO nSmp - lag - 1
+            s0 = @pPcm[i]
+            sLag = @pPcm[i + lag]
+            acfLag = acfLag + CQUD(s0) * CQUD(sLag)
+        NEXT i
+        nacf = CDBL(acfLag) / CDBL(acf0)
+        IF nacf > maxNacf THEN maxNacf = nacf
+    NEXT lag
+
+    IF maxNacf > (CDBL(%BWSOLA_VOICED_THRESH) / 100.0#) THEN
+        FUNCTION = 1
+    ELSE
+        FUNCTION = 0
+    END IF
+END FUNCTION
+
+' BWSOLA_FindPitch - Find pitch period via normalized autocorrelation.
+' Returns best lag (pitch period in FLAT samples) in
+' [PITCH_MIN*nCh .. PITCH_MAX*nCh], or 0 if no ACF peak above threshold
+' (unvoiced). Used internally by BWSOLA_PLC_Frame to get the pitch for
+' continuation. The returned pitch is already in flat samples (= nCh *
+' per-channel pitch), suitable for direct use as a flat-buffer stride.
+FUNCTION BWSOLA_FindPitch(BYVAL pPcm AS INTEGER PTR, BYVAL nSmp AS LONG, _
+                          BYVAL nCh AS LONG) AS LONG
+    LOCAL i AS LONG, lag AS LONG
+    LOCAL acf0 AS QUAD, acfLag AS QUAD
+    LOCAL maxNacf AS DOUBLE, nacf AS DOUBLE
+    LOCAL bestLag AS LONG
+    LOCAL s0 AS LONG, sLag AS LONG
+    LOCAL pitchMin AS LONG, pitchMax AS LONG
+
+    IF nCh < 1 THEN nCh = 1
+    IF nCh > 2 THEN nCh = 2
+    pitchMin = %BWSOLA_PITCH_MIN * nCh
+    pitchMax = %BWSOLA_PITCH_MAX * nCh
+    ' Need at least pitchMin+1 samples to compute ACF at the minimum lag.
+    ' Shorter frames (e.g. 5ms @ 48kHz = 240 samples) can still detect voices
+    ' with pitch >= smpRate/nSmp; the inner loop EXIT FORs when lag >= nSmp.
+    IF nSmp < pitchMin + 1 THEN
+        FUNCTION = 0
+        EXIT FUNCTION
+    END IF
+
+    acf0 = 0
+    FOR i = 0 TO nSmp - 1
+        s0 = @pPcm[i]
+        acf0 = acf0 + CQUD(s0) * CQUD(s0)
+    NEXT i
+    IF acf0 = 0 THEN
+        FUNCTION = 0
+        EXIT FUNCTION
+    END IF
+
+    maxNacf = 0
+    bestLag = 0
+    FOR lag = pitchMin TO pitchMax STEP nCh
+        IF lag >= nSmp THEN EXIT FOR
+        acfLag = 0
+        FOR i = 0 TO nSmp - lag - 1
+            s0 = @pPcm[i]
+            sLag = @pPcm[i + lag]
+            acfLag = acfLag + CQUD(s0) * CQUD(sLag)
+        NEXT i
+        nacf = CDBL(acfLag) / CDBL(acf0)
+        IF nacf > maxNacf THEN
+            maxNacf = nacf
+            bestLag = lag
+        END IF
+    NEXT lag
+
+    IF maxNacf > (CDBL(%BWSOLA_VOICED_THRESH) / 100.0#) THEN
+        FUNCTION = bestLag
+    ELSE
+        FUNCTION = 0
+    END IF
+END FUNCTION
+
+' BWSOLA_BestCorr - Cross-correlation search (Eq 2, 6 of paper).
+' Searches for offset in [0..search] that maximizes sum(pA[j] * pB[j+offset]).
+' Returns best offset. QUAD accumulator avoids LONG overflow on long overlaps.
+' Used for WSOLA-style alignment (available for future enhancement of the
+' BV strategy; currently BWSOLA_PLC_Frame uses pitch-period continuation
+' which is simpler and adequate for 1-packet loss).
+FUNCTION BWSOLA_BestCorr(BYVAL pA AS INTEGER PTR, BYVAL pB AS INTEGER PTR, _
+                         BYVAL nFlat AS LONG, BYVAL search AS LONG) AS LONG
+    LOCAL offset AS LONG, j AS LONG
+    LOCAL corr AS QUAD, maxCorr AS QUAD
+    LOCAL bestOff AS LONG
+    LOCAL sA AS LONG, sB AS LONG
+
+    IF nFlat <= 0 OR search < 0 THEN
+        FUNCTION = 0
+        EXIT FUNCTION
+    END IF
+
+    bestOff = 0
+    maxCorr = -&H7FFFFFFFFFFFFFFF&&
+
+    FOR offset = 0 TO search
+        corr = 0
+        FOR j = 0 TO nFlat - 1
+            sA = @pA[j]
+            sB = @pB[j + offset]
+            corr = corr + CQUD(sA) * CQUD(sB)
+        NEXT j
+        IF corr > maxCorr THEN
+            maxCorr = corr
+            bestOff = offset
+        END IF
+    NEXT offset
+
+    FUNCTION = bestOff
+END FUNCTION
+
+' BWSOLA_Crossfade16 - Linear OLA crossfade from pA to pB over nFlat samples.
+' pOut[i] = pA[i] * (1 - g) + pB[i] * g, where g = i / (nFlat - 1).
+' Endpoint-safe: nFlat=1 copies pB[0]. Uses DOUBLE gain, CINT cast for INT16.
+' Safe for pA == pOut (self-referential): each pOut[i] is written AFTER
+' reading pA[i] = pOut[i], and earlier indices are never re-read.
+SUB BWSOLA_Crossfade16(BYVAL pA AS INTEGER PTR, BYVAL pB AS INTEGER PTR, _
+                       BYVAL nFlat AS LONG, BYVAL pOut AS INTEGER PTR)
+    LOCAL i AS LONG
+    LOCAL g AS DOUBLE
+    LOCAL sA AS LONG, sB AS LONG
+
+    IF nFlat <= 0 THEN EXIT SUB
+    IF nFlat = 1 THEN
+        @pOut[0] = @pB[0]
+        EXIT SUB
+    END IF
+
+    FOR i = 0 TO nFlat - 1
+        g = CDBL(i) / CDBL(nFlat - 1)
+        sA = @pA[i]
+        sB = @pB[i]
+        @pOut[i] = CINT(CDBL(sA) * (1.0# - g) + CDBL(sB) * g)
+    NEXT i
+END SUB
+
+' BWSOLA_PLC_Frame - Main bilateral PLC reconstruction (per Yeh et al. 2013).
+' Takes L_WSOLA (previous good packet) + R_WSOLA (next good packet), produces
+' a concealed frame for the lost packet. Lengths are in SAMPLES (flat,
+' interleaved if stereo). Returns bytes written (outLen*2) or 0 on failure.
+'
+' Strategy selection (Section 3.1-3.4):
+'   BV (both voiced)     - bilateral pitch continuation + linear crossfade
+'   PV (prev voiced)     - extend L forward, amplitude-adjust toward R energy
+'   NV (next voiced)     - extend R backward, amplitude-adjust toward L energy
+'   BU (both unvoiced)   - linear crossfade L tail -> R head
+'
+' PRACTICAL SIMPLIFICATIONS vs paper:
+'   - Pitch-period continuation instead of full WSOLA search-and-OLA for the
+'     extension (simpler, adequate for 1-packet loss where the gap is small).
+'   - BV uses a smooth bilateral linear crossfade (L cont at start -> R cont
+'     at end) instead of the paper's cross-correlation alignment (Eq 9) +
+'     reconstruction window (Eq 10). The bilateral blend achieves the same
+'     goal (using both L and R) with simpler code.
+'   - PV/NV amplitude adjustment per Eq 11-12 is applied per-sample (not as
+'     an OLA sum) since we generate continuation samples directly.
+FUNCTION BWSOLA_PLC_Frame(BYVAL pL AS INTEGER PTR, BYVAL lenL AS LONG, _
+                          BYVAL pR AS INTEGER PTR, BYVAL lenR AS LONG, _
+                          BYVAL pOut AS INTEGER PTR, BYVAL outLen AS LONG, _
+                          BYVAL nCh AS LONG) AS LONG
+    LOCAL i AS LONG, k AS LONG
+    LOCAL isVL AS LONG, isVR AS LONG
+    LOCAL pLflat AS LONG, pRflat AS LONG   ' pitch in flat samples
+    LOCAL g AS DOUBLE
+    LOCAL sA AS LONG, sB AS LONG
+    LOCAL srcIdx AS LONG
+    LOCAL energyL AS QUAD, energyR AS QUAD
+    LOCAL adjustFact AS DOUBLE
+
+    IF outLen <= 0 OR lenL <= 0 OR lenR <= 0 THEN
+        FUNCTION = 0
+        EXIT FUNCTION
+    END IF
+    IF pL = 0 OR pR = 0 OR pOut = 0 THEN
+        FUNCTION = 0
+        EXIT FUNCTION
+    END IF
+    IF nCh < 1 THEN nCh = 1
+    IF nCh > 2 THEN nCh = 2
+
+    ' Trivial 1-sample case: average L's last sample and R's first sample.
+    IF outLen = 1 THEN
+        sA = @pL[lenL - 1]
+        sB = @pR[0]
+        @pOut[0] = CINT((CDBL(sA) + CDBL(sB)) / 2.0#)
+        FUNCTION = 2
+        EXIT FUNCTION
+    END IF
+
+    ' Voiced detection + pitch finding on the flat interleaved stream.
+    ' BWSOLA_IsVoiced/BWSOLA_FindPitch multiply the per-channel pitch range
+    ' by nCh internally, so callers pass the flat buffer + flat sample count.
+    isVL = 0
+    isVR = 0
+    pLflat = 0
+    pRflat = 0
+    IF lenL >= (%BWSOLA_PITCH_MIN * nCh) + 1 THEN
+        isVL = BWSOLA_IsVoiced(pL, lenL, nCh)
+        IF isVL THEN
+            pLflat = BWSOLA_FindPitch(pL, lenL, nCh)
+            IF pLflat < nCh THEN pLflat = nCh   ' safety
+        END IF
+    END IF
+    IF lenR >= (%BWSOLA_PITCH_MIN * nCh) + 1 THEN
+        isVR = BWSOLA_IsVoiced(pR, lenR, nCh)
+        IF isVR THEN
+            pRflat = BWSOLA_FindPitch(pR, lenR, nCh)
+            IF pRflat < nCh THEN pRflat = nCh
+        END IF
+    END IF
+
+    IF isVL AND isVR THEN
+        ' ---- BV (Both Voiced): bilateral pitch continuation + linear crossfade
+        ' L continuation forward: repeat L's last pitch period.
+        ' R continuation backward: repeat R's first pitch period (reversed in
+        '   time so the END of output = R[pRflat-1], the sample "before" R[0]).
+        ' Linear crossfade g = i/(outLen-1): 0 at start (pure L cont), 1 at end
+        '   (pure R cont). Smoothly transitions L->R across the gap.
+        FOR i = 0 TO outLen - 1
+            ' L continuation at position i
+            srcIdx = (lenL - pLflat) + (i MOD pLflat)
+            IF srcIdx < 0 THEN srcIdx = 0
+            IF srcIdx >= lenL THEN srcIdx = lenL - 1
+            sA = @pL[srcIdx]
+            ' R continuation backward at position i
+            k = outLen - 1 - i     ' distance from end (backward in time)
+            srcIdx = (pRflat - 1) - (k MOD pRflat)
+            IF srcIdx < 0 THEN srcIdx = srcIdx + pRflat
+            IF srcIdx >= lenR THEN srcIdx = lenR - 1
+            IF srcIdx < 0 THEN srcIdx = 0
+            sB = @pR[srcIdx]
+            g = CDBL(i) / CDBL(outLen - 1)
+            @pOut[i] = CINT(CDBL(sA) * (1.0# - g) + CDBL(sB) * g)
+        NEXT i
+
+    ELSEIF isVL AND (isVR = 0) THEN
+        ' ---- PV (Prev voiced, Next unvoiced) ----
+        ' Extend L forward by pitch continuation; amplitude-adjust toward R's
+        ' (unvoiced) energy per Eq 11-12: A(n) = 1 - n*(Ev - Euv)/(Ev*(l-1)).
+        ' Ev = energy of L (voiced), Euv = energy of R (unvoiced).
+        energyL = 0
+        FOR i = 0 TO lenL - 1
+            sA = @pL[i]
+            energyL = energyL + CQUD(sA) * CQUD(sA)
+        NEXT i
+        energyR = 0
+        FOR i = 0 TO lenR - 1
+            sB = @pR[i]
+            energyR = energyR + CQUD(sB) * CQUD(sB)
+        NEXT i
+        FOR i = 0 TO outLen - 1
+            srcIdx = (lenL - pLflat) + (i MOD pLflat)
+            IF srcIdx < 0 THEN srcIdx = 0
+            IF srcIdx >= lenL THEN srcIdx = lenL - 1
+            sA = @pL[srcIdx]
+            IF energyL > 0 THEN
+                adjustFact = 1.0# - (CDBL(i) * CDBL(energyL - energyR) / _
+                                     (CDBL(energyL) * CDBL(outLen - 1)))
+                IF adjustFact < 0.0# THEN adjustFact = 0.0#
+                IF adjustFact > 2.0# THEN adjustFact = 2.0#
+            ELSE
+                adjustFact = 1.0#
+            END IF
+            @pOut[i] = CINT(CDBL(sA) * adjustFact)
+        NEXT i
+
+    ELSEIF (isVL = 0) AND isVR THEN
+        ' ---- NV (Prev unvoiced, Next voiced) - mirror of PV ----
+        ' Extend R backward by pitch continuation; amplitude-adjust toward L's
+        ' (unvoiced) energy. A(n) = 1 - n*(Ev - Euv)/(Ev*(l-1)) where now
+        ' Ev = energy of R (voiced), Euv = energy of L (unvoiced).
+        energyL = 0
+        FOR i = 0 TO lenL - 1
+            sA = @pL[i]
+            energyL = energyL + CQUD(sA) * CQUD(sA)
+        NEXT i
+        energyR = 0
+        FOR i = 0 TO lenR - 1
+            sB = @pR[i]
+            energyR = energyR + CQUD(sB) * CQUD(sB)
+        NEXT i
+        FOR i = 0 TO outLen - 1
+            k = outLen - 1 - i     ' distance from end (backward in time)
+            srcIdx = (pRflat - 1) - (k MOD pRflat)
+            IF srcIdx < 0 THEN srcIdx = srcIdx + pRflat
+            IF srcIdx >= lenR THEN srcIdx = lenR - 1
+            IF srcIdx < 0 THEN srcIdx = 0
+            sB = @pR[srcIdx]
+            IF energyR > 0 THEN
+                adjustFact = 1.0# - (CDBL(i) * CDBL(energyR - energyL) / _
+                                     (CDBL(energyR) * CDBL(outLen - 1)))
+                IF adjustFact < 0.0# THEN adjustFact = 0.0#
+                IF adjustFact > 2.0# THEN adjustFact = 2.0#
+            ELSE
+                adjustFact = 1.0#
+            END IF
+            @pOut[i] = CINT(CDBL(sB) * adjustFact)
+        NEXT i
+
+    ELSE
+        ' ---- BU (Both Unvoiced): linear crossfade L tail -> R head ----
+        ' Per Section 3.4: treat lost packet as noise, fade-in/fade-out.
+        ' Copy L's last outLen samples to pOut, then crossfade with R using
+        ' BWSOLA_Crossfade16 (self-referential: pA == pOut is safe).
+        IF lenL >= outLen THEN
+            FOR i = 0 TO outLen - 1
+                @pOut[i] = @pL[lenL - outLen + i]
+            NEXT i
+        ELSE
+            ' L shorter than outLen: zero-pad the front, then copy L
+            FOR i = 0 TO outLen - lenL - 1
+                @pOut[i] = 0
+            NEXT i
+            FOR i = 0 TO lenL - 1
+                @pOut[outLen - lenL + i] = @pL[i]
+            NEXT i
+        END IF
+        BWSOLA_Crossfade16 pOut, pR, outLen, pOut
+    END IF
+
+    FUNCTION = outLen * 2    ' bytes written (16-bit samples)
+END FUNCTION
 
 ' AudioThread - Per-device audio receive/decode/play thread
 '   Supports mono (1 DVI4 block) and stereo (2 independent DVI4 blocks).
@@ -1767,6 +2265,16 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
         outBits = 16               ' ADPCM: always 16-bit (dithered on ESP)
     END IF
 
+    ' BWSOLA PLC forces 16-bit WaveOut (BWSOLA operates on INTEGER PCM).
+    ' 24-bit ESP PCM is down-converted via the existing >>8 path in the
+    ' PCM passthrough block. ADPCM is already 16-bit, so this only
+    ' affects PCM codec with devBits=24.
+    IF %BWSOLA_PLC_ENABLE AND outBits = 24 THEN
+        AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+               ": BWSOLA forces 16-bit WaveOut (was 24-bit PCM)"
+        outBits = 16
+    END IF
+
     ' <<<DRIFT FIX>>> открываем WaveOut на ФАКТИЧЕСКОЙ частоте I2S ESP,
     ' иначе при 44100 Гц (реально 43860) буфер опустошается быстрее →
     ' underrun → пощипывание в LIVE (дамп чистый, т.к. пишет синхронно).
@@ -1890,30 +2398,50 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
     pktRecv = 0
     wIdx = 0
 
-    ' ---- Jitter Buffer / PLC / Adaptive state ----
-    LOCAL jitterTarget AS LONG     ' Current prebuffer target (adaptive)
-    LOCAL jitterFilled AS LONG     ' Frames accumulated in prebuffer phase
-    LOCAL jitterPrebuffering AS LONG  ' 1 = still prebuffering, 0 = playing
+    ' ---- PCM Ring Buffer / PLC / Adaptive state (GROK-RINGBUFFER) ----
+    LOCAL ringCap AS LONG          ' Ring capacity in bytes (= %RING_CAP_BYTES)
+    LOCAL ringPtr AS DWORD         ' HeapAlloc'd ring buffer (ringCap bytes)
+    LOCAL ringW AS LONG            ' Write index (next free byte)
+    LOCAL ringR AS LONG            ' Read index (next data byte)
+    LOCAL ringUsed AS LONG         ' Bytes currently in ring
+    LOCAL frameBytes AS LONG       ' Bytes per audio frame (locked from first played frame)
+    LOCAL ringTargetBytes AS LONG  ' Target ring depth (bytes) at start/refill
+    LOCAL ringMinBytes AS LONG     ' Soft-refill threshold after first underrun
+    LOCAL ringMaxBytes AS LONG     ' Adaptive grow ceiling
+    LOCAL ringPlaying AS LONG      ' 1 = consumer (FeedWaveOut) is active
+    LOCAL ringEverStarted AS LONG  ' 1 after first ring play ON (faster refill on reconnect)
     LOCAL underrunCount AS LONG    ' Underruns in current adaptation interval
-    ' FIX (GROK-5): separate counter for overflow events (queue full).
-    ' Previously overflow used underrunCount, mislabeling the event and
-    ' feeding it into the adaptive-grow decision (which would grow the
-    ' buffer when it was already full). Now overflows only increment this
-    ' counter; the adaptive logic can use it to SHRINK jitterTarget.
     LOCAL overflowCount AS LONG    ' Overflows in current adaptation interval
     LOCAL lastAdaptTick AS DWORD   ' Last adaptive adjustment time
-    ' FIX (log-fix-C): consecutive zero-underrun intervals (need 2 to decrease)
-    LOCAL zeroUnderrunIntervals AS LONG
+    LOCAL bytesPerMs AS LONG       ' actualSmpRate * nCh * (outBits/8) / 1000
+    LOCAL feedNeed AS LONG         ' Temp: bytes needed to (re)start consumer
+    LOCAL decodePtr AS DWORD       ' Decode always here, not into WaveOut slot
+
     LOCAL lastPcmPtr AS DWORD      ' Pointer to last decoded PCM (for PLC)
     LOCAL lastPcmLen AS LONG       ' Length of last decoded PCM (for PLC)
-    ' FIX (grok22#5): per-channel last sample for stereo PLC ramp.
-    ' Previously a single lastPcmLastSample held only L's last value,
-    ' so R was ramped using L's interpolation -> discontinuity on R.
-    ' Array index 0=L, 1=R (unused for mono).
+    ' FIX (grok22#5): per-channel last sample for stereo PLC ramp (reserved
+    ' for future PLC variants; current PLC uses simple frame-repeat).
     ' FIX (compile): PowerBASIC requires DIM (not LOCAL) for local arrays.
     DIM lastPcmLastSample(1) AS LOCAL LONG  ' Last sample value per channel
 
-    LOCAL plcActive AS LONG        ' 1 = PLC interpolation in progress
+    ' FIX (AUDIT-ANTON#7): plcActive is a RESERVED flag. Always 0 with the
+    ' current PLC design (frame-repeat via RingWrite). Kept for forward
+    ' compatibility with future PLC variants that may suppress lastPcm update.
+    LOCAL plcActive AS LONG
+    ' ---- BWSOLA PLC state (per Yeh et al. 2013) ----
+    ' Bilateral PLC: when a packet is lost, we CANNOT reconstruct immediately
+    ' because BWSOLA needs the NEXT good packet (R_WSOLA). So on loss detection
+    ' we COPY lastPcm into plcLBuf (stable storage - decodePtr will be
+    ' overwritten when we decode the current packet) and set plcPending. When
+    ' the next good packet arrives and is decoded, we run BWSOLA_PLC_Frame
+    ' using plcLBuf (L) + decodePtr (R), write the concealed frame to the ring,
+    ' THEN write the real current packet to the ring.
+    LOCAL plcPending AS LONG     ' >0 = loss detected, waiting for R_WSOLA
+    LOCAL plcLPtr AS DWORD       ' pointer to L_WSOLA (stable copy in plcLBuf)
+    LOCAL plcLLen AS LONG        ' length of L_WSOLA in BYTES
+    LOCAL plcLBuf AS DWORD       ' HeapAlloc'd stable buffer for L_WSOLA copy
+    LOCAL plcOutBuf AS DWORD     ' HeapAlloc'd buffer for BWSOLA_PLC_Frame output
+
 
     ' FIX (startup clicks): skip the first ~1 second of audio after stream
     ' start. The INMP441 I2S MEMS mic has a startup transient (DC offset
@@ -1931,21 +2459,109 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
     skipFramesRemaining = 999   ' large sentinel; replaced after first packet
     skipFrameMs = 20            ' default; updated from packet header
 
-    ' FIX (startup clicks): after the skip completes, apply a linear fade-in
-    ' over FADE_IN_MS (1 second) to smooth the silence→signal transition.
-    ' Even after 1 second of skip, the first played sample may have a small
-    ' DC step relative to the digital silence in WaveOut buffers — fade-in
-    ' ramps amplitude from 0 to 1 over 1 second, making the onset inaudible.
-    ' fadeSamplesRemaining = total samples in FADE_IN_MS, computed from the
-    ' actual sample rate (from the first packet). 0 = fade-in complete.
+    ' FIX (startup clicks): after the skip completes, apply a raised-cosine
+    ' fade-in over FADE_IN_MS (1 second) to smooth the silence->signal
+    ' transition. Even after 1 second of skip, the first played sample may
+    ' have a small DC step relative to the digital silence in WaveOut
+    ' buffers - fade-in ramps amplitude from 0 to 1 over 1 second, making
+    ' the onset inaudible. 0 = fade-in complete.
     LOCAL fadeSamplesRemaining AS LONG
     LOCAL fadeSamplesTotal AS LONG
     fadeSamplesRemaining = 0   ' armed when skip completes
     fadeSamplesTotal = 0
 
-    jitterTarget = %JITTER_INITIAL
-    jitterFilled = 0
-    jitterPrebuffering = 1
+    ' ---- Allocate ring + decode buffers (GROK-RINGBUFFER) ----
+    ' Ring must be allocated AFTER waveOutOpen (we need actualSmpRate/outBits
+    ' to compute bytesPerMs / target depth). Same fatal-cleanup pattern as
+    ' the pcmPtrs alloc failure above.
+    ringCap = %RING_CAP_BYTES
+    ringPtr = HeapAlloc(g_hHeap, %HEAP_ZERO_MEMORY, ringCap)
+    IF ringPtr = 0 THEN
+        AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & ": RingAlloc FAILED"
+        FOR wIdx2 = 0 TO %NUM_WAVE_BUFS - 1
+            IF pcmPtrs(wIdx2) THEN HeapFree g_hHeap, 0, pcmPtrs(wIdx2)
+        NEXT wIdx2
+        ERRCLEAR
+        IF devTransport = 1 THEN TCP CLOSE #fNum ELSE UDP CLOSE #fNum
+        EnterCriticalSection g_csDev
+        g_Devs(idx).fAudioFile = 0
+        g_Devs(idx).dwRunning  = 0
+        g_Devs(idx).dwHBActive = 0
+        g_Devs(idx).dwStatus   = %STS_IDLE
+        LeaveCriticalSection g_csDev
+        FUNCTION = 0 : EXIT FUNCTION
+    END IF
+
+    decodePtr = HeapAlloc(g_hHeap, 0, bufSz)
+    IF decodePtr = 0 THEN
+        AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & ": decodeBuf alloc FAILED"
+        HeapFree g_hHeap, 0, ringPtr
+        FOR wIdx2 = 0 TO %NUM_WAVE_BUFS - 1
+            IF pcmPtrs(wIdx2) THEN HeapFree g_hHeap, 0, pcmPtrs(wIdx2)
+        NEXT wIdx2
+        ERRCLEAR
+        IF devTransport = 1 THEN TCP CLOSE #fNum ELSE UDP CLOSE #fNum
+        EnterCriticalSection g_csDev
+        g_Devs(idx).fAudioFile = 0
+        g_Devs(idx).dwRunning  = 0
+        g_Devs(idx).dwHBActive = 0
+        g_Devs(idx).dwStatus   = %STS_IDLE
+        LeaveCriticalSection g_csDev
+        FUNCTION = 0 : EXIT FUNCTION
+    END IF
+
+    ' ---- BWSOLA PLC buffers (per Yeh et al. 2013) ----
+    ' plcLBuf: stable storage for L_WSOLA copy (decodePtr gets overwritten
+    '   on the next decode, so we must copy lastPcm here when a loss is
+    '   detected). plcOutBuf: output of BWSOLA_PLC_Frame (concealed frame).
+    ' Both are bufSz bytes (same as decodePtr) - plenty for any frame size.
+    IF %BWSOLA_PLC_ENABLE THEN
+        plcLBuf = HeapAlloc(g_hHeap, %HEAP_ZERO_MEMORY, bufSz)
+        IF plcLBuf = 0 THEN
+            AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & ": plcLBuf alloc FAILED"
+            HeapFree g_hHeap, 0, decodePtr
+            HeapFree g_hHeap, 0, ringPtr
+            FOR wIdx2 = 0 TO %NUM_WAVE_BUFS - 1
+                IF pcmPtrs(wIdx2) THEN HeapFree g_hHeap, 0, pcmPtrs(wIdx2)
+            NEXT wIdx2
+            ERRCLEAR
+            IF devTransport = 1 THEN TCP CLOSE #fNum ELSE UDP CLOSE #fNum
+            EnterCriticalSection g_csDev
+            g_Devs(idx).fAudioFile = 0
+            g_Devs(idx).dwRunning  = 0
+            g_Devs(idx).dwHBActive = 0
+            g_Devs(idx).dwStatus   = %STS_IDLE
+            LeaveCriticalSection g_csDev
+            FUNCTION = 0 : EXIT FUNCTION
+        END IF
+        plcOutBuf = HeapAlloc(g_hHeap, %HEAP_ZERO_MEMORY, bufSz)
+        IF plcOutBuf = 0 THEN
+            AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & ": plcOutBuf alloc FAILED"
+            HeapFree g_hHeap, 0, plcLBuf : plcLBuf = 0
+            HeapFree g_hHeap, 0, decodePtr
+            HeapFree g_hHeap, 0, ringPtr
+            FOR wIdx2 = 0 TO %NUM_WAVE_BUFS - 1
+                IF pcmPtrs(wIdx2) THEN HeapFree g_hHeap, 0, pcmPtrs(wIdx2)
+            NEXT wIdx2
+            ERRCLEAR
+            IF devTransport = 1 THEN TCP CLOSE #fNum ELSE UDP CLOSE #fNum
+            EnterCriticalSection g_csDev
+            g_Devs(idx).fAudioFile = 0
+            g_Devs(idx).dwRunning  = 0
+            g_Devs(idx).dwHBActive = 0
+            g_Devs(idx).dwStatus   = %STS_IDLE
+            LeaveCriticalSection g_csDev
+            FUNCTION = 0 : EXIT FUNCTION
+        END IF
+        AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & ": BWSOLA PLC enabled (16-bit)"
+    ELSE
+        AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & ": BWSOLA PLC disabled (frame-repeat fallback)"
+    END IF
+
+    ringW = 0 : ringR = 0 : ringUsed = 0
+    frameBytes = 0
+    ringPlaying = 0
+    ringEverStarted = 0
     underrunCount = 0
     overflowCount = 0
     lastAdaptTick = GetTickCount()
@@ -1955,8 +2571,26 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
     lastPcmLastSample(1) = 0
     plcActive = 0
 
+    ' BWSOLA PLC pending state (init)
+    plcPending = 0
+    plcLPtr = 0
+    plcLLen = 0
+    ' Depth from ACTUAL WaveOut rate (EspActualRate) + channels + outBits.
+    ' bytesPerMs is recomputed on every reopen (rate/ch/bits may change).
+    bytesPerMs = (CLNG(actualSmpRate) * nCh * (outBits \ 8) + 999) \ 1000
+    IF bytesPerMs < 1 THEN bytesPerMs = 1
+    ringTargetBytes = bytesPerMs * %JITTER_INITIAL_MS
+    ringMinBytes    = bytesPerMs * %JITTER_MIN_MS
+    ringMaxBytes    = bytesPerMs * %JITTER_MAX_MS
+    IF ringMaxBytes > (ringCap \ 2) THEN ringMaxBytes = ringCap \ 2
+    IF ringTargetBytes > ringMaxBytes THEN ringTargetBytes = ringMaxBytes
+    IF ringMinBytes > ringTargetBytes THEN ringMinBytes = ringTargetBytes
+
     AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
-           ": jitter buffer: prebuffer=" & TRIM$(STR$(jitterTarget)) & " frames"
+           ": ring target=" & TRIM$(STR$(ringTargetBytes)) & "B (~" & _
+           TRIM$(STR$(%JITTER_INITIAL_MS)) & "ms) min=" & _
+           TRIM$(STR$(ringMinBytes)) & " max=" & TRIM$(STR$(ringMaxBytes)) & _
+           " cap=" & TRIM$(STR$(ringCap))
 
     ' ---- Main audio loop ----
     ' TCP framing: [u16 length BE][16-byte pkt_header][payload].
@@ -2114,7 +2748,12 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
                            ": UDP RECV err=" & TRIM$(STR$(ERR)) & _
                            " (count=" & TRIM$(STR$(audErrCount)) & ") - no data?"
                 END IF
-                SLEEP 2
+                ' GROK-RINGBUFFER: drain ring while idle. Without this,
+                ' a long UDP RECV timeout (no packet) would leave the ring
+                ' full and WaveOut starved -> false underrun. FeedWaveOut
+                ' pulls from the ring even when no new packet arrived.
+                GOSUB FeedWaveOut
+                SLEEP 1
                 ITERATE DO
             END IF
         END IF
@@ -2208,6 +2847,10 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
             skipFrameMs = PEEK(BYTE, STRPTR(recvBuf) + 9)
             IF skipFrameMs < 1 THEN skipFrameMs = 20  ' guard against 0/garbage
             skipFramesRemaining = %STARTUP_SKIP_MS \ skipFrameMs
+            ' (GROK-RINGBUFFER): jitter depth is now in BYTES, computed from
+            ' bytesPerMs (actualSmpRate * nCh * outBits/8 / 1000) at ring
+            ' alloc time and on reopen. No frame-count recompute here -
+            ' skipFrameMs is only used for the skip count and the log below.
             ' Compute fade-in sample count from the actual sample rate.
             ' fadeSamplesTotal = samples in FADE_IN_MS at this rate.
             ' e.g. 32000 Hz × 1s = 32000 samples; 48000 Hz × 1s = 48000.
@@ -2451,144 +3094,53 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
         END IF
         lastSeq = seqNum
 
-        ' ---- Find a FREE buffer for the current packet's decode ----
-        ' Done FIRST (before PLC) so the real packet always gets a buffer.
-        ' PLC then uses a SEPARATE free buffer (skipping wIdx) — if no second
-        ' free buffer is available, PLC is skipped (the lost packet becomes a
-        ' natural gap rather than stealing the current packet's buffer).
+        ' ---- (GROK-RINGBUFFER) freeBuf scan DELETED ----
+        ' Decode is no longer tied to a WaveOut slot. Decoded PCM goes into
+        ' decodePtr, then producer RingWrite copies it into the ring. Overflow
+        ' (no room in ring) is handled inside RingWrite by dropping OLDEST bytes,
+        ' not by dropping the current packet. The consumer (FeedWaveOut GOSUB)
+        ' finds free WaveOut slots on its own when pulling from the ring.
+        ' ---- BWSOLA PLC loss detection (per Yeh et al. 2013) ----
+        ' BWSOLA is BILATERAL: needs L_WSOLA (previous good packet) AND
+        ' R_WSOLA (next good packet). When packet N is lost, we CANNOT
+        ' reconstruct immediately - we must WAIT for packet N+1.
+        ' So on loss detection (lostPkt > 0) we COPY lastPcm into plcLBuf
+        ' (stable storage - decodePtr will be overwritten when we decode
+        ' the current packet N+1) and set plcPending. The actual BWSOLA
+        ' reconstruction runs AFTER the current packet is decoded (see
+        ' pcm_ready block below), using plcLBuf (L) + decodePtr (R).
         '
-        ' CRITICAL FIX: the old code decoded into pcmPtrs(wIdx) WITHOUT
-        ' checking if WaveOut was still playing that buffer. If whdrs(wIdx)
-        ' was INQUEUE (being played), the decoder overwrote live audio ->
-        ' clicks. Now we scan for a free buffer BEFORE decoding.
-        '
-        ' If ALL buffers are INQUEUE (underrun): we must wait. But we can't
-        ' block the recv loop. So we SKIP this packet (drop it) and log the
-        ' underrun. This is better than overwriting a playing buffer.
-        LOCAL freeBufIdx AS LONG
-        freeBufIdx = -1
-        FOR wIdx2 = 0 TO %NUM_WAVE_BUFS - 1
-            IF (whdrs(wIdx2).dwFlags AND %WHDR_INQUEUE) = 0 THEN
-                freeBufIdx = wIdx2
-                EXIT FOR
-            END IF
-        NEXT wIdx2
-        IF freeBufIdx < 0 THEN
-            ' All buffers in queue = queue FULL (overflow, not underrun).
-            ' Drop this packet, count it.
-            ' FIX (GROK-5): use a separate overflowCount instead of reusing
-            ' underrunCount. The previous code incremented underrunCount on
-            ' overflow, which (a) mislabeled the event in logs as "underrun"
-            ' and (b) fed the overflow events into the adaptive-jitter grow
-            ' decision at the JITTER_ADAPT_MS check, which would GROW
-            ' jitterTarget when the queue was already full (counter-productive).
-            ' Now overflows only increment overflowCount; the adaptive logic
-            ' uses underrunCount (true underruns = empty queue) to grow, and
-            ' overflowCount to SHRINK jitterTarget.
-            INCR overflowCount
-            IF overflowCount <= 3 OR (overflowCount MOD 100) = 0 THEN
-                AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
-                       ": overflow (all bufs INQUEUE) - pkt dropped, overflows=" & _
-                       TRIM$(STR$(overflowCount))
-            END IF
-            ' Re-prebuffer to rebuild the queue
-            IF jitterPrebuffering = 0 THEN
-                jitterPrebuffering = 1
-                jitterFilled = 0
-            END IF
-            ITERATE DO
-        END IF
-        ' Use the free buffer for this frame's decode
-        wIdx = freeBufIdx
-
-        ' ---- PLC (Packet Loss Concealment) with linear interpolation ----
-        ' When packets were lost (lostPkt > 0), insert ONE synthetic frame
-        ' (copy of last good frame with a fade ramp) into the WaveOut queue
-        ' BEFORE decoding the current packet. This conceals the lost packet N
-        ' while still playing the current packet N+1 normally — the PLC frame
-        ' is submitted to a SEPARATE buffer (plcBufIdx, != wIdx) so it doesn't
-        ' replace the current packet.
-        '
-        ' PREVIOUS BUG: lostPkt was computed in pcm_ready (END of iteration),
-        ' so PLC fired one packet LATE — replacing good packet N+2 with a copy
-        ' of N+1 instead of concealing the lost N. Net effect was 2 effective
-        ' losses (N dropped + N+2 overwritten) instead of 1 concealed. Now PLC
-        ' fires in the SAME iteration that detects the loss, concealing N while
-        ' decoding N+1 normally → 0 effective losses on a single packet drop.
-        '
-        ' Only ONE PLC frame is inserted regardless of lostPkt count, to avoid
-        ' flooding the WaveOut queue and shifting playback timing. Multi-packet
-        ' bursts get one concealment + the rest as natural gaps.
+        ' One BWSOLA-concealed frame is inserted for the FIRST lost packet.
+        ' Multi-packet bursts (lostPkt > 1) get 1 BWSOLA frame + up to 3
+        ' simple frame-repeats for additional losses (per spec simplification 5:
+        ' BWSOLA is best for 1-2 packet losses; the paper tested 1-4).
         plcActive = 0
-        IF lostPkt > 0 AND lastPcmPtr <> 0 AND lastPcmLen > 0 AND waveOut <> 0 THEN
-            ' Find a free buffer for the PLC frame, SKIPPING wIdx (reserved for
-            ' the current packet). If none, skip PLC — the current packet must
-            ' not be sacrificed for concealment.
-            LOCAL plcBufIdx AS LONG
-            plcBufIdx = -1
-            FOR wIdx2 = 0 TO %NUM_WAVE_BUFS - 1
-                IF wIdx2 <> wIdx AND (whdrs(wIdx2).dwFlags AND %WHDR_INQUEUE) = 0 THEN
-                    plcBufIdx = wIdx2
-                    EXIT FOR
+        IF lostPkt > 0 AND lastPcmPtr <> 0 AND lastPcmLen > 0 AND ringPtr <> 0 THEN
+            ' Save L_WSOLA = lastPcm. Copy to plcLBuf (stable storage) because
+            ' lastPcmPtr = decodePtr, which will be overwritten by the decode
+            ' of the current packet N+1. plcLBuf is HeapAlloc'd (bufSz bytes),
+            ' large enough for any frame (lastPcmLen <= bufSz).
+            IF %BWSOLA_PLC_ENABLE AND plcLBuf <> 0 AND lastPcmLen <= bufSz THEN
+                CopyMemory plcLBuf, lastPcmPtr, lastPcmLen
+                plcLPtr = plcLBuf
+                plcLLen = lastPcmLen
+                plcPending = lostPkt
+                IF g_bVerbose THEN
+                    AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & ": BWSOLA PLC pending (lost=" & TRIM$(STR$(lostPkt)) & " len=" & TRIM$(STR$(lastPcmLen)) & ")"
                 END IF
-            NEXT wIdx2
-
-            IF plcBufIdx >= 0 THEN
-                ' Copy last good frame into the PLC buffer
-                POKE$ pcmPtrs(plcBufIdx), PEEK$(lastPcmPtr, lastPcmLen)
-                LOCAL plcLen AS LONG
-                plcLen = lastPcmLen
-
-                ' Linear interpolation: ramp from lastPcmLastSample to the
-                ' first sample of the copied frame over the first N samples.
-                ' Smooths the discontinuity at the splice point.
-                ' FIX (BUG#R3-1): extended to stereo (nCh=2). For interleaved
-                ' L,R,L,R PCM, ramp both channels at each sample index.
-                ' Previously stereo fell through with NO ramp -> hard splice
-                ' -> audible click on every lost packet in stereo streams.
-                IF outBits = 16 AND (nCh = 1 OR nCh = 2) THEN
-                    LOCAL pPcm16 AS INTEGER PTR
-                    LOCAL rampLen AS LONG
-                    LOCAL rampI AS LONG
-                    LOCAL rampStep AS DOUBLE
-                    LOCAL chStride AS LONG
-                    LOCAL rampCh AS LONG
-                    LOCAL chFirst AS LONG
-                    LOCAL chStep AS DOUBLE
-                    LOCAL chVal AS DOUBLE
-                    pPcm16 = pcmPtrs(plcBufIdx)
-                    chStride = nCh  ' 1 for mono, 2 for stereo (interleaved)
-                    ' rampLen is in FRAMES (not bytes): 25% of frame, cap 64.
-                    ' lastPcmLen is bytes; samples = bytes/2; frames = samples/chStride.
-                    rampLen = (lastPcmLen \ 2) \ chStride \ 4
-                    IF rampLen > 64 THEN rampLen = 64
-                    IF rampLen > 0 THEN
-                        ' FIX (grok22#5): ramp each channel independently.
-                        ' For stereo, L ramps from lastL to firstL, R ramps
-                        ' from lastR to firstR. Previously both used L's
-                        ' values, causing an R discontinuity at the splice.
-                        FOR rampCh = 0 TO chStride - 1
-                            chFirst = @pPcm16[rampCh]  ' first sample of this ch
-                            chStep = (chFirst - lastPcmLastSample(rampCh)) / rampLen
-                            FOR rampI = 0 TO rampLen - 1
-                                chVal = lastPcmLastSample(rampCh) + chStep * rampI
-                                @pPcm16[rampI * chStride + rampCh] = CINT(chVal)
-                            NEXT rampI
-                        NEXT rampCh
+            ELSE
+                ' Fallback (BWSOLA disabled or alloc failed): immediate
+                ' frame-repeat into the ring (V2 behavior). This runs BEFORE
+                ' decode, so lastPcmPtr still holds the previous good packet.
+                IF RingWrite(ringPtr, ringCap, ringW, ringR, ringUsed, _
+                             lastPcmPtr, lastPcmLen) THEN
+                    INCR overflowCount
+                    IF overflowCount <= 3 OR (overflowCount MOD 100) = 0 THEN
+                        AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+                               ": PLC(repeat) RingWrite dropped oldest (overflow) overflows=" & _
+                               TRIM$(STR$(overflowCount)) & " used=" & TRIM$(STR$(ringUsed))
                     END IF
                 END IF
-
-                ' Submit the PLC frame to WaveOut. It plays BEFORE the current
-                ' packet (which is decoded and submitted below), concealing the
-                ' lost packet's slot in the timeline.
-                ' NOTE: plcActive is NOT set to 1 here — the current packet
-                ' (decoded below into wIdx) is a REAL packet and SHOULD update
-                ' lastPcm, so the next loss can conceal from it. The old code
-                ' set plcActive=1 because PLC replaced the current buffer; now
-                ' PLC uses a separate buffer, so this flag stays 0.
-                whdrs(plcBufIdx).dwBufferLength = plcLen
-                whdrs(plcBufIdx).dwBytesRecorded = plcLen
-                waveOutWrite waveOut, whdrs(plcBufIdx), SIZEOF(WAVEHDR)
             END IF
         END IF
 
@@ -2609,7 +3161,7 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
                 LOCAL si24 AS LONG
                 pcm24Len = LEN(recvBuf) - %PKT_HDR_SZ
                 pcm24Src = STRPTR(recvBuf) + %PKT_HDR_SZ
-                pcm16Dst = pcmPtrs(wIdx)
+                pcm16Dst = decodePtr
                 LOCAL outIdx AS LONG
                 outIdx = 0
                 FOR si24 = 0 TO pcm24Len - 3 STEP 3
@@ -2635,7 +3187,7 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
                     pcmLen = bufSz
                 END IF
                 IF pcmLen > 0 THEN
-                    POKE$ pcmPtrs(wIdx), PEEK$(STRPTR(recvBuf) + %PKT_HDR_SZ, pcmLen)
+                    POKE$ decodePtr, PEEK$(STRPTR(recvBuf) + %PKT_HDR_SZ, pcmLen)
                 END IF
             END IF
             GOTO pcm_ready
@@ -2662,7 +3214,7 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
             pcmLen = adpcmLen * 4
             IF pcmLen > %WAVE_BUF_SZ THEN pcmLen = %WAVE_BUF_SZ
 
-            DecodeImaAdpcm STRPTR(recvBuf) + 20, adpcmLen, pcmPtrs(wIdx), predictor, stepIndex
+            DecodeImaAdpcm STRPTR(recvBuf) + 20, adpcmLen, decodePtr, predictor, stepIndex
 
             ' FIX (AUDIT-MEDIUM): dead diagnostic block 'first 5 packets'
             ' removed - the comment above said 'Remove this block after
@@ -2686,7 +3238,7 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
             ' Decode left channel
             predictor = CVI(PEEK$(STRPTR(recvBuf) + 16, 2))
             stepIndex = PEEK(BYTE, STRPTR(recvBuf) + 18)
-            DecodeImaAdpcm STRPTR(recvBuf) + 20, adpcmLenL, pcmPtrs(wIdx), predictor, stepIndex
+            DecodeImaAdpcm STRPTR(recvBuf) + 20, adpcmLenL, decodePtr, predictor, stepIndex
             pcmLenL = adpcmLenL * 4
 
             ' Decode right channel
@@ -2696,13 +3248,13 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
 
             predictor2 = CVI(PEEK$(STRPTR(recvBuf) + offsetR, 2))
             stepIndex2 = PEEK(BYTE, STRPTR(recvBuf) + offsetR + 2)
-            DecodeImaAdpcm STRPTR(recvBuf) + offsetR + 4, adpcmLenL, pcmPtrs(wIdx) + pcmLenL, predictor2, stepIndex2
+            DecodeImaAdpcm STRPTR(recvBuf) + offsetR + 4, adpcmLenL, decodePtr + pcmLenL, predictor2, stepIndex2
             pcmLenR = adpcmLenL * 4
 
             ' Interleave L,R into the PCM buffer
-            ' Left is at pcmPtrs(wIdx), Right is at pcmPtrs(wIdx) + pcmLenL
+            ' Left is at decodePtr, Right is at decodePtr + pcmLenL
             ' We need to interleave: L0,R0,L1,R1...
-            ' BUGFIX: pL and pOut point to the SAME buffer (pcmPtrs).
+            ' BUGFIX: pL and pOut point to the SAME buffer (decodePtr).
             ' Writing R0 to pOut[1] overwrites pL[1] before it's read!
             ' Fix: Copy BOTH channels to temp areas before interleaving.
             ' Buffer layout: [L 640B] [R 640B] [tempR 640B] [tempL 640B] [unused]
@@ -2714,14 +3266,14 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
             LOCAL si AS LONG
             LOCAL pTempL AS INTEGER PTR
             LOCAL pTempR AS INTEGER PTR
-            pL = pcmPtrs(wIdx)
-            pR = pcmPtrs(wIdx) + pcmLenL
+            pL = decodePtr
+            pR = decodePtr + pcmLenL
             nSamp = pcmLenL \ 2
                       ' Copy both channels to safe temp areas beyond the decoded region.
             ' pTempR at byte offset 2*pcmLenL, pTempL at byte offset 3*pcmLenL
             ' (offsets scale with pcmLenL; only safe because bufSz = 4*WAVE_BUF_SZ for stereo)
-            pTempR = pcmPtrs(wIdx) + (2 * pcmLenL)
-            pTempL = pcmPtrs(wIdx) + (3 * pcmLenL)
+            pTempR = decodePtr + (2 * pcmLenL)
+            pTempL = decodePtr + (3 * pcmLenL)
 
 
             FOR si = 0 TO nSamp - 1
@@ -2729,7 +3281,7 @@ THREAD FUNCTION AudioThread(BYVAL param AS DWORD) AS DWORD
                 @pTempL[si] = @pL[si]
             NEXT si
             ' Interleave from temp buffers (safe, no overwriting)
-            pOut = pcmPtrs(wIdx)
+            pOut = decodePtr
             FOR si = 0 TO nSamp - 1
                 @pOut = @pTempL[si]
                 INCR pOut
@@ -2768,7 +3320,7 @@ pcm_ready:
         LeaveCriticalSection g_csDev
 
         ' ---- WAV dump: ADPCM decoded PCM ----
-        ' For ADPCM codec: write decoded 16-bit PCM from pcmPtrs to WAV file.
+        ' For ADPCM codec: write decoded 16-bit PCM from decodePtr to WAV file.
         ' (PCM codec is already handled above with raw payload write.)
         ' FIX (GROK-9): apply the same g_dumpIp filter as the PCM path above
         ' so only the selected device's decoded PCM is dumped.
@@ -2776,7 +3328,7 @@ pcm_ready:
            AND (g_dumpIp = 0 OR devIP = g_dumpIp) THEN
             EnterCriticalSection g_csDump
             IF g_hDumpFile THEN
-                PUT$ #g_hDumpFile, PEEK$(pcmPtrs(wIdx), pcmLen)
+                PUT$ #g_hDumpFile, PEEK$(decodePtr, pcmLen)
                 g_dumpDataSize = g_dumpDataSize + pcmLen
                 ' Auto-split at 1 GB
                 IF g_dumpDataSize > 1073741780 THEN
@@ -2790,9 +3342,92 @@ pcm_ready:
             LeaveCriticalSection g_csDump
         END IF
 
+        ' ---- BWSOLA PLC reconstruction (bilateral, per Yeh et al. 2013) ----
+        ' If plcPending > 0, the PREVIOUS iteration detected a loss and saved
+        ' L_WSOLA in plcLBuf. The current packet (just decoded into decodePtr)
+        ' is R_WSOLA. Run BWSOLA_PLC_Frame to reconstruct the lost frame, then
+        ' RingWrite the concealed frame BEFORE the current packet (ring order:
+        ' ..., N-1, concealed-N, N+1, ...). This block runs BEFORE the
+        ' save-lastPcm + producer RingWrite below, so the concealed frame is
+        ' queued first.
+        IF plcPending > 0 AND plcLPtr <> 0 AND plcLLen > 0 AND _
+           decodePtr <> 0 AND pcmLen > 0 AND ringPtr <> 0 THEN
+            IF %BWSOLA_PLC_ENABLE AND outBits = 16 AND plcOutBuf <> 0 THEN
+                LOCAL plcOut AS INTEGER PTR
+                LOCAL plcGot AS LONG
+                LOCAL plcOutSmp AS LONG
+                plcOut = plcOutBuf
+                plcOutSmp = plcLLen \ 2     ' output sample count = L sample count
+                plcGot = BWSOLA_PLC_Frame(plcLPtr, plcLLen \ 2, _
+                                          decodePtr, pcmLen \ 2, _
+                                          plcOut, plcOutSmp, nCh)
+                IF plcGot > 0 THEN
+                    IF RingWrite(ringPtr, ringCap, ringW, ringR, ringUsed, _
+                                 plcOutBuf, plcGot) THEN
+                        INCR overflowCount
+                        IF overflowCount <= 3 OR (overflowCount MOD 100) = 0 THEN
+                            AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+                                   ": BWSOLA PLC RingWrite dropped oldest (overflow) overflows=" & _
+                                   TRIM$(STR$(overflowCount)) & " used=" & TRIM$(STR$(ringUsed))
+                        END IF
+                    END IF
+                    IF g_bVerbose THEN
+                        AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+                               ": BWSOLA PLC reconstructed " & TRIM$(STR$(plcGot)) & _
+                               " bytes (L=" & TRIM$(STR$(plcLLen)) & " R=" & TRIM$(STR$(pcmLen)) & ")"
+                    END IF
+                ELSE
+                    ' BWSOLA failed (outLen <= 0 or invalid params) - fallback
+                    ' to frame-repeat using the saved L copy in plcLBuf.
+                    IF RingWrite(ringPtr, ringCap, ringW, ringR, ringUsed, _
+                                 plcLPtr, plcLLen) THEN
+                        INCR overflowCount
+                    END IF
+                    AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+                           ": BWSOLA PLC failed (plcGot=0), frame-repeat fallback"
+                END IF
+            ELSE
+                ' BWSOLA disabled or outBits != 16 or no plcOutBuf: fallback
+                ' frame-repeat (V2 behavior). plcLPtr = plcLBuf holds the L copy.
+                IF RingWrite(ringPtr, ringCap, ringW, ringR, ringUsed, _
+                             plcLPtr, plcLLen) THEN
+                    INCR overflowCount
+                    IF overflowCount <= 3 OR (overflowCount MOD 100) = 0 THEN
+                        AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+                               ": PLC(repeat) RingWrite dropped oldest (overflow) overflows=" & _
+                               TRIM$(STR$(overflowCount)) & " used=" & TRIM$(STR$(ringUsed))
+                    END IF
+                END IF
+            END IF
+            ' Multi-packet loss (plcPending > 1): simple frame-repeat for
+            ' additional lost packets (spec simplification 5: BWSOLA for the
+            ' first gap, simple repeat for the rest). Cap at 3 additional
+            ' repeats to avoid flooding the ring on large bursts (matches
+            ' the paper's 1-4 packet loss test range).
+            IF plcPending > 1 THEN
+                LOCAL extraLoss AS LONG
+                LOCAL extraMax AS LONG
+                IF plcPending - 1 > 3 THEN
+                    extraMax = 3
+                ELSE
+                    extraMax = plcPending - 1
+                END IF
+                FOR extraLoss = 1 TO extraMax
+                    IF RingWrite(ringPtr, ringCap, ringW, ringR, ringUsed, _
+                                 plcLPtr, plcLLen) THEN
+                        INCR overflowCount
+                    END IF
+                NEXT extraLoss
+                AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+                       ": PLC multi-loss " & TRIM$(STR$(plcPending)) & _
+                       " pkts: 1 BWSOLA + " & TRIM$(STR$(extraMax)) & " repeat"
+            END IF
+        END IF
+        plcPending = 0
+
         ' ---- Save last decoded PCM for PLC (Packet Loss Concealment) ----
         IF pcmLen > 0 AND plcActive = 0 THEN
-            lastPcmPtr = pcmPtrs(wIdx)
+            lastPcmPtr = decodePtr
             lastPcmLen = pcmLen
             ' Save last sample value per channel (for interpolation on next
             ' packet loss). FIX (grok22#5): per-channel, not just L.
@@ -2803,7 +3438,7 @@ pcm_ready:
             IF outBits = 16 AND pcmLen >= 2 THEN
                 LOCAL pLast AS INTEGER PTR
                 LOCAL totalSmp AS LONG
-                pLast = pcmPtrs(wIdx)
+                pLast = decodePtr
                 totalSmp = pcmLen \ 2
                 IF nCh = 2 THEN
                     lastPcmLastSample(0) = @pLast[totalSmp - 2]  ' last L
@@ -2817,7 +3452,7 @@ pcm_ready:
         ' ---- Fade-in ramp (startup click suppression, 2nd second) ----
         ' Applied AFTER the 1-second skip completes. Linearly scales sample
         ' amplitude from 0 to 1 over fadeSamplesRemaining samples (1 second
-        ' at the current sample rate). Operates IN-PLACE on pcmPtrs(wIdx).
+        ' at the current sample rate). Operates IN-PLACE on decodePtr.
         ' Handles frame boundaries: if the frame is shorter than the remaining
         ' ramp, fades the whole frame and continues on the next. If longer,
         ' fades the first N samples and leaves the rest at full amplitude.
@@ -2836,7 +3471,7 @@ pcm_ready:
             LOCAL fadeI AS LONG
             LOCAL fadeScale AS DOUBLE
             LOCAL fadeProg AS DOUBLE
-            pFade = pcmPtrs(wIdx)
+            pFade = decodePtr
             fadeFrameSamples = pcmLen \ 2   ' 16-bit samples in this frame
             IF fadeFrameSamples < fadeSamplesRemaining THEN
                 ' Frame shorter than remaining ramp — fade whole frame,
@@ -2861,115 +3496,90 @@ pcm_ready:
             END IF
         END IF
 
-        ' ---- Jitter Buffer: prebuffer before starting playback ----
-        IF jitterPrebuffering AND pcmLen > 0 THEN
-            INCR jitterFilled
-            ' During prebuffer, still submit to WaveOut (buffers queue up)
-            IF waveOut <> 0 AND (whdrs(wIdx).dwFlags AND %WHDR_INQUEUE) = 0 THEN
-                whdrs(wIdx).dwBufferLength = pcmLen
-                whdrs(wIdx).dwBytesRecorded = pcmLen
-                waveOutWrite waveOut, whdrs(wIdx), SIZEOF(WAVEHDR)
-                wIdx = (wIdx + 1) MOD %NUM_WAVE_BUFS
-            END IF
-            IF jitterFilled >= jitterTarget THEN
-                jitterPrebuffering = 0
+        ' ==================================================================
+        ' PRODUCER: decoded PCM -> ring (GROK-RINGBUFFER)
+        ' ==================================================================
+        IF pcmLen > 0 AND ringPtr <> 0 THEN
+            ' Lock frame size from the first played frame. Used by the
+            ' consumer (FeedWaveOut) to know how many bytes to pull per
+            ' waveOutWrite. Format changes trigger reopen_waveout which
+            ' resets frameBytes=0, so the next frame re-locks.
+            IF frameBytes = 0 THEN
+                frameBytes = pcmLen
                 AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
-                       ": jitter buffer filled (" & TRIM$(STR$(jitterFilled)) & _
-                       " frames) - playback started"
+                       ": frameBytes=" & TRIM$(STR$(frameBytes))
             END IF
-            ITERATE DO
+
+            ' Producer writes decoded PCM into the ring. RingWrite drops
+            ' OLDEST bytes on overflow (keeps newest audio, advances
+            ' ringR) - no packet drop, no re-prebuffer chaos.
+            IF RingWrite(ringPtr, ringCap, ringW, ringR, ringUsed, _
+                         decodePtr, pcmLen) THEN
+                INCR overflowCount
+                IF overflowCount <= 3 OR (overflowCount MOD 100) = 0 THEN
+                    AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+                           ": ring overflow (drop oldest) overflows=" & _
+                           TRIM$(STR$(overflowCount)) & " used=" & TRIM$(STR$(ringUsed))
+                END IF
+            END IF
         END IF
 
-        ' ---- Adaptive buffer adjustment ----
-        ' Every JITTER_ADAPT_MS, adjust jitterTarget based on underruns.
-        ' underrunCount is now correctly incremented when WaveOut queue is
-        ' empty (0 INQUEUE). If underruns happen, increase prebuffer; if
-        ' stable, slowly decrease to reduce latency.
-        ' FIX (BUG#R3-2): do NOT decrease jitterTarget in the first 5 seconds
-        ' after stream start. Early WiFi jitter is normal (DNS, DHCP renewal,
-        ' ESP I2S DMA warmup) and a too-small prebuffer during this window
-        ' causes underrun-clicks. The decrease guard is one-shot per stream.
-        IF (GetTickCount() - lastAdaptTick) >= %JITTER_ADAPT_MS THEN
-            LOCAL msSinceStart AS DWORD
-            msSinceStart = GetTickCount() - g_Devs(idx).dwStreamStart
-            ' FIX (log-fix-C): require 2 consecutive zero-underrun intervals
-            ' (20s) before decreasing. Log showed the buffer oscillating
-            ' 6->5->7->6->5->4 because a single 10s zero-underrun window
-            ' was followed by underruns. Requiring 2 windows confirms the
-            ' buffer is genuinely too large, not just in a lucky gap.
-            IF underrunCount = 0 AND jitterTarget > %JITTER_MIN AND _
-               msSinceStart > 5000 THEN
-                INCR zeroUnderrunIntervals
-                IF zeroUnderrunIntervals >= 2 THEN
-                    DECR jitterTarget
-                    zeroUnderrunIntervals = 0
-                    AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
-                           ": adaptive buffer: 0 underruns -> decrease to " & _
-                           TRIM$(STR$(jitterTarget))
-                END IF
-            ELSEIF underrunCount >= %JITTER_UNDERRUN_THRESHOLD AND _
-                   jitterTarget < %JITTER_MAX THEN
-                INCR jitterTarget
-                zeroUnderrunIntervals = 0
-                AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
-                       ": adaptive buffer: " & TRIM$(STR$(underrunCount)) & _
-                       " underruns -> increase to " & TRIM$(STR$(jitterTarget))
+        ' ---- Gate: start / soft-refill ----
+        ' ringPlaying=0 means the consumer is paused. We unpause it when
+        ' the ring has enough data. On FIRST start we wait for the full
+        ' ringTargetBytes (cold prebuffer). After the first underrun we
+        ' only wait for ringMinBytes (faster resume, accepts that WiFi
+        ' jitter is still bursty).
+        IF ringPlaying = 0 THEN
+            IF ringEverStarted = 0 THEN
+                feedNeed = ringTargetBytes
             ELSE
-                ' Underruns below threshold or at JITTER_MAX: reset counter
-                zeroUnderrunIntervals = 0
+                feedNeed = ringMinBytes
+            END IF
+            IF ringUsed >= feedNeed THEN
+                ringPlaying = 1
+                ' FIX (CLICKS-D): only log 'ring play ON' on FIRST start.
+                ' After underrun re-prebuffers, this was spamming 20+ logs/sec.
+                IF ringEverStarted = 0 THEN
+                    ringEverStarted = 1
+                    AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+                           ": ring play ON used=" & TRIM$(STR$(ringUsed)) & _
+                           " need=" & TRIM$(STR$(feedNeed))
+                END IF
+            END IF
+        END IF
+
+        ' ---- CONSUMER: pull frames from ring -> WaveOut ----
+        ' FeedWaveOut is a GOSUB target defined after the main DO...LOOP.
+        ' It scans for a free WaveOut buffer, RingReads frameBytes from
+        ' the ring into it, and waveOutWrites. On ring underrun (ringUsed
+        ' < frameBytes while ringPlaying=1), it injects ONE silence frame
+        ' (RingFillZero) to avoid a hard WaveOut click, then sets
+        ' ringPlaying=0 so the gate above re-prebuffers to ringMinBytes.
+        GOSUB FeedWaveOut
+
+        ' ---- Adaptive (grow only, GROK-RINGBUFFER) ----
+        ' Every JITTER_ADAPT_MS, check underrunCount. If >= threshold,
+        ' grow ringTargetBytes by 20ms (clamped to ringMaxBytes). No shrink
+        ' path - simpler, avoids oscillation, overflow drops oldest anyway.
+        ' Also bump ringMinBytes to ringTargetBytes\2 so the soft-refill
+        ' gate tracks the new target.
+        IF (GetTickCount() - lastAdaptTick) >= %JITTER_ADAPT_MS THEN
+            IF underrunCount >= %JITTER_UNDERRUN_THRESHOLD THEN
+                IF ringTargetBytes < ringMaxBytes THEN
+                    ringTargetBytes = ringTargetBytes + bytesPerMs * 20
+                    IF ringTargetBytes > ringMaxBytes THEN ringTargetBytes = ringMaxBytes
+                    IF ringMinBytes < (ringTargetBytes \ 2) THEN
+                        ringMinBytes = ringTargetBytes \ 2
+                    END IF
+                    AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+                           ": ring grow target=" & TRIM$(STR$(ringTargetBytes)) & _
+                           " (underruns=" & TRIM$(STR$(underrunCount)) & ")"
+                END IF
             END IF
             underrunCount = 0
-            ' FIX (GROK-5): also reset overflowCount at end of adaptation interval
             overflowCount = 0
             lastAdaptTick = GetTickCount()
-        END IF
-
-        ' ---- Underrun detection (CORRECTED: 0 INQUEUE = underrun, not all) ----
-        ' OLD BUG: checked if ALL buffers were INQUEUE (= overflow). But the
-        ' real underrun = ZERO INQUEUE (WaveOut queue empty, playing silence).
-        ' This happened when network jitter > prebuffer depth: WaveOut drained
-        ' all queued buffers, played silence for a few ms, then the late packet
-        ' arrived → discontinuity → CLICK. With 0 drops and 0 lost packets
-        ' (the packet wasn't lost, just late), this was invisible to the stats.
-        '
-        ' FIX: count INQUEUE buffers. If 0 INQUEUE (not prebuffering) → underrun.
-        ' On underrun: re-prebuffer + arm a short fade-in (5ms) to smooth the
-        ' silence→signal transition when playback resumes.
-        IF waveOut <> 0 AND pcmLen > 0 AND jitterPrebuffering = 0 THEN
-            LOCAL inQueueCount AS LONG
-            inQueueCount = 0
-            FOR wIdx2 = 0 TO %NUM_WAVE_BUFS - 1
-                IF (whdrs(wIdx2).dwFlags AND %WHDR_INQUEUE) <> 0 THEN
-                    INCR inQueueCount
-                END IF
-            NEXT wIdx2
-            IF inQueueCount = 0 THEN
-                ' UNDERRUN: WaveOut queue is empty, was playing silence.
-                ' Re-prebuffer to rebuild the queue, and arm a short fade-in
-                ' to prevent the click when audio resumes.
-                INCR underrunCount
-                jitterPrebuffering = 1
-                jitterFilled = 0
-                ' Arm a short fade-in (5ms = 160 samples at 32kHz) for the
-                ' resume. This smooths the silence->signal discontinuity.
-                IF fadeSamplesRemaining = 0 AND outBits = 16 THEN
-                    fadeSamplesTotal = 160
-                    fadeSamplesRemaining = 160
-                END IF
-                IF underrunCount <= 3 OR (underrunCount MOD 50) = 0 THEN
-                    AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
-                           ": underrun (0 bufs in queue) - re-prebuffering #" & _
-                           TRIM$(STR$(underrunCount))
-                END IF
-                ' FIX (GROK-6): ITERATE DO here so the current packet is
-                ' DROPPED into the prebuffer phase (next iteration handles
-                ' it via the jitterPrebuffering branch). Previously the code
-                ' fell through to waveOutWrite, submitting the current
-                ' packet raw into the empty queue -> click + immediate
-                ' repeat underrun risk. With ITERATE DO, the prebuffer
-                ' phase rebuilds queue depth before the next submit.
-                ITERATE DO
-            END IF
         END IF
 
         ' ---- Check for WaveOut reopen request (device change / sleep-wake) ----
@@ -3019,9 +3629,13 @@ pcm_ready:
                 AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
                        ": reopen suppressed (duplicate within 5s)"
                 ' Skip reopen — WaveOut was just reopened, it's still valid.
-                ' But still reset jitter state (packets may have been lost).
-                jitterPrebuffering = 1
-                jitterFilled = 0
+                ' But still reset ring state (packets may have been lost).
+                ' Light reset: clear ring + pause consumer. Keep frameBytes
+                ' (format unchanged) and ringEverStarted (faster refill).
+                ' bytesPerMs / ringTargetBytes / ringMinBytes / ringMaxBytes
+                ' unchanged (no format change).
+                ringW = 0 : ringR = 0 : ringUsed = 0
+                ringPlaying = 0
                 ITERATE DO
             END IF
             g_Devs(idx).dwLastReopenTick = nowReopenTick
@@ -3123,32 +3737,10 @@ pcm_ready:
         ' Falls through to the WaveOut submit block.
 skip_reopen_block:
 
-        ' ---- Submit to WaveOut ----
-        ' wIdx already points to a FREE buffer (found in the scan above).
-        ' Submit the decoded PCM for playback.
-        IF waveOut <> 0 AND pcmLen > 0 THEN
-            whdrs(wIdx).dwBufferLength = pcmLen
-            whdrs(wIdx).dwBytesRecorded = pcmLen
-            LOCAL wWriteRes AS LONG
-            wWriteRes = waveOutWrite(waveOut, whdrs(wIdx), SIZEOF(WAVEHDR))
-            ' Check for device-loss errors. After sleep/wake the waveOut handle
-            ' becomes invalid; waveOutWrite returns MMSYSERR_NODRIVER (2) or
-            ' MMSYSERR_INVALHANDLE (9). Flag reopen instead of silently losing
-            ' audio. MMSYSERR_NOERROR = 0, WAVERR_STILLPLAYING = 33 (buffer still
-            ' benign — don't reopen on that).
-            IF wWriteRes <> 0 AND wWriteRes <> 33 THEN
-                AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
-                       ": waveOutWrite failed err=" & TRIM$(STR$(wWriteRes)) & _
-                       " - flagging reopen"
-                ' FIX (H15): protect bReopenWaveOut write with CS
-
-                EnterCriticalSection g_csDev
-
-                g_Devs(idx).bReopenWaveOut = 1
-
-                LeaveCriticalSection g_csDev
-            END IF
-        END IF
+        ' ---- (GROK-RINGBUFFER) Submit to WaveOut block DELETED ----
+        ' The consumer is now the FeedWaveOut GOSUB above. Producer writes
+        ' to the ring; FeedWaveOut pulls frameBytes and waveOutWrites.
+        ' No direct waveOutWrite from the decode path.
 
         ITERATE DO
 
@@ -3170,13 +3762,10 @@ reopen_waveout:
         stepIndex2 = 0
         lastSeq = 0
 
-        ' Reset jitter buffer state for new format
-        jitterPrebuffering = 1
-        jitterFilled = 0
-        underrunCount = 0
-        overflowCount = 0   ' FIX (GROK-5)
-        zeroUnderrunIntervals = 0   ' FIX (log-fix-C)
-        lastAdaptTick = GetTickCount()
+        ' Reset PLC + skip + fade state for new format.
+        ' (GROK-RINGBUFFER) ring state is reset LATER - after actualSmpRate
+        ' and outBits are recomputed below, so bytesPerMs / ringTarget
+        ' reflect the new format.
         lastPcmPtr = 0
         lastPcmLen = 0
         plcActive = 0
@@ -3208,6 +3797,13 @@ reopen_waveout:
         IF devCodec = %CODEC_ID_PCM THEN
             outBits = devBits
         ELSE
+            outBits = 16
+        END IF
+
+        ' BWSOLA PLC forces 16-bit WaveOut on reopen (same as initial setup).
+        IF %BWSOLA_PLC_ENABLE AND outBits = 24 THEN
+            AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+                   ": BWSOLA forces 16-bit WaveOut on reopen (was 24-bit PCM)"
             outBits = 16
         END IF
 
@@ -3275,9 +3871,117 @@ reopen_waveout:
                    " - audio disabled until next format change"
         END IF
 
+        ' ---- GROK-RINGBUFFER: ring reset after reopen ----
+        ' actualSmpRate and outBits are now final (waveOutOpen may have
+        ' flipped outBits 24->16). Recompute bytesPerMs / targets from the
+        ' new format and clear ring state for a fresh prebuffer.
+        ringW = 0 : ringR = 0 : ringUsed = 0
+        ringPlaying = 0
+        frameBytes = 0
+        underrunCount = 0
+        overflowCount = 0
+        lastAdaptTick = GetTickCount()
+        ' Full prebuffer on format change (treat as fresh stream)
+        ringEverStarted = 0
+
+        bytesPerMs = (CLNG(actualSmpRate) * nCh * (outBits \ 8) + 999) \ 1000
+        IF bytesPerMs < 1 THEN bytesPerMs = 1
+        ringTargetBytes = bytesPerMs * %JITTER_INITIAL_MS
+        ringMinBytes    = bytesPerMs * %JITTER_MIN_MS
+        ringMaxBytes    = bytesPerMs * %JITTER_MAX_MS
+        IF ringMaxBytes > (ringCap \ 2) THEN ringMaxBytes = ringCap \ 2
+        IF ringTargetBytes > ringMaxBytes THEN ringTargetBytes = ringMaxBytes
+        IF ringMinBytes > ringTargetBytes THEN ringMinBytes = ringTargetBytes
+
+        AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+               ": ring reset after reopen target=" & TRIM$(STR$(ringTargetBytes)) & _
+               "B min=" & TRIM$(STR$(ringMinBytes)) & " max=" & TRIM$(STR$(ringMaxBytes))
+
         ITERATE DO
     LOOP
 
+    ' GROK-RINGBUFFER: skip past the FeedWaveOut GOSUB target so we
+    ' don't fall into it after the main loop exits (which would execute
+    ' the consumer once on stale state, then RETURN into the cleanup
+    ' block - confusing but harmless; the GOTO makes the intent explicit).
+    GOTO aud_cleanup
+
+FeedWaveOut:
+    ' ---- CONSUMER: pull frameBytes from ring -> free WaveOut buffer ----
+    ' GOSUB target. Called from the main loop after producer RingWrite +
+    ' gate, AND from the UDP RECV timeout path (to drain ring while idle).
+    ' Single-reader: only AudioThread calls this. No locks needed.
+    IF waveOut = 0 OR ringPlaying = 0 OR frameBytes <= 0 OR ringPtr = 0 THEN
+        RETURN
+    END IF
+
+    LOCAL feedFi AS LONG, freeIdx AS LONG, got AS LONG, wRes AS LONG
+
+    DO
+        ' Find a free (not INQUEUE) WaveOut buffer
+        freeIdx = -1
+        FOR feedFi = 0 TO %NUM_WAVE_BUFS - 1
+            IF (whdrs(feedFi).dwFlags AND %WHDR_INQUEUE) = 0 THEN
+                freeIdx = feedFi
+                EXIT FOR
+            END IF
+        NEXT feedFi
+        IF freeIdx < 0 THEN EXIT DO   ' WaveOut queue full - OK, not overflow
+
+        IF ringUsed >= frameBytes THEN
+            ' Pull one frame from the ring into the free WaveOut buffer
+            got = RingRead(ringPtr, ringCap, ringW, ringR, ringUsed, _
+                           pcmPtrs(freeIdx), frameBytes)
+            IF got <= 0 THEN EXIT DO
+
+            whdrs(freeIdx).dwBufferLength  = frameBytes
+            whdrs(freeIdx).dwBytesRecorded = frameBytes
+            wRes = waveOutWrite(waveOut, whdrs(freeIdx), SIZEOF(WAVEHDR))
+            ' Check for device-loss errors (sleep/wake -> invalid handle).
+            ' MMSYSERR_NOERROR=0, WAVERR_STILLPLAYING=33 (benign, no reopen).
+            IF wRes <> 0 AND wRes <> 33 THEN
+                EnterCriticalSection g_csDev
+                g_Devs(idx).bReopenWaveOut = 1
+                LeaveCriticalSection g_csDev
+                EXIT DO
+            END IF
+        ELSE
+            ' Soft underrun: ring has less than one frame while consumer
+            ' is active. Inject ONE silence frame to avoid a hard WaveOut
+            ' click, then pause the consumer (ringPlaying=0). The gate in
+            ' the main loop will re-enable it once ringUsed >= ringMinBytes
+            ' (faster refill after first underrun).
+            IF ringEverStarted THEN
+                INCR underrunCount
+                IF underrunCount <= 3 OR (underrunCount MOD 50) = 0 THEN
+                    AddLog "[AUD] dev #" & TRIM$(STR$(idx)) & _
+                           ": ring underrun used=" & TRIM$(STR$(ringUsed)) & _
+                           " need=" & TRIM$(STR$(frameBytes)) & _
+                           " #" & TRIM$(STR$(underrunCount))
+                END IF
+                ' FIX (GROK-AUDIT-P0-2): silence ONLY if WaveOut queue is
+                ' truly empty (inQ=0). If inQ>0, card plays remaining frames
+                ' while ring refills — no gap, no click. Count INQUEUE buffers.
+                LOCAL inQ AS LONG, qFi AS LONG
+                inQ = 0
+                FOR qFi = 0 TO %NUM_WAVE_BUFS - 1
+                    IF (whdrs(qFi).dwFlags AND %WHDR_INQUEUE) <> 0 THEN INCR inQ
+                NEXT qFi
+                IF inQ = 0 AND freeIdx >= 0 THEN
+                    ' WaveOut truly empty — inject one silence frame
+                    RingFillZero pcmPtrs(freeIdx), frameBytes
+                    whdrs(freeIdx).dwBufferLength  = frameBytes
+                    whdrs(freeIdx).dwBytesRecorded = frameBytes
+                    waveOutWrite waveOut, whdrs(freeIdx), SIZEOF(WAVEHDR)
+                END IF
+                ringPlaying = 0   ' pause consumer; gate will refill
+            END IF
+            EXIT DO
+        END IF
+    LOOP
+    RETURN
+
+aud_cleanup:
     ' ---- Cleanup ----
     IF waveOut THEN
         waveOutReset waveOut
@@ -3310,6 +4014,13 @@ reopen_waveout:
     FOR wIdx2 = 0 TO %NUM_WAVE_BUFS - 1
         IF pcmPtrs(wIdx2) THEN HeapFree g_hHeap, 0, pcmPtrs(wIdx2)
     NEXT wIdx2
+
+    ' GROK-RINGBUFFER: free ring + decode buffers (allocated in Step 3)
+    IF decodePtr THEN HeapFree g_hHeap, 0, decodePtr : decodePtr = 0
+    IF ringPtr   THEN HeapFree g_hHeap, 0, ringPtr   : ringPtr   = 0
+    ' BWSOLA PLC: free L_WSOLA copy + reconstruction output buffers
+    IF plcLBuf   THEN HeapFree g_hHeap, 0, plcLBuf   : plcLBuf   = 0
+    IF plcOutBuf THEN HeapFree g_hHeap, 0, plcOutBuf : plcOutBuf = 0
 
     ' Clear state under CS so other threads see consistent state.
     ' NOTE: hAudioThread is NOT cleared here - the main thread is responsible
@@ -3946,9 +4657,12 @@ END SUB
 ' Called on initial start and on 1 GB auto-split.
 SUB OpenNewDumpFile()
     LOCAL sFile AS STRING
-    LOCAL stDump AS SYSTEMTIME
 
-    GetLocalTime stDump
+    ' FIX (AUDIT-ANTON#4): removed dead LOCAL stDump AS SYSTEMTIME +
+    ' GetLocalTime stDump - the timestamp is already baked into
+    ' g_dumpBaseName by ToggleDump (which calls GetLocalTime there).
+    ' OpenNewDumpFile only appends the file index, so stDump was unused
+    ' dead code here.
     sFile = g_dumpBaseName & "_" & TRIM$(STR$(g_dumpFileIdx)) & ".wav"
 
     g_hDumpFile = FREEFILE
@@ -4009,7 +4723,6 @@ SUB ToggleDump()
         g_dumpWavReady = 0
         g_dumpCodec = 0
         g_dumpDataSize = 0
-        g_dumpSeqCounter = 0
         ' FIX (GROK-9): record the currently-selected device's IP so the
         ' dump write paths in AudioThread can filter by device. Without
         ' this, 2+ concurrent AudioThreads would all write to the single
@@ -5223,6 +5936,14 @@ FUNCTION PBMAIN() AS LONG
 
     ' FIX M5: Delete font handle (was leaking ~1KB GDI memory)
     IF hMono THEN FONT END hMono
+
+    ' FIX (AUDIT-ANTON#3): close the single-instance mutex handle on
+    ' normal exit. Previously it was only closed in the second-instance
+    ' branch (line ~5031), so normal termination leaked one handle per
+    ' session. The OS reclaims it at process exit, but closing explicitly
+    ' is cleaner and avoids handle-table pollution if this code is ever
+    ' reused in a DLL or long-running service.
+    IF hMutex THEN CloseHandle hMutex
 
     FUNCTION = lResult
 END FUNCTION
